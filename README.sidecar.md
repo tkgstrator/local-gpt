@@ -4,22 +4,27 @@ LocalGPT (Bun/TypeScript) and LocalMCP (Rust) run as two Docker Compose services
 
 ## Start
 
+The root `compose.yaml` starts both services together. Bun is used on the host for the initial extension build and pairing/configuration setup; both servers run in Docker.
+
 ```sh
+bun install --frozen-lockfile
 bun run setup:sidecar
-bun run start:sidecar
+docker compose --env-file .localmcp.env up -d --build
 ```
+
+`bun run start:sidecar` is an alias for the same Compose command, not a host Bun server.
 
 The setup command creates `.localmcp-token` and `.localmcp.env` outside the shared workspace, with mode 0600. They are ignored by Git and excluded from the Docker build context. On first setup, specify a workspace explicitly with `bun scripts/setup-sidecar.mjs /absolute/path/to/workspace` after `bun run build`. Existing configuration is preserved. Change `LOCALGPT_WORKSPACE` in `.localmcp.env` to use a different folder, then recreate the services. The application folder and its parents cannot be used as the shared workspace because they hold credentials.
 
-Default workspace: the sibling `outputs/localgpt-workspace` folder. Both containers mount it at `/workspace`. Filesystem tool paths are relative to this root. A path such as `src/main.ts` refers to `<host workspace>/src/main.ts`. The sidecar's state database is in a separate named volume, outside that root. No Docker socket, SSH keys or Git credentials are mounted.
+Default workspace: the sibling `../localgpt-workspace` folder. Both containers mount it at `/workspace`. Filesystem tool paths are relative to this root. A path such as `src/main.ts` refers to `<host workspace>/src/main.ts`. The sidecar's state database is in a separate named volume, outside that root. No Docker socket, SSH keys or Git credentials are mounted.
 
 For an existing installation, stop the host LocalGPT process, build the container with `docker compose --env-file .localmcp.env build localgpt`, then run `bun run migrate:sidecar` once before the first `start:sidecar`. Migration makes a consistent private SQLite snapshot, copies it into the state volume, and refuses to overwrite an existing target DB.
 
 Stop the previous host LocalGPT process before starting Compose: both use 8766/8875. Ports are bound to 127.0.0.1 only. The sidecar exposes 8876 on loopback for local MCP clients. Inside Compose, LocalGPT uses `http://local-mcp:8080/local`. The same browser pairing key is provided to the image build and runtime as a Docker secret, preserving existing installed browser pairing. Keep the extension in sync with the downloaded build.
 
 ```sh
-bun run stop:sidecar
-bun run logs:sidecar
+docker compose --env-file .localmcp.env stop
+docker compose --env-file .localmcp.env logs --tail=100
 ```
 
 `stop` preserves conversations metadata and OAuth state volumes. Do not use `down -v` unless you intend to delete those volumes.

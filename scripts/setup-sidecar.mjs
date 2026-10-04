@@ -16,4 +16,4 @@ if(!existsSync(config))writeFileSync(config,`LOCALGPT_WORKSPACE=${JSON.stringify
 else if(supplied)throw Error('Configuration already exists. Edit LOCALGPT_WORKSPACE in .localmcp.env explicitly instead of overwriting it.');
 const bun=process.execPath;
 writeFileSync(resolve(app,'dist/mcp-config-fused.json'),JSON.stringify({mcpServers:{localgpt:{command:bun,args:[`--env-file=${config}`,resolve(app,'dist/mcp-stdio.mjs')],env:{LOCALGPT_URL:'http://127.0.0.1:8766'}}}},null,2)+'\n');
-console.log(`LocalMCP sidecar configuration prepared. Shared workspace: ${root}\nStart: bun run start:sidecar\nMCP client config: dist/mcp-config-fused.json\nChatGPT must connect separately to the LocalMCP-only /local endpoint.`);
+console.log(`LocalGPT + LocalMCP Compose configuration prepared. Shared workspace: ${root}\nStart both services: docker compose --env-file .localmcp.env up -d --build\nMCP client config: dist/mcp-config-fused.json\nRegister only http://127.0.0.1:8766/mcp in Codex Desktop. Chrome and the extension run on the host.`);

@@ -13,17 +13,21 @@
 
 ## Dockerサイドカーで起動
 
-Bun 1.3.11以降とDocker Composeを使用します。
+`compose.yaml`でLocalGPTとLocalMCPの2つのサービスを一緒に起動します。ChromeとCodex Desktopはホスト側で動かします。
+
+Docker Composeを使用します。初回の拡張機能ビルドと接続キーの準備にはBun 1.3.11以降も必要です。
 
 ```sh
 git clone https://github.com/tkgstrator/local-gpt.git
 cd local-gpt
 bun install --frozen-lockfile
 bun run setup:sidecar
-bun run start:sidecar
+docker compose --env-file .localmcp.env up -d --build
 ```
 
-`setup:sidecar`はローカル専用の認証情報を生成します。`.bridge-token`、`.localmcp-token`、`.localmcp.env`、セッションDB、ペアリング情報を含むビルド成果物はコミットしません。公開用の共通拡張機能を配布するのではなく、各インストールで生成した拡張機能を使用します。
+`setup:sidecar`は拡張機能をビルドし、ローカル専用の認証情報と共有フォルダー設定を生成します。このコマンドはサーバーを起動しません。続く`docker compose`がLocalMCPを起動し、ヘルスチェックの成功後にLocalGPTを起動します。`bun run start:sidecar`も同じComposeコマンドの短縮形です。
+
+`.bridge-token`、`.localmcp-token`、`.localmcp.env`、セッションDB、ペアリング情報を含むビルド成果物はコミットしません。公開用の共通拡張機能を配布するのではなく、各インストールで生成した拡張機能を使用します。
 
 Chromeの`chrome://extensions/`でデベロッパーモードを有効にし、「パッケージ化されていない拡張機能を読み込む」から`dist/extension`を選びます。ChatGPTを再読み込みし、[ローカルダッシュボード](http://localhost:8766/)でサーバー・ブラウザ・リクエスト・ファイル操作の4つの状態を確認してください。
 
@@ -63,7 +67,7 @@ bun run typecheck
 bun run test
 ```
 
-VS Codeでは「Reopen in Container」で編集・テスト環境を起動できます。Dev Containerと本番サービスのComposeは別です。ホストChromeへ接続するサービスはホストから`bun run start:sidecar`で起動してください。Dev Container内のlocalhostはホストのlocalhostとは異なります。
+VS Codeでは「Reopen in Container」で編集・テスト環境を起動できます。Dev Containerと本番サービスのComposeは別です。ホストChromeへ接続するサービスはホストから`docker compose --env-file .localmcp.env up -d --build`で起動してください。Dev Container内のlocalhostはホストのlocalhostとは異なります。
 
 テンプレートのDev Containerはホストの設定ディレクトリをマウントします。初回起動前に、存在しないディレクトリを作成してください。
 
