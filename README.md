@@ -62,7 +62,7 @@ Responses APIはテキスト中心の対応範囲です。SSEはブラウザー�
 
 ## 開発
 
-[qtmleap/devcontainers](https://github.com/qtmleap/devcontainers)の`hono-node`例とルート共通設定を土台に、LocalGPT向けに構成しました。アプリケーションの既存Express実装を維持し、プロジェクトの実行・ビルド・テストにはBunを使います。
+開発にはBun 1.3.11以降を使用します。
 
 ```sh
 bun run check
@@ -72,14 +72,12 @@ bun run test
 
 VS Codeでは「Reopen in Container」で編集・テスト環境を起動できます。Dev Containerと本番サービスのComposeは別です。ホストChromeへ接続するサービスはホストからルートの`compose.yaml`で`docker compose up -d`を実行してください。Dev Container内のlocalhostはホストのlocalhostとは異なります。
 
-テンプレートのDev Containerはホストの設定ディレクトリをマウントします。初回起動前に、存在しないディレクトリを作成してください。
+Dev Containerはホストの設定ディレクトリをマウントします。初回起動前に、存在しないディレクトリを作成してください。
 
 ```sh
 mkdir -p ~/.aws ~/.claude ~/.codex ~/.ssh ~/.config/gh
 ```
 
-テンプレートのエディター設定をマージし、Conventional CommitsとBunのCIを採用しています。Biomeはフォーマットに使用します。既存実装を移植するため、テンプレートの独自Gritルールは適用せず、`biome-plugins`サブモジュールは使用していません。Codexの共有設定はローカルの`.codex/`へ置き、Git管理対象にはしません。
-
 ## 由来とライセンス
 
-[zsodur/chatgpt-api-by-browser-script](https://github.com/zsodur/chatgpt-api-by-browser-script)を出発点に、TypeScript、Bun、Responses、MCP、拡張機能、セッション管理を追加した派生実装です。アプリケーションのライセンスはISCです。テンプレート由来の設定については[第三者ライセンス表示](THIRD_PARTY_NOTICES.md)を参照してください。
+[zsodur/chatgpt-api-by-browser-script](https://github.com/zsodur/chatgpt-api-by-browser-script)を出発点に、TypeScript、Bun、Responses、MCP、拡張機能、セッション管理を追加した派生実装です。アプリケーションのライセンスはISCです。第三者の著作権・ライセンスについては[第三者ライセンス表示](THIRD_PARTY_NOTICES.md)を参照してください。

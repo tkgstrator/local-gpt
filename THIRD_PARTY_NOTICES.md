@@ -1,8 +1,6 @@
 # Third-party notices
 
-## qtmleap/devcontainers
-
-Development configuration adapted from commit `821158f94ce68eadaa6a37c0dbd8e4240e459fa3`.
+## Development configuration
 
 MIT License
 
