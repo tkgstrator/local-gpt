@@ -1,3 +1,5 @@
+> このガイドはソースからBunで開発・実行する場合の手順です。通常のDocker利用は、[READMEのComposeだけで起動する手順](README.md#dockerサイドカーで起動)を使用してください。
+
 DockerサイドカーでLocalMCPと一緒に使う場合は [README.sidecar.md](README.sidecar.md) を参照してください。
 
 # LocalGPTの使い方

@@ -1,59 +1,67 @@
 name: localgpt
 services:
+  credentials:
+    image: ghcr.io/tkgstrator/local-gpt:latest
+    command: ['--init']
+    environment:
+      LOCALMCP_UID: 1000
+      LOCALGPT_INIT_WORKSPACE: /workspace
+    volumes:
+      - credentials:/var/lib/localgpt-credentials
+      - workspace:/workspace
+    restart: 'no'
   localgpt:
-    build:
-      context: .
-      secrets:
-        - browser_bridge
+    image: ghcr.io/tkgstrator/local-gpt:latest
     environment:
       HOST: 0.0.0.0
       HTTP_PORT: 8766
       WS_PORT: 8875
-      BRIDGE_TOKEN_FILE: /run/secrets/browser_bridge
       SESSIONS_FILE: /var/lib/localgpt/sessions.sqlite
       LOCALMCP_URL: http://local-mcp:8080/local
-      LOCALMCP_TOKEN_FILE: /run/secrets/local_mcp_token
     ports:
       - '127.0.0.1:8766:8766'
       - '127.0.0.1:8875:8875'
     volumes:
-      - '${LOCALGPT_WORKSPACE:?Run bun run setup:sidecar first}:/workspace'
+      - credentials:/var/lib/localgpt-credentials
+      - workspace:/workspace
       - localgpt-state:/var/lib/localgpt
-    secrets:
-      - browser_bridge
-      - local_mcp_token
     depends_on:
+      credentials:
+        condition: service_completed_successfully
       local-mcp:
         condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'bun', '-e', 'const r = await fetch("http://127.0.0.1:8766/health"); process.exit(r.ok ? 0 : 1)']
+      interval: 5s
+      timeout: 3s
+      retries: 12
     restart: unless-stopped
   local-mcp:
     image: ghcr.io/tkgstrator/local-mcp@sha256:3d1acb77bd0beed1541a422236d56acc1d54ff2efbf6c8d55de677a4d1a77f10
-    entrypoint: ['sh', '-c', 'export LOCAL_MCP_TOKEN="$$(cat /run/secrets/local_mcp_token)"; exec local-mcp']
+    entrypoint: ['sh', '-c', 'export LOCAL_MCP_TOKEN="$$(cat /var/lib/localgpt-credentials/local-mcp-token)"; exec local-mcp']
     environment:
       LOCAL_MCP_ROOT: /workspace
       LOCAL_MCP_BIND: 0.0.0.0:8080
       LOCAL_MCP_STATE_DB: /var/lib/local-mcp/state.sqlite
-      LOCAL_MCP_ALLOWED_HOSTS: 'local-mcp,localhost,127.0.0.1${LOCALMCP_PUBLIC_HOST:+,}${LOCALMCP_PUBLIC_HOST:-}'
-      LOCAL_MCP_PUBLIC_URL: '${LOCALMCP_PUBLIC_URL:-}'
+      LOCAL_MCP_ALLOWED_HOSTS: 'local-mcp,localhost,127.0.0.1'
       LOCAL_MCP_ALLOW_EXEC: '${LOCALMCP_ALLOW_EXEC:-true}'
     ports:
       - '127.0.0.1:8876:8080'
     volumes:
-      - '${LOCALGPT_WORKSPACE:?Run bun run setup:sidecar first}:/workspace'
+      - credentials:/var/lib/localgpt-credentials:ro
+      - workspace:/workspace
       - localmcp-state:/var/lib/local-mcp
-    secrets:
-      - local_mcp_token
+    depends_on:
+      credentials:
+        condition: service_completed_successfully
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:8080/healthz']
       interval: 5s
       timeout: 3s
       retries: 12
     restart: unless-stopped
-secrets:
-  browser_bridge:
-    file: .bridge-token
-  local_mcp_token:
-    file: .localmcp-token
 volumes:
+  credentials:
+  workspace:
   localgpt-state:
   localmcp-state:

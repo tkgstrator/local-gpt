@@ -12,9 +12,9 @@
     "watch": "bun scripts/watch.mjs",
     "build:css": "bun node_modules/@tailwindcss/cli/dist/index.mjs -i src/dashboard.css -o dist/dashboard.css --minify",
     "setup:sidecar": "bun run build && bun scripts/setup-sidecar.mjs",
-    "start:sidecar": "docker compose --env-file .localmcp.env up -d --build",
-    "stop:sidecar": "docker compose --env-file .localmcp.env stop",
-    "logs:sidecar": "docker compose --env-file .localmcp.env logs --tail=100",
+    "start:sidecar": "docker compose up -d",
+    "stop:sidecar": "docker compose stop",
+    "logs:sidecar": "docker compose logs --tail=100",
     "migrate:sidecar": "bun scripts/migrate-sidecar-sessions.mjs",
     "check": "bun node_modules/@biomejs/biome/bin/biome format .",
     "format": "bun node_modules/@biomejs/biome/bin/biome format --write ."

@@ -45,4 +45,19 @@ jobs:
       - name: Validate Dev Container and runtime Compose
         run: |
           docker compose -f .devcontainer/compose.yaml config --quiet
-          LOCALGPT_WORKSPACE=/tmp/localgpt-workspace docker compose config --quiet
+          docker compose config --quiet
+      - name: Verify standalone Compose from empty volumes
+        run: |
+          docker build -t localgpt-compose-ci .
+          cat > /tmp/compose-ci.yaml <<'EOF'
+          services:
+            credentials:
+              image: localgpt-compose-ci
+            localgpt:
+              image: localgpt-compose-ci
+          EOF
+          docker compose -p localgpt-ci -f compose.yaml -f /tmp/compose-ci.yaml up -d --wait --wait-timeout 120 localgpt
+          docker compose -p localgpt-ci -f compose.yaml -f /tmp/compose-ci.yaml exec -T localgpt bun scripts/verify-compose.mjs
+      - name: Clean up test containers
+        if: always()
+        run: docker compose -p localgpt-ci -f compose.yaml -f /tmp/compose-ci.yaml down -v || true

@@ -13,23 +13,26 @@
 
 ## Dockerサイドカーで起動
 
-`compose.yaml`でLocalGPTとLocalMCPの2つのサービスを一緒に起動します。ChromeとCodex Desktopはホスト側で動かします。
-
-Docker Composeを使用します。初回の拡張機能ビルドと接続キーの準備にはBun 1.3.11以降も必要です。
+Docker Composeだけで起動できます。リポジトリのclone、ホストのBun、セットアップスクリプトは不要です。
 
 ```sh
-git clone https://github.com/tkgstrator/local-gpt.git
-cd local-gpt
-bun install --frozen-lockfile
-bun run setup:sidecar
-docker compose --env-file .localmcp.env up -d --build
+curl -fsSLO https://raw.githubusercontent.com/tkgstrator/local-gpt/master/compose.yaml
+docker compose up -d
 ```
 
-`setup:sidecar`は拡張機能をビルドし、ローカル専用の認証情報と共有フォルダー設定を生成します。このコマンドはサーバーを起動しません。続く`docker compose`がLocalMCPを起動し、ヘルスチェックの成功後にLocalGPTを起動します。`bun run start:sidecar`も同じComposeコマンドの短縮形です。
+Composeが公開イメージを取得し、接続キーの初期化、LocalMCP、LocalGPTの順に起動します。初期化用コンテナは成功後に終了します。接続キー・セッション・LocalMCPの状態・共有作業フォルダーはDockerの名前付きボリュームに保存され、再起動後も維持されます。初回起動時に、このインストール専用の接続キーを使った拡張機能をコンテナ内で生成します。
 
-`.bridge-token`、`.localmcp-token`、`.localmcp.env`、セッションDB、ペアリング情報を含むビルド成果物はコミットしません。公開用の共通拡張機能を配布するのではなく、各インストールで生成した拡張機能を使用します。
+[ローカルダッシュボード](http://localhost:8766/)を開き、拡張機能ZIPをダウンロードして展開します。ホストのChromeの`chrome://extensions/`でデベロッパーモードを有効にし、「パッケージ化されていない拡張機能を読み込む」から展開したフォルダーを選びます。ログイン済みのChatGPTを再読み込みし、ダッシュボードでサーバー・ブラウザ・リクエスト・ファイル操作の4つの状態を確認してください。
 
-Chromeの`chrome://extensions/`でデベロッパーモードを有効にし、「パッケージ化されていない拡張機能を読み込む」から`dist/extension`を選びます。ChatGPTを再読み込みし、[ローカルダッシュボード](http://localhost:8766/)でサーバー・ブラウザ・リクエスト・ファイル操作の4つの状態を確認してください。
+```sh
+docker compose logs --tail=100
+docker compose stop
+# イメージを更新して再起動
+docker compose pull
+docker compose up -d
+```
+
+`docker compose down -v`は接続キーやセッション、共有ファイルも削除します。通常の停止には`stop`を使ってください。ホストのソースコードを共有する場合は、両サービスの`workspace:/workspace`を同じホストフォルダーのbind mount（例: `./workspace:/workspace`）に変更します。
 
 ## Codex Desktopから利用
 
@@ -39,7 +42,7 @@ Streamable HTTP対応クライアントには次を登録します。
 http://127.0.0.1:8766/mcp
 ```
 
-stdioを使うクライアント向けには、セットアップで`dist/mcp-config-fused.json`を生成します。LocalMCPを別途登録する必要はありません。`localgpt_*`がChatGPT操作を、`localmcp_*`がファイル・コマンド操作を担当します。
+Dockerだけでの利用には上記のHTTP接続を使います。ソースから開発する場合は、stdio向けの`dist/mcp-config-fused.json`も生成できます。LocalMCPを別途登録する必要はありません。`localgpt_*`がChatGPT操作を、`localmcp_*`がファイル・コマンド操作を担当します。
 
 Codex DesktopがLocalMCPでファイルを読み、必要な内容をLocalGPTへ送って質問し、返答に基づいて編集する流れを想定しています。ChatGPT自身がLocalMCPを直接呼ぶ接続や、Mac全体のComputer Useは実装していません。
 
@@ -67,7 +70,7 @@ bun run typecheck
 bun run test
 ```
 
-VS Codeでは「Reopen in Container」で編集・テスト環境を起動できます。Dev Containerと本番サービスのComposeは別です。ホストChromeへ接続するサービスはホストから`docker compose --env-file .localmcp.env up -d --build`で起動してください。Dev Container内のlocalhostはホストのlocalhostとは異なります。
+VS Codeでは「Reopen in Container」で編集・テスト環境を起動できます。Dev Containerと本番サービスのComposeは別です。ホストChromeへ接続するサービスはホストからルートの`compose.yaml`で`docker compose up -d`を実行してください。Dev Container内のlocalhostはホストのlocalhostとは異なります。
 
 テンプレートのDev Containerはホストの設定ディレクトリをマウントします。初回起動前に、存在しないディレクトリを作成してください。
 

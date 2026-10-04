@@ -3,8 +3,10 @@ import { build } from 'esbuild';
 import { readFile, writeFile, copyFile, mkdir, readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
+const tokenPath = process.env.BRIDGE_TOKEN_FILE || '.bridge-token';
 let token;
-try { token = (await readFile('.bridge-token', 'utf8')).trim(); } catch (err) { if (err.code !== 'ENOENT') throw err; token = randomBytes(32).toString('hex'); await writeFile('.bridge-token', token + '\n', { mode: 0o600, flag: 'wx' }); }
+if (process.env.LOCALGPT_IMAGE_BUILD === '1') token = '0'.repeat(64);
+else try { token = (await readFile(tokenPath, 'utf8')).trim(); } catch (err) { if (err.code !== 'ENOENT') throw err; token = randomBytes(32).toString('hex'); await writeFile(tokenPath, token + '\n', { mode: 0o600, flag: 'wx' }); }
 if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('Invalid local pairing token');
 const metadata = await readFile(new URL('../src/userscript.header.txt', import.meta.url), 'utf8');
 await build({ entryPoints: ['src/userscript.ts'], outfile: 'dist/chatgpt-api.user.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', define: { __BRIDGE_TOKEN__: JSON.stringify(token) }, banner: { js: metadata }, legalComments: 'inline' });

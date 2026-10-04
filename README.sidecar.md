@@ -1,62 +1,35 @@
-# LocalGPT + LocalMCP
+# LocalGPT + LocalMCP with Docker Compose
 
-LocalGPT (Bun/TypeScript) and LocalMCP (Rust) run as two Docker Compose services. LocalGPT publishes the combined MCP at `http://127.0.0.1:8766/mcp`. ChatGPT generation uses the existing browser extension; the Rust sidecar owns filesystem and shell tools.
-
-## Start
-
-The root `compose.yaml` starts both services together. Bun is used on the host for the initial extension build and pairing/configuration setup; both servers run in Docker.
+Download only `compose.yaml` and start both servers; no clone, host Bun installation, or `setup:sidecar` command is required.
 
 ```sh
-bun install --frozen-lockfile
-bun run setup:sidecar
-docker compose --env-file .localmcp.env up -d --build
+curl -fsSLO https://raw.githubusercontent.com/tkgstrator/local-gpt/master/compose.yaml
+docker compose up -d
 ```
 
-`bun run start:sidecar` is an alias for the same Compose command, not a host Bun server.
+The `credentials` service initializes private keys in a named volume and exits successfully. LocalMCP waits for initialization; LocalGPT waits for the sidecar health check. LocalGPT generates paired browser downloads inside its container at startup. Published images contain no installation credentials. Download the extension ZIP from http://127.0.0.1:8766/, extract it and load it in the host Chrome with developer mode. Chrome must remain logged into ChatGPT.
 
-The setup command creates `.localmcp-token` and `.localmcp.env` outside the shared workspace, with mode 0600. They are ignored by Git and excluded from the Docker build context. On first setup, specify a workspace explicitly with `bun scripts/setup-sidecar.mjs /absolute/path/to/workspace` after `bun run build`. Existing configuration is preserved. Change `LOCALGPT_WORKSPACE` in `.localmcp.env` to use a different folder, then recreate the services. The application folder and its parents cannot be used as the shared workspace because they hold credentials.
+Register only `http://127.0.0.1:8766/mcp` in Codex Desktop. LocalGPT exposes `localgpt_*` chat tools and forwards the allowlisted `localmcp_*` file/command tools to `http://local-mcp:8080/local` inside Compose. Codex Desktop orchestrates the two sets of tools. ChatGPT itself does not directly call the local sidecar.
 
-Default workspace: the sibling `../localgpt-workspace` folder. Both containers mount it at `/workspace`. Filesystem tool paths are relative to this root. A path such as `src/main.ts` refers to `<host workspace>/src/main.ts`. The sidecar's state database is in a separate named volume, outside that root. No Docker socket, SSH keys or Git credentials are mounted.
+## Storage and host files
 
-For an existing installation, stop the host LocalGPT process, build the container with `docker compose --env-file .localmcp.env build localgpt`, then run `bun run migrate:sidecar` once before the first `start:sidecar`. Migration makes a consistent private SQLite snapshot, copies it into the state volume, and refuses to overwrite an existing target DB.
+Both servers mount the `workspace` named volume at `/workspace`. File tools accept paths relative to this shared root. To work on an existing host source/log folder, replace `workspace:/workspace` in **both** services with the same bind mount, such as `./workspace:/workspace`, and create that host folder before startup. Attachment paths refer to `/workspace/...` inside LocalGPT, rather than a Mac host path.
 
-Stop the previous host LocalGPT process before starting Compose: both use 8766/8875. Ports are bound to 127.0.0.1 only. The sidecar exposes 8876 on loopback for local MCP clients. Inside Compose, LocalGPT uses `http://local-mcp:8080/local`. The same browser pairing key is provided to the image build and runtime as a Docker secret, preserving existing installed browser pairing. Keep the extension in sync with the downloaded build.
+Keys, LocalGPT sessions and LocalMCP state use separate persistent named volumes. `stop` and `down` preserve these volumes; `down -v` deletes them, including shared files and pairing keys. Ports 8766, 8875 and 8876 are bound only to host loopback. No public tunnel, Docker socket, SSH keys or Git credentials are mounted.
 
 ```sh
-docker compose --env-file .localmcp.env stop
-docker compose --env-file .localmcp.env logs --tail=100
+docker compose logs --tail=100
+docker compose stop
+docker compose pull
+docker compose up -d
 ```
 
-`stop` preserves conversations metadata and OAuth state volumes. Do not use `down -v` unless you intend to delete those volumes.
+Set `LOCALMCP_ALLOW_EXEC=false` in your shell or a Compose `.env` file to disable the command tools. Recreate the services and reconnect the MCP client after changing this setting. The dashboard file-operation status and `localmcp_status` report connectivity.
 
-## One MCP entry point for callers
+## Existing installations and development
 
-Register `http://127.0.0.1:8766/mcp` in a client that accepts Streamable HTTP. A ready sidecar adds these tools to the existing LocalGPT session/model/dot tools:
+This standalone Compose deployment generates its own keys and starts with its own session volume. If you previously used a host Bun server, stop it before startup to free 8766/8875, then install the extension downloaded from the new deployment. Existing host sessions are not automatically imported. Preserve the old key and SQLite files when migrating; do not assume previous session IDs survive a fresh deployment.
 
-- `localmcp_read_file`, `localmcp_write_file`, `localmcp_edit_file`
-- `localmcp_list_dir`, `localmcp_search`
-- `localmcp_execute`, `localmcp_start_command`, `localmcp_poll_job`, `localmcp_stop_job`
-- `localmcp_status`
+The old `setup:sidecar` helper is retained only for source-based development/legacy configuration. It is not part of this deployment procedure.
 
-The upstream input schemas are validated and its content/results forwarded. Credentials stay server side. The allowlist excludes unrelated upstream tools. If LocalMCP is unavailable, LocalGPT still initializes; `localmcp_status` explains that its tools are unavailable. Reconnect the MCP client to refresh discovery after restarting/updating the sidecar. Set `LOCALMCP_ALLOW_EXEC=false` in `.localmcp.env` to omit the four command tools; recreate the sidecar and reconnect clients.
-
-For a stdio client, use `dist/mcp-config-fused.json`, generated by setup. It uses Bun with the private environment file and the same loopback sidecar. It contains paths, not tokens. Run `bun scripts/verify-sidecar.mjs` to exercise the real sidecar through this combined stdio entry point. Verification writes only `localgpt-verification/sidecar-test.txt` and runs `printf`.
-
-`GET /v1/localmcp` and the dashboard's LocalMCP panel confirm gateway connectivity. They do not prove ChatGPT plugin access.
-
-## Let ChatGPT work with files without attachments
-
-This is a separate connection from registering LocalGPT in the caller. Connect **LocalMCP only** as a ChatGPT plugin. Never connect LocalGPT's `/mcp` back to the same ChatGPT worker: exposing `localgpt_respond` there causes recursive generation.
-
-1. Make the LocalMCP endpoint reachable from ChatGPT using your existing authenticated HTTPS forwarding service. Forward `/local` and the OAuth discovery/authorization routes to the Rust sidecar, not LocalGPT. Nothing is published publicly by this Compose file.
-2. Put the public HTTPS origin in `LOCALMCP_PUBLIC_URL` and its hostname in `LOCALMCP_PUBLIC_HOST`, then recreate the sidecar. The endpoint is `<origin>/local`.
-3. In ChatGPT developer mode, add a plugin with that `/local` URL and OAuth authentication. Obtain the consent token locally from `.localmcp-token`; do not paste it into a chat or commit it. Token entry/consent is done in the browser.
-4. Enable the plugin in the conversation used by LocalGPT. Ask ChatGPT to list the workspace or read a dedicated verification file; confirm actual tool use before trusting that file operations are available.
-5. Continue that conversation using its LocalGPT `session_id`. For new sessions, ensure the plugin is available there too. LocalGPT currently does not automatically select ChatGPT plugins or accept their approval dialogs.
-
-Example instruction to `localgpt_respond` after the plugin is enabled: “LocalMCPで src/main.ts と logs/test.log を読み、原因を調べて修正してください。確認コマンドも実行して結果を教えてください。” No `files` argument is required. File content still reaches ChatGPT through MCP tool results. Images can continue to use optional LocalGPT attachments.
-
-Official connection documentation: https://developers.openai.com/plugins/deploy/connect-chatgpt
-Upstream: https://github.com/tkgstrator/local-mcp (MIT). This integration keeps the Rust implementation in its original sidecar and pins the tested container digest in Compose.
-
-After moving LocalGPT into Docker, attachment `files.path` uses the container path `/workspace/...`, not the Mac `/Users/...` path. LocalMCP file tools instead use relative paths under the same `/workspace`. Existing host session metadata must be copied to the LocalGPT state volume before switching an existing installation; do not start with an empty volume and assume previous session IDs survived.
+LocalMCP upstream: https://github.com/tkgstrator/local-mcp (MIT). The Rust image is pinned by digest. LocalGPT publishes multi-platform images to `ghcr.io/tkgstrator/local-gpt` after Integration CI succeeds on master.
