@@ -439,7 +439,12 @@ class App {
       else if (request.reasoning)
         throw new DomError('model_required', 'Specify a model ID when selecting reasoning effort.')
       assertConversation()
-      const previous = new Set(assistantNodes(document))
+      // ChatGPT may recycle DOM elements while scrolling; message IDs remain distinct.
+      const answerKey = (node: HTMLElement) =>
+        node.getAttribute('data-chatgpt-selection-message-id') ||
+        node.getAttribute('data-message-id') ||
+        node
+      const previous = new Set(assistantNodes(document).map(answerKey))
       const editor = findEditor(document)
       writeEditor(document, request.text, editor)
       if (request.files?.length)
@@ -500,7 +505,7 @@ class App {
         const generating = isGenerating(document)
         sawGenerating ||= generating
         const lastNode = assistantNodes(document).at(-1)
-        if (lastNode && !previous.has(lastNode)) {
+        if (lastNode && !previous.has(answerKey(lastNode))) {
           const text = readLatestAnswer(document)
           if (text !== lastText) {
             lastText = text

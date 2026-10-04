@@ -32,3 +32,22 @@ test('manual attachments block requests without API files before session navigat
  const f=await fixture(t); const editor=f.page.document.querySelector('[role="textbox"]'); const form=f.page.document.createElement('form');editor.replaceWith(form);form.append(editor);form.insertAdjacentHTML('beforeend','<button aria-label="Remove manual.txt">Remove</button>');
  f.queue({type:'request',requestId:'manual-file',text:'Continue',newChat:false,conversationId:target});assert.equal((await f.event('manual-file')).code,'attachment_draft_present');assert.equal(f.events.some(e=>e.type==='navigate'),false);assert.equal(f.page.location.pathname,'/');
 });
+
+test('built extension reads a fresh answer when ChatGPT recycles an existing message element', async t => {
+ const f = await fixture(t, `https://chatgpt.com/c/${target}`);
+ f.page.document.body.insertAdjacentHTML('beforeend', '<div data-chatgpt-selection-message-id="old-answer"><div data-markdown-text-style="assistant-message">Old answer</div></div>');
+ const recycled = f.page.document.querySelector('[data-chatgpt-selection-message-id]');
+ f.page.document.querySelector('button').addEventListener('click', () => {
+  recycled.setAttribute('data-chatgpt-selection-message-id', 'new-answer');
+  recycled.querySelector('[data-markdown-text-style]').textContent = 'Fresh review result';
+ });
+ f.queue({type:'request',requestId:'recycled',text:'Review this diff',newChat:false});
+ let stop;
+ for(let i=0;i<200;i++) {
+  stop=f.events.find(e=>e.requestId==='recycled' && e.type==='stop');
+  if(stop)break;
+  await new Promise(r=>setTimeout(r,20));
+ }
+ assert.equal(f.events.find(e=>e.requestId==='recycled' && e.type==='answer')?.text,'Fresh review result');
+ assert.equal(stop?.conversationId,target);
+});

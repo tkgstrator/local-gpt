@@ -14,7 +14,10 @@ export function isVisible(node: Element) {
     const style = win?.getComputedStyle(parent)
     if (style?.display === 'none' || style?.visibility === 'hidden') return false
   }
-  return node.ownerDocument.documentElement.clientWidth === 0 || node.getClientRects().length > 0
+  return (
+    node.ownerDocument.documentElement.clientWidth === 0 ||
+    [...node.getClientRects()].some((rect) => rect.width > 0 && rect.height > 0)
+  )
 }
 export function findEditor(doc: Document): HTMLElement | HTMLTextAreaElement {
   const editor = [
