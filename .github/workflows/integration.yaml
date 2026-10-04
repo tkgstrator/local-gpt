@@ -1,0 +1,48 @@
+name: Integration
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  commitlint:
+    name: Commit Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Validate commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            bun node_modules/@commitlint/cli/cli.js --from "$PR_BASE" --to "$PR_HEAD" --verbose
+          else
+            bun node_modules/@commitlint/cli/cli.js --last --verbose
+          fi
+  check:
+    name: Format, TypeScript and Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run check
+      - run: bun run test
+      - name: Validate Dev Container and runtime Compose
+        run: |
+          docker compose -f .devcontainer/compose.yaml config --quiet
+          LOCALGPT_WORKSPACE=/tmp/localgpt-workspace docker compose config --quiet

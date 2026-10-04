@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>LocalGPT · Local dashboard</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <script src="/assets/dashboard.js" defer></script>
+</head>
+<body class="min-h-screen bg-canvas font-sans text-ink antialiased">
+  <a href="#main" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-white focus:p-3">本文へ移動</a>
+  <header class="border-b border-line bg-white">
+    <div class="mx-auto flex h-20 max-w-6xl items-center justify-between gap-4 px-5 sm:px-8">
+      <a href="/" class="flex min-w-0 items-center gap-3" aria-label="LocalGPT ホーム">
+        <span class="grid size-10 shrink-0 place-items-center rounded-xl bg-accent text-white" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5m8-10 5 5-5 5m-3-12-2 20"/></svg></span>
+        <div><span class="block text-sm font-semibold tracking-tight sm:text-base">LocalGPT</span><span class="block text-xs text-muted">LOCAL WORKSPACE</span></div>
+      </a>
+      <span class="flex shrink-0 items-center gap-2 rounded-full border border-line px-3 py-1.5 text-xs font-medium text-muted"><span class="size-1.5 rounded-full bg-accent" aria-hidden="true"></span>localhost<span class="hidden sm:inline"> : 8766</span></span>
+    </div>
+  </header>
+
+  <main id="main" class="mx-auto max-w-6xl px-5 pb-10 pt-10 sm:px-8 sm:pt-14">
+    <div class="mb-9 flex flex-wrap items-end justify-between gap-5">
+      <div>
+        <p class="mb-3 text-xs font-semibold tracking-[0.18em] text-accent">YOUR BROWSER, YOUR API.</p>
+        <h1 class="text-3xl font-semibold leading-snug tracking-tight sm:text-4xl">ChatGPTを、ローカルAPIへ。</h1>
+        <p class="mt-3 max-w-xl text-sm leading-7 text-muted">ブラウザーのChatGPTと、いつものツールをつなぐ。<br class="hidden sm:block">このページで接続を確認して、すぐに使い始められます。</p>
+      </div>
+      <button id="refresh-status" class="secondary-button" type="button"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/></svg>接続を更新</button>
+    </div>
+
+    <section aria-label="接続状態" class="mb-7 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div class="rounded-2xl border border-line bg-white p-5"><div class="mb-4 flex items-center justify-between"><h2 class="text-xs font-medium text-muted">サーバー</h2><svg aria-hidden="true" class="text-muted" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01"/></svg></div><p id="server-status" class="text-lg font-semibold" aria-live="polite">確認中…</p><p class="mt-1 text-xs text-muted">HTTP · ポート8766</p></div>
+      <div class="rounded-2xl border border-line bg-white p-5"><div class="mb-4 flex items-center justify-between"><h2 class="text-xs font-medium text-muted">ブラウザ</h2><svg aria-hidden="true" class="text-muted" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01"/></svg></div><p id="browser-status" class="text-lg font-semibold" aria-live="polite">確認中…</p><p id="browser-detail" class="mt-1 text-xs text-muted">スクリプトの接続を確認しています</p></div>
+      <div class="rounded-2xl border border-line bg-white p-5"><div class="mb-4 flex items-center justify-between"><h2 class="text-xs font-medium text-muted">リクエスト</h2><svg aria-hidden="true" class="text-muted" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="m13 3-8 10h6l-1 8 9-11h-6l1-7Z"/></svg></div><p id="request-status" class="text-lg font-semibold" aria-live="polite">確認中…</p><p class="mt-1 text-xs text-muted">異なるセッションは空いているタブで並列に処理します</p></div>
+      <div class="rounded-2xl border border-line bg-white p-5"><div class="mb-4 flex items-center justify-between"><h2 class="text-xs font-medium text-muted">ファイル操作</h2><svg aria-hidden="true" class="text-muted" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 7h7l2 2h9v11H3z"/><path d="M3 7V4h7l2 3"/></svg></div><p id="localmcp-status" class="text-lg font-semibold" aria-live="polite">確認中…</p><p id="localmcp-detail" class="mt-1 text-xs text-muted">LocalMCPサイドカーを確認しています</p><p id="localmcp-chatgpt" class="mt-2 text-xs leading-5 text-muted">ChatGPTからの利用は未確認</p><button id="refresh-localmcp" type="button" class="mt-3 text-xs font-medium text-accent hover:underline">接続を確認</button></div>
+    </section>
+
+    <section class="mb-7 overflow-hidden rounded-2xl border border-line bg-white" aria-labelledby="capability-title">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-line px-6 py-5"><div><h2 id="capability-title" class="text-lg font-semibold">モデル一覧</h2><p class="mt-1 text-xs text-muted">接続中のChatGPTが受け取った情報</p></div><div class="flex items-center gap-3"><span class="rounded-md bg-accent-soft px-3 py-2 text-xs font-medium">プラン <span id="account-plan">未取得</span></span><button id="refresh-capabilities" type="button" class="secondary-button">情報を更新</button></div></div>
+      <p id="capability-detail" role="status" class="px-6 py-4 text-xs leading-5 text-muted">ChatGPTの接続後に情報を取得します。</p>
+      <div class="overflow-x-auto"><table class="w-full text-left text-sm"><thead class="bg-canvas text-xs text-muted"><tr><th class="px-6 py-3 font-medium">利用できるモデル</th><th class="px-6 py-3 font-medium">リーゾニング</th><th class="px-6 py-3 font-medium">Thinking effort</th></tr></thead><tbody id="capability-models" class="divide-y divide-line"></tbody></table></div>
+      <p class="border-t border-line px-6 py-4 text-xs leading-5 text-muted">モデルの変更はChatGPTで行ってください。ここでは情報を表示します。</p>
+    </section>
+
+    <div class="grid items-start gap-6 lg:grid-cols-[1.15fr_1fr]">
+      <section class="overflow-hidden rounded-2xl border border-line bg-white" aria-labelledby="setup-title">
+        <div class="border-b border-line px-6 py-5 sm:px-7"><p class="mb-1 text-xs font-medium text-muted">GET STARTED</p><h2 id="setup-title" class="text-lg font-semibold">3ステップで接続</h2><div class="mt-4 inline-flex rounded-lg bg-canvas p-1" aria-label="導入方法"><button type="button" class="installer-button" data-installer="extension" aria-pressed="true">開発用拡張機能</button><button type="button" class="installer-button" data-installer="userscript" aria-pressed="false">Tampermonkey</button></div></div>
+        <ol class="divide-y divide-line px-6 sm:px-7">
+          <li class="flex gap-4 py-6"><span class="step-number">01</span><div class="min-w-0 flex-1">
+            <div id="install-extension"><h3 class="text-sm font-semibold">開発用拡張機能を読み込む</h3><p class="mb-4 mt-2 text-sm leading-6 text-muted">ZIPをダウンロードして展開。Chromeの拡張機能管理でデベロッパーモードを有効にし、「パッケージ化されていない拡張機能を読み込む」から展開したフォルダーを選びます。</p><a class="primary-button" href="/extension" >拡張機能をダウンロード</a><button type="button" class="mt-3 block text-xs font-medium text-accent hover:underline" data-copy="extensions">chrome://extensions をコピー</button></div>
+            <div id="install-userscript" hidden><h3 class="text-sm font-semibold">スクリプトを用意する</h3><p class="mb-4 mt-2 text-sm leading-6 text-muted">ビルド済みファイルを、Tampermonkeyの新しいスクリプトに貼り付けて保存します。</p><a class="primary-button" href="/userscript" download="chatgpt-api.user.js">スクリプトをダウンロード</a></div>
+            <p class="mt-3 text-xs leading-5 text-muted">どちらか一方だけを有効にしてください。</p>
+          </div></li>
+          <li class="flex gap-4 py-6"><span class="step-number">02</span><div class="min-w-0 flex-1"><h3 class="text-sm font-semibold">ChatGPTを開く</h3><p class="mb-3 mt-2 text-sm leading-6 text-muted">ログインしてChatモードを選び、ページを再読み込みします。</p><a class="inline-flex items-center gap-2 text-sm font-semibold text-accent hover:underline" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer">ChatGPTを開く<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7M7 7h10v10"/></svg></a></div></li>
+          <li class="flex gap-4 py-6"><span class="step-number">03</span><div class="min-w-0 flex-1"><h3 class="text-sm font-semibold">接続を確認する</h3><p class="mt-2 text-sm leading-6 text-muted">ChatGPTの右下に「LocalGPT · 接続済み」と表示されたら準備完了。このページの接続状態も自動で更新されます。</p></div></li>
+        </ol>
+      </section>
+
+      <div class="space-y-5">
+        <section class="rounded-2xl border border-line bg-white p-6 sm:p-7" aria-labelledby="endpoint-title">
+          <div class="mb-5 flex items-center justify-between gap-3"><h2 id="endpoint-title" class="text-base font-semibold">APIエンドポイント</h2><span class="rounded-md bg-accent-soft px-2 py-1 font-mono text-[11px] font-semibold text-accent">POST</span></div>
+          <div class="rounded-xl border border-line bg-canvas p-4"><p class="mb-2 text-xs text-muted">Base URL</p><code class="break-all text-sm">http://localhost:8766/v1</code><div class="my-3 border-t border-line"></div><p class="mb-2 text-xs text-muted">Responses API</p><code class="break-all text-sm">/responses</code></div>
+          <button class="secondary-button mt-4 w-full justify-center" type="button" data-copy="endpoint">エンドポイントをコピー</button>
+        </section>
+
+        <section class="overflow-hidden rounded-2xl border border-line bg-white" aria-labelledby="example-title">
+          <div class="flex items-center justify-between gap-3 px-6 py-4"><h2 id="example-title" class="text-sm font-semibold">最初のリクエスト</h2><button class="rounded-md px-2 py-1 text-xs font-medium text-muted transition hover:bg-canvas hover:text-ink" type="button" data-copy="example">コピー</button></div>
+          <div class="overflow-x-auto bg-code p-5 text-[12px] leading-6 text-slate-200"><pre><code id="request-example">curl -N http://localhost:8766/v1/responses \
+  -H 'Content-Type: application/json' \
+  --data '{"input":"こんにちは！","stream":true}'</code></pre></div>
+          <p class="px-6 py-4 text-xs leading-5 text-muted">接続後にターミナルから実行できます。モデルはChatGPTの画面で選択してください。MCPの入口は <code>/mcp</code>、モデル表示名の取得は <code>/v1/models</code> です。</p>
+        </section>
+      </div>
+    </div>
+
+    <div id="connection-notice" class="mt-6 flex items-start gap-3 rounded-xl border border-line bg-white px-5 py-4 text-sm" data-state="loading"><span id="notice-dot" class="mt-1.5 size-2 shrink-0 rounded-full bg-muted" aria-hidden="true"></span><div><p id="notice-title" class="font-medium">接続状態を確認しています</p><p id="notice-detail" class="mt-1 text-xs leading-5 text-muted">最新の状態を取得するまで少しお待ちください。</p></div></div>
+    <noscript><p class="mt-4 rounded-xl border border-line bg-white p-4 text-sm">JavaScriptが無効のため、自動更新は停止しています。<a href="/health" class="text-accent underline">接続状態を直接確認</a>できます。</p></noscript>
+    <footer class="mt-9 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-5 text-xs text-muted"><p>LocalGPT <span class="mx-2 text-line">/</span> Local workspace</p><div class="flex items-center gap-4"><span id="updated-at">接続状態は5秒ごとに更新</span><a class="hover:text-ink" href="/health">接続データを見る ↗</a></div></footer>
+  </main>
+  <div id="copy-feedback" role="status" class="pointer-events-none fixed bottom-5 left-1/2 -translate-x-1/2 rounded-full bg-ink px-5 py-3 text-sm text-white opacity-0 transition-opacity"></div>
+</body>
+</html>

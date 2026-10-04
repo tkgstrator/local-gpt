@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.bridge-token
+.localmcp-token
+.localmcp.env
+.localgpt-sessions.sqlite*
+work
+workspaces
+.codex
+.claude
+.devcontainer
+.vscode
+.env
+.env.*
+.secrets

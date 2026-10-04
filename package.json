@@ -1,0 +1,65 @@
+{
+  "name": "localgpt",
+  "version": "2.5.0",
+  "description": "LocalGPT: a local Responses API bridge for your ChatGPT browser tab",
+  "main": "index.js",
+  "scripts": {
+    "start": "bun run build && bun dist/server.cjs",
+    "typecheck": "bun node_modules/typescript/bin/tsc --noEmit",
+    "build": "bun run typecheck && bun scripts/build.mjs && bun run build:css",
+    "test": "bun run build && bun test test",
+    "mcp": "bun dist/mcp-stdio.mjs",
+    "watch": "bun scripts/watch.mjs",
+    "build:css": "bun node_modules/@tailwindcss/cli/dist/index.mjs -i src/dashboard.css -o dist/dashboard.css --minify",
+    "setup:sidecar": "bun run build && bun scripts/setup-sidecar.mjs",
+    "start:sidecar": "docker compose --env-file .localmcp.env up -d --build",
+    "stop:sidecar": "docker compose --env-file .localmcp.env stop",
+    "logs:sidecar": "docker compose --env-file .localmcp.env logs --tail=100",
+    "migrate:sidecar": "bun scripts/migrate-sidecar-sessions.mjs",
+    "check": "bun node_modules/@biomejs/biome/bin/biome format .",
+    "format": "bun node_modules/@biomejs/biome/bin/biome format --write ."
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "express": "^4.18.2",
+    "ws": "^8.13.0",
+    "zod": "^4.6.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tkgstrator/local-gpt.git"
+  },
+  "author": "zhangxiaobin",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/tkgstrator/local-gpt/issues"
+  },
+  "homepage": "https://github.com/tkgstrator/local-gpt#readme",
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
+    "@tailwindcss/cli": "^4.3.3",
+    "@types/bun": "^1.4.2",
+    "@types/chrome": "^0.3.4",
+    "@types/express": "^5.0.6",
+    "@types/jsdom": "^30.0.0",
+    "@types/node": "^26.6.4",
+    "@types/ws": "^8.18.2",
+    "conventional-changelog-conventionalcommits": "^10.4.0",
+    "esbuild": "^0.28.2",
+    "fflate": "^0.8.3",
+    "happy-dom": "^20.14.5",
+    "jsdom": "^30.1.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2"
+  },
+  "packageManager": "bun@1.3.11",
+  "engines": {
+    "bun": ">=1.3.11"
+  },
+  "private": true,
+  "contributors": [
+    "tkgstrator"
+  ]
+}

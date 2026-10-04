@@ -1,0 +1,75 @@
+import { FilesSchema, BrowserFileSchema } from './attachment-protocol'
+import { DotActionSchema, DotResultSchema } from './dots'
+import { z } from 'zod'
+import { CapabilitiesSchema } from './capabilities'
+z.config({ jitless: true })
+
+export const ChatRequestSchema = z.object({
+  messages: z
+    .array(
+      z.object({
+        role: z.enum(['system', 'developer', 'user', 'assistant']),
+        content: z
+          .string()
+          .refine((value) => value.trim().length > 0, 'Message content cannot be blank'),
+      }),
+    )
+    .min(1),
+  model: z.string().optional(),
+  reasoning: z
+    .object({ effort: z.string().min(1).max(200) })
+    .strict()
+    .optional(),
+  session_id: z.string().uuid().optional(),
+  files: FilesSchema.optional(),
+  stream: z.boolean().default(false),
+  newChat: z.boolean().default(true),
+})
+export const ModelObservationSchema = z.object({
+  selected: z.string().min(1).max(200).nullable(),
+  models: z.array(z.string().min(1).max(200)).max(100),
+  source: z.literal('visible_ui'),
+  selectionLabel: z.string().max(200).nullable().default(null),
+})
+export const BrowserRequestSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('request'),
+    requestId: z.string().min(1),
+    text: z.string().min(1),
+    newChat: z.boolean(),
+    files: z.array(BrowserFileSchema).max(10).optional(),
+    model: z.string().optional(),
+    reasoning: z.object({ effort: z.string().min(1).max(200) }).optional(),
+    conversationId: z.string().uuid().optional(),
+  }),
+  z.object({ type: z.literal('models'), requestId: z.string().min(1) }),
+  z.object({ type: z.literal('capabilities'), requestId: z.string().min(1) }),
+  z.object({ type: z.literal('navigation_ready'), requestId: z.string().min(1) }),
+  z.object({ type: z.literal('dots'), requestId: z.string().min(1), operation: DotActionSchema }),
+])
+export const BrowserEventSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('answer'), requestId: z.string().min(1), text: z.string() }),
+  z.object({
+    type: z.literal('stop'),
+    requestId: z.string().min(1),
+    conversationId: z.string().uuid().optional(),
+  }),
+  z.object({
+    type: z.literal('error'),
+    requestId: z.string().min(1),
+    code: z.string().min(1),
+    message: z.string(),
+  }),
+  z.object({ type: z.literal('heartbeat') }),
+  z.object({
+    type: z.literal('navigate'),
+    requestId: z.string().min(1),
+    conversationId: z.string().uuid(),
+  }),
+  z.object({ type: z.literal('dots'), requestId: z.string().min(1), result: DotResultSchema }),
+  CapabilitiesSchema.extend({ type: z.literal('capabilities'), requestId: z.string().min(1) }),
+  ModelObservationSchema.extend({ type: z.literal('models'), requestId: z.string().min(1) }),
+])
+export type BrowserRequest = z.infer<typeof BrowserRequestSchema>
+export type BrowserEvent = z.infer<typeof BrowserEventSchema>
+export type ChatRequest = z.infer<typeof ChatRequestSchema>

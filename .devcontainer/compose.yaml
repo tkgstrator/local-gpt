@@ -1,0 +1,15 @@
+name: localgpt-dev
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - node_modules:/home/vscode/app/node_modules
+      - ../:/home/vscode/app:cached
+    environment:
+      NODE_ENV: development
+    tty: true
+    stdin_open: true
+volumes:
+  node_modules:

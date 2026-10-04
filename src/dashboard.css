@@ -1,0 +1,31 @@
+@import "tailwindcss" source(none);
+@source "../public/dashboard.html";
+@source "./dashboard.ts";
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --color-canvas: #f6f7f9;
+  --color-ink: #1c2926;
+  --color-muted: #667570;
+  --color-line: #e4e9e6;
+  --color-accent: #147d64;
+  --color-accent-soft: #eaf5ef;
+  --color-code: #202c29;
+}
+@layer base {
+  button, a { -webkit-tap-highlight-color: transparent; }
+  button:not(:disabled), a { cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; }
+}
+@layer components {
+  .primary-button { @apply inline-flex items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#10634f]; }
+  .secondary-button { @apply inline-flex items-center gap-2 rounded-lg border border-line bg-white px-4 py-2.5 text-sm font-medium text-ink transition-colors hover:bg-canvas disabled:cursor-wait disabled:opacity-50; }
+  .installer-button { @apply rounded-md px-3 py-2 text-xs font-medium text-muted transition-colors; }
+  .installer-button[aria-pressed="true"] { @apply bg-white text-ink; }
+  .step-number { @apply grid size-8 shrink-0 place-items-center rounded-lg bg-canvas font-mono text-xs font-semibold text-muted; }
+  #connection-notice[data-state="ready"] { border-color: #cfe5d9; background-color: #f0f8f3; }
+  #connection-notice[data-state="ready"] #notice-dot { background-color: var(--color-accent); }
+  #connection-notice[data-state="waiting"] #notice-dot { background-color: #b77b26; }
+  #connection-notice[data-state="error"] #notice-dot { background-color: #bb4e46; }
+}
+@media (prefers-reduced-motion: reduce) { *, ::before, ::after { transition-duration: 0s !important; } }

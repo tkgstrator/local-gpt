@@ -1,0 +1,13 @@
+import { test } from './test-support.mjs';
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { JSDOM } from 'jsdom';
+const require=createRequire(import.meta.url);
+test('model selection confirms the requested version and reasoning before returning',async()=>{
+ const page=new JSDOM('<button id="model" aria-label="Select ChatGPT model" aria-expanded="false"></button>');const doc=page.window.document;const selector=doc.querySelector('button');let current=4;let selected='Latest';
+ selector.addEventListener('click',()=>{if(selector.getAttribute('aria-expanded')==='true'){doc.querySelector('[role="menu"]')?.remove();selector.setAttribute('aria-expanded','false');return;}selector.setAttribute('aria-expanded','true');doc.body.insertAdjacentHTML('beforeend',`<div role="menu" aria-labelledby="model"><div data-model-picker-view-toggle></div><div role="menuitemradio" aria-checked="${selected==='Latest'}">Latest</div><div role="menuitemradio" aria-checked="${selected==='GPT-Test'}">GPT-Test</div><div data-reasoning-slider role="menuitem" tabindex="0"></div><span role="slider" aria-valuemax="4" aria-valuenow="${current}"></span><span role="status">${current===4?'Pro':'Medium'}, 1 of 5.</span></div>`);for(const node of doc.querySelectorAll('[role="menuitemradio"]'))node.addEventListener('click',()=>{selected=node.textContent;for(const other of doc.querySelectorAll('[role="menuitemradio"]'))other.setAttribute('aria-checked',String(other===node));});doc.querySelector('[data-reasoning-slider]').addEventListener('keydown',e=>{current+=e.key==='ArrowLeft'?-1:1;doc.querySelector('[role="slider"]').setAttribute('aria-valuenow',String(current));doc.querySelector('[role="status"]').textContent=(current===1?'Medium':'Pro')+', 1 of 5.';});});
+ const {selectModel}=require('../dist/model-selection.cjs');const capabilities={choices:[{model:'test-thinking',version:'test',versionLabel:'GPT-Test',title:'Medium',effort:'standard',index:1,count:5}]};const result=await selectModel(doc,capabilities,'test-thinking','standard');assert.equal(result.model,'test-thinking');assert.equal(selected,'GPT-Test');assert.equal(current,1);assert.equal(selector.getAttribute('aria-expanded'),'false');page.window.close();
+});
+test('unavailable model or effort fails without opening any menu',async()=>{
+ const page=new JSDOM('<button aria-label="Select ChatGPT model"></button>');let clicks=0;page.window.document.querySelector('button').onclick=()=>clicks++;const {selectModel}=require('../dist/model-selection.cjs');await assert.rejects(selectModel(page.window.document,{choices:[]},'unavailable'),e=>e.code==='model_unavailable');assert.equal(clicks,0);page.window.close();
+});
