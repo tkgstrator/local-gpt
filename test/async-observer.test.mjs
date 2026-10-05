@@ -117,3 +117,18 @@ test('built extension keeps saved draft recoverable and does not overwrite newer
   f.emit('new-draft',{kind:'started'});f.emit('new-draft',{kind:'answer',text:'Done'});f.emit('new-draft',{kind:'stop'});await f.until(()=>f.find('new-draft','stop'));await pause(1200);
   assert.equal(editor.textContent,'Newer draft');assert.equal(JSON.parse(f.page.sessionStorage.getItem('localgpt:draft-backups:v1'))[0].text,'Saved draft');assert.equal(f.page.document.querySelector('#localgpt-saved-drafts').hidden,false);
 });
+
+test('native failure in the same tick as an answer preserves acknowledged partial text before reporting failure', async t => {
+  const f = await fixture(t);
+  const id = 'failed-partial';
+  f.queue({type:'request',requestId:id,text:'Review',newChat:false,conversationId:target,backgroundJob:true});
+  await f.until(() => f.order.includes('click'));
+  f.emit(id, {kind:'started'});
+  f.emit(id, {kind:'answer',text:'Safe partial before native failure'});
+  f.emit(id, {kind:'error',code:'chatgpt_generation_failed'});
+  await f.until(() => f.find(id, 'error'));
+  assert.equal(f.find(id, 'answer')?.text, 'Safe partial before native failure');
+  const answerIndex=f.events.findIndex(e=>e.requestId===id&&e.type==='answer');
+  const errorIndex=f.events.findIndex(e=>e.requestId===id&&e.type==='error');
+  assert.ok(answerIndex >= 0 && answerIndex < errorIndex);
+});

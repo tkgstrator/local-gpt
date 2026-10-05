@@ -832,11 +832,6 @@ class App {
         state.conversationId !== request.conversationId
       )
         throw new DomError('conversation_changed', 'The API returned a different conversation.')
-      if (state.terminal?.kind === 'error')
-        throw new DomError(
-          state.terminal.code ?? 'chatgpt_api_error',
-          'ChatGPT response communication failed or was incomplete.',
-        )
       if (!this.connected()) {
         // Keep observing locally; the latest text and terminal state replay after reconnection.
         await this.waitForStreamEvent(Date.now() + 1000)
@@ -853,6 +848,12 @@ class App {
           continue
         }
       }
+      // A final error can arrive in the same task as the last text. Preserve delivery before failing.
+      if (state.terminal?.kind === 'error')
+        throw new DomError(
+          state.terminal.code ?? 'chatgpt_api_error',
+          'ChatGPT response communication failed or was incomplete.',
+        )
       if (state.terminal?.kind === 'stop') {
         if (!state.conversationId || !state.text?.trim())
           throw new DomError(
