@@ -65,3 +65,19 @@ test('Pro numbered tier comes from subscription SKU, never inferred from generic
  for(let i=0;i<30&&!receipt;i++)await new Promise(r=>setTimeout(r,10));
  assert.deepEqual(receipt,{messageId,conversationId:null});
  });
+
+test('armed native stream accepts bounded text normalization and refuses different internal text', async t => {
+ for(const [armedText,outgoing,expected] of [['  Review\r\nthis\n','Review\nthis',true],['Review  this','Review this',false],['Review\u00a0this','Review this',false]]) {
+  const page=new Window({url:'https://chatgpt.com/'});t.after(()=>page.close());
+  const user='f5eadb59-b96e-4ef5-9342-2f49d62b3c6f', conversation='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef3';
+  const body='data: '+JSON.stringify({conversation_id:conversation,message:{id:'094c6dd5-45d0-4da3-bd50-a79ef778addb',author:{role:'assistant'},channel:'final',recipient:'all',content:{content_type:'text',parts:['Done']},status:'finished_successfully',end_turn:true}})+'\n\ndata: [DONE]\n\n';
+  page.fetch=async()=>new Response(body,{headers:{'Content-Type':'text/event-stream'}});
+  require('../dist/page-observer.cjs').installPageObserver(page);const events=[];
+  page.addEventListener('localgpt:response-stream',e=>events.push(JSON.parse(e.detail)));
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm',{detail:JSON.stringify({requestId:'r',text:armedText,backgroundJob:true})}));
+  const response=await page.fetch('/backend-api/f/conversation',{body:JSON.stringify({messages:[{id:user,author:{role:'user'},content:{parts:[outgoing]}}],conversation_id:conversation})});
+  assert.equal(await response.text(),body);
+  for(let i=0;i<30&&!events.some(e=>e.kind==='stop');i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(events.some(e=>e.kind==='stop'),expected);
+ }
+});
