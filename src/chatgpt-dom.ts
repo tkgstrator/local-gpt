@@ -50,19 +50,71 @@ export function userTurn(doc: Document, id: string) {
     ) ?? null
   )
 }
+// Deliberately reject rich editor nodes rather than flattening them into plain text.
+export function readPlainDraft(editor: HTMLElement): string {
+  const win = editor.ownerDocument.defaultView!
+  if (editor instanceof win.HTMLTextAreaElement) return editor.value
+  const inline = (node: Node): string => {
+    if (node.nodeType === 3) return node.textContent ?? ''
+    if (
+      !(node instanceof win.HTMLElement) ||
+      node.tagName !== 'BR' ||
+      [...node.attributes].some((a) => a.name !== 'class') ||
+      (node.className && node.className !== 'ProseMirror-trailingBreak')
+    )
+      throw new DomError('draft_unsupported', 'A formatted draft cannot be safely suspended.')
+    return node.className === 'ProseMirror-trailingBreak' ? '' : '\n'
+  }
+  const children = [...editor.childNodes]
+  // ProseMirror decorates ordinary paragraphs, including its empty placeholder.
+  // Unknown metadata may describe semantic content, so keep this allowlist narrow.
+  const plainParagraph = (node: Node): node is HTMLElement =>
+    node instanceof win.HTMLElement &&
+    node.tagName === 'P' &&
+    [...node.attributes].every((a) => ['class', 'dir', 'data-placeholder'].includes(a.name))
+  if (children.some((n) => n instanceof win.HTMLElement && n.tagName === 'P')) {
+    // Whitespace between block elements is DOM layout, not composer text. NBSP,
+    // leading/trailing root text and whitespace within paragraphs remain content.
+    const firstParagraph = children.findIndex(plainParagraph)
+    const lastParagraph = children.length - 1 - [...children].reverse().findIndex(plainParagraph)
+    const paragraphs = children.filter((node, index) => {
+      if (node.nodeType !== 3 || !/^[ \t\r\n]*$/.test(node.textContent ?? '')) return true
+      return !(index > firstParagraph && index < lastParagraph)
+    })
+    if (!paragraphs.every(plainParagraph))
+      throw new DomError('draft_unsupported', 'The draft structure cannot be safely suspended.')
+    return paragraphs
+      .map((p) => {
+        const nodes = [...p.childNodes]
+        if (
+          nodes.length === 1 &&
+          nodes[0] instanceof win.HTMLElement &&
+          nodes[0].tagName === 'BR'
+        ) {
+          inline(nodes[0])
+          return ''
+        }
+        return nodes.map(inline).join('')
+      })
+      .join('\n')
+  }
+  return children.map(inline).join('')
+}
+
 export function writeEditor(doc: Document, text: string, editor = findEditor(doc)) {
   if (!editor.isConnected || editor.ownerDocument !== doc)
     throw new DomError('conversation_changed', 'The message editor changed.')
   const win = doc.defaultView
   if (!win) throw new DomError('editor_not_found', 'Editor window is unavailable.')
-  const existing =
-    editor instanceof win.HTMLTextAreaElement ? editor.value : editor.textContent || ''
-  if (existing.trim())
+  const existing = readPlainDraft(editor)
+  if (existing !== '')
     throw new DomError(
       'composer_not_empty',
       'An unsent draft is present; the bridge will not overwrite it.',
     )
   editor.focus()
+  if (!editor.isConnected || !isVisible(editor) || readPlainDraft(editor) !== '')
+    throw new DomError('composer_not_empty', 'The composer changed before native input.')
   if (editor instanceof win.HTMLTextAreaElement) {
     const setter = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, 'value')?.set
     if (!setter) throw new DomError('editor_unavailable', 'Textarea setter is unavailable.')
