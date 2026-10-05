@@ -280,6 +280,9 @@ export function createResponseJobStore(
     progress(id: string, phase: 'processing' | 'thinking' | 'answering' | 'unresponsive') {
       const job = jobs.get(id)
       if (!job || job.status !== 'in_progress') return
+      const changed = job.phase !== phase
+      // Repeated unknown observations are not activity and must not rewrite the record.
+      if (!changed && phase === 'unresponsive') return
       job.phase = phase
       job.updatedAt = stamp()
       if (phase === 'unresponsive')
@@ -289,7 +292,12 @@ export function createResponseJobStore(
         job.lastActivityAt = job.updatedAt
         delete job.message
       }
-      updated(job)
+      if (changed) updated(job)
+      else if (dir) {
+        // Native activity in the same phase shares the partial-text write batch.
+        dirty.add(id)
+        scheduleFlush(250)
+      }
     },
     complete(id: string, result: Record<string, unknown>) {
       const job = jobs.get(id)

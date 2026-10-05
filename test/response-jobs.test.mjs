@@ -271,3 +271,21 @@ test('failed expiry cleanup cannot break readers and retries deletion after stor
   assert.doesNotThrow(() => store.flush());
   assert.deepEqual(await readdir(dir), []);
 });
+
+test('unchanged answer phase batches disk writes and preserves newest activity while real phases persist immediately', async t => {
+  const dir = await tempDir(t); const { createResponseJobStore } = await import('../src/response-jobs.ts'); let now=1000;
+  const store=createResponseJobStore({dir, now:()=>now});t.after(()=>store.close());const job=store.create(),file=join(dir,job.id+'.json');
+  now=1100;store.progress(job.id,'answering');const before=await readFile(file,'utf8');const updates=[];store.subscribe(job.id,event=>updates.push(event));
+  for(let i=0;i<20;i++){now++;store.answer(job.id,'x'.repeat(i+1));store.progress(job.id,'answering');}
+  assert.equal(await readFile(file,'utf8'),before,'per-token unchanged phase must not write the full record');
+  assert.equal(store.get(job.id).lastActivityAt,new Date(now).toISOString());assert.equal(updates.filter(e=>e.type==='response_job.updated').length,0);
+  store.flush();const latest=JSON.parse(await readFile(file,'utf8'));assert.equal(latest.text,'x'.repeat(20));assert.equal(latest.job.lastActivityAt,new Date(now).toISOString());
+  now++;store.progress(job.id,'thinking');assert.equal(JSON.parse(await readFile(file,'utf8')).job.phase,'thinking');
+  store.answer(job.id,'last text');store.complete(job.id,{object:'response',status:'completed',answer:'Final'});assert.equal(JSON.parse(await readFile(file,'utf8')).job.status,'completed');
+});
+test('repeated unknown progress is not new activity and produces no writes or duplicate status notifications',async t=>{
+  const dir=await tempDir(t);const{createResponseJobStore}=await import('../src/response-jobs.ts');let now=1000;const store=createResponseJobStore({dir,now:()=>now});t.after(()=>store.close());const job=store.create(),file=join(dir,job.id+'.json');
+  now=2000;store.progress(job.id,'unresponsive');const first=store.get(job.id),saved=await readFile(file,'utf8'),updates=[];store.subscribe(job.id,event=>updates.push(event));
+  for(let i=0;i<20;i++){now++;store.progress(job.id,'unresponsive');}
+  assert.equal(await readFile(file,'utf8'),saved);assert.deepEqual(store.get(job.id),first);assert.equal(updates.length,0);
+});

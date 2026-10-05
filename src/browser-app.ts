@@ -56,6 +56,32 @@ const DEFINITE_FAILURES = [
   'chatgpt_api_error',
 ]
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+// Preserve stable guard codes that already prove the generation was never sent.
+// Other pre-click failures carry an explicit setup_ prefix, including transport loss.
+const DEFINITE_SETUP_FAILURES = new Set([
+  'browser_setup_timeout',
+  'browser_busy',
+  'chat_mode_required',
+  'dot_mode_requires_dot_api',
+  'composer_not_empty',
+  'new_chat_not_found',
+  'model_required',
+  'editor_not_found',
+  'editor_unavailable',
+  'model_selector_unavailable',
+  'model_unavailable',
+  'model_selection_failed',
+  'reasoning_selector_unavailable',
+  'attachment_draft_present',
+  'attachment_input_unavailable',
+  'attachment_upload_failed',
+  'attachment_upload_timeout',
+  'draft_unsupported',
+  'draft_clear_failed',
+  'draft_storage_unavailable',
+  'draft_too_large',
+  'draft_backup_conflict',
+])
 export type HttpBridge = (path: string, data: unknown, browserId: string) => Promise<unknown>
 class App {
   private responseStream: {
@@ -288,38 +314,40 @@ class App {
     } else if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(event))
   }
   // Resolves true only when the server confirmed it took the event (HTTP reply or WebSocket event_ack).
-  private async sendObserved(event: BrowserEvent): Promise<boolean> {
+  private async sendObserved(event: BrowserEvent): Promise<boolean | null> {
     if (this.transport === 'http') {
       try {
         await this.events
         const reply = await this.httpRequest('event', event)
         this.httpConnected = true
-        return (
+        if (
           typeof reply === 'object' &&
           reply !== null &&
           'accepted' in reply &&
-          reply.accepted === true
+          typeof reply.accepted === 'boolean'
         )
+          return reply.accepted
+        return null
       } catch {
         this.httpConnected = false
         this.responseStream?.wake?.()
-        return false
+        return null
       }
     }
-    if (this.socket?.readyState !== WebSocket.OPEN || event.type === 'heartbeat') return false
+    if (this.socket?.readyState !== WebSocket.OPEN || event.type === 'heartbeat') return null
     const eventId = crypto.randomUUID()
-    return new Promise<boolean>((resolve) => {
-      const done = (received: boolean) => {
+    return new Promise<boolean | null>((resolve) => {
+      const done = (received: boolean | null) => {
         clearTimeout(timer)
         this.acknowledgements.delete(eventId)
         resolve(received)
       }
-      const timer = setTimeout(() => done(false), 4000)
+      const timer = setTimeout(() => done(null), 4000)
       this.acknowledgements.set(eventId, done)
       try {
         this.socket!.send(JSON.stringify({ ...event, eventId }))
       } catch {
-        done(false)
+        done(null)
       }
     })
   }
@@ -706,8 +734,9 @@ class App {
         )
       }
       // Poll immediately after sending; there is no load-event or observer-start race.
-      send.click()
+      // A click can invoke page handlers before throwing; once attempted, unsent is no longer proven.
       dispatched = true
+      send.click()
       if (background) {
         deadline = Infinity
         await this.observeBackground(request)
@@ -791,10 +820,13 @@ class App {
               'browser_error',
               err instanceof Error ? err.message : 'Unknown browser error',
             )
-      // Before dispatch a setup timeout is definite; after dispatch anything but a native failure is unknown.
-      if (background && !dispatched && error.code === 'browser_timeout')
-        error = new DomError('browser_setup_timeout', error.message)
-      this.send({
+      if (background && !dispatched) {
+        if (error.code === 'browser_timeout')
+          error = new DomError('browser_setup_timeout', error.message)
+        else if (!DEFINITE_SETUP_FAILURES.has(error.code))
+          error = new DomError(`setup_${error.code}`, error.message)
+      }
+      const failure: BrowserEvent = {
         type: 'error',
         requestId: request.requestId,
         code:
@@ -802,7 +834,31 @@ class App {
             ? `observation_${error.code}`
             : error.code,
         message: error.message,
-      })
+      }
+      if (background) {
+        // Retain the active request until ownership is acknowledged; replay events only, never the send.
+        while (!this.destroyed) {
+          const state = this.responseStream
+          if (state?.conversationId && state.text !== null && state.text !== state.forwardedText) {
+            const partial = state.text
+            if (
+              !(await this.sendObserved({
+                type: 'answer',
+                requestId: request.requestId,
+                text: partial,
+              }))
+            ) {
+              await sleep(1000)
+              continue
+            }
+            state.forwardedText = partial
+          }
+          const accepted = await this.sendObserved(failure)
+          // An explicit rejection can release this tab only when no send was ever attempted.
+          if (accepted === true || (!dispatched && accepted === false)) break
+          await sleep(1000)
+        }
+      } else this.send(failure)
       this.setStatus(`${error.code}\n${error.message}`)
       console.error('[LocalGPT]', error.code, error.message)
     } finally {

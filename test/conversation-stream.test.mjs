@@ -33,7 +33,17 @@ test('native reasoning progress exposes phase without leaking thinking text', as
   const events = await observe(frame(root(reasoning)) + frame(root(final)) + 'data: [DONE]\n\n'); assert.ok(events.some(e => e.kind === 'progress' && e.phase === 'thinking')); assert.ok(events.some(e => e.kind === 'progress' && e.phase === 'answering')); assert.equal(JSON.stringify(events).includes('Private reasoning'), false); assert.equal(events.at(-1).kind, 'stop');
 });
 test('explicit native failed and cancelled statuses are distinct from silence and timeouts', async () => {
-  for (const [status, code] of [['cancelled', 'chatgpt_generation_cancelled'], ['failed', 'chatgpt_generation_failed']]) { const e = await observe(frame(root({ ...message('analysis'), status })) + 'data: [DONE]\n\n'); assert.equal(e.at(-1).kind, 'error'); assert.equal(e.at(-1).code, code); }
+  for (const [status, code] of [['cancelled', 'chatgpt_generation_cancelled'], ['failed', 'chatgpt_generation_failed']]) { const e = await observe(frame(root({ ...message('final'), status })) + 'data: [DONE]\n\n'); assert.equal(e.at(-1).kind, 'error'); assert.equal(e.at(-1).code, code); }
+});
+test('failed hidden reasoning and tool steps do not fail a later successful final answer', async () => {
+  for (const intermediate of [message('analysis'), message('final', 'assistant', 'python'), message('final', 'tool'), {...message(), metadata:{is_visually_hidden_from_conversation:true}}]) {
+    intermediate.status='failed'; intermediate.content.parts=['Private intermediate failure'];
+    const final={...message(),content:{content_type:'text',parts:['Successful final answer']},status:'finished_successfully',end_turn:true};
+    const events=await observe(frame(root(intermediate))+frame(root(final))+'data: [DONE]\n\n');
+    assert.equal(events.at(-1).kind,'stop');
+    assert.equal(events.some(e=>e.kind==='error'),false);
+    assert.equal(JSON.stringify(events).includes('Private intermediate'),false);
+  }
 });
 test('idle native stream becomes unresponsive without ending, and recovers on activity', async () => {
   const { observeConversationResponse } = await import('../src/conversation-stream.ts'); let controller; const events = [];

@@ -104,7 +104,8 @@ Composeは既存のLocalGPT状態ボリュームに`LOCALGPT_RESPONSE_JOBS_DIR=/
 2. ChatGPTを開き、生成中でないこと（待機状態）を目視で確認します。生成中なら停止または完了を待ちます。
 3. `localgpt-state`ボリュームの`response-jobs`と`sessions.sqlite`のバックアップを取ります。
 4. 該当ジョブの`<id>.json`を削除します。必要な途中本文は先に控えます。
-5. LocalGPTを再起動します。
+5. ChatGPTの同じタブを再読み込みし、古い観測処理を終了します。入力途中の文章や保存した下書きは先に回収してください。
+6. LocalGPTを再起動します。
 
 ChatGPT側の生成を取り消したとは見なしません。必要ならChatGPT上で手動で確認してください。
 

@@ -84,10 +84,6 @@ export async function observeConversationResponse(
     }
     const m = value.message
     if (!object(m) || !object(m.author) || !object(m.content)) return
-    if (m.author.role === 'assistant' && (m.status === 'failed' || m.status === 'cancelled'))
-      throw new StreamError(
-        m.status === 'cancelled' ? 'chatgpt_generation_cancelled' : 'chatgpt_generation_failed',
-      )
     if (m.author.role === 'assistant' && m.channel === 'analysis') activity('thinking')
     if (m.content.content_type === 'model_editable_context') return
     if (m.author.role !== 'assistant') return
@@ -97,6 +93,11 @@ export async function observeConversationResponse(
     )
       return
     if (object(m.metadata) && m.metadata.is_visually_hidden_from_conversation === true) return
+    // A failed internal tool/reasoning step does not establish that the final response failed.
+    if (m.status === 'failed' || m.status === 'cancelled')
+      throw new StreamError(
+        m.status === 'cancelled' ? 'chatgpt_generation_cancelled' : 'chatgpt_generation_failed',
+      )
     if (typeof m.id !== 'string' || !object(m.content)) return
     if (
       m.content.content_type !== 'text' ||
@@ -105,8 +106,6 @@ export async function observeConversationResponse(
     ) {
       throw new StreamError('unsupported_response_content')
     }
-    if (m.status === 'failed' || m.status === 'cancelled')
-      throw new StreamError('chatgpt_api_error')
     if (m.content.parts.join('').trim()) activity('answering')
     answers.set(m.id, m.content.parts.join(''))
     textStates.set(m.id, m.status === 'finished_successfully')

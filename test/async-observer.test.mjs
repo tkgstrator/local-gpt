@@ -44,14 +44,14 @@ test('page observer has no project or image feature coupling', async () => {
 async function fixture(t, url = `https://chatgpt.com/c/${target}`) {
   const page = new Window({ url }); t.after(async () => { page.dispatchEvent(new page.Event('pagehide')); await page.happyDOM.abort(); page.close(); });
   page.document.body.innerHTML = '<div role="textbox" contenteditable="true"></div><button aria-label="Send">Send</button>'; await page.happyDOM.waitUntilComplete(); installNativeEditing(page);
-  let queued = null, failBridge = false; const events = [], order = [];
-  page.chrome = { runtime: { sendMessage: async r => { if (failBridge && r.path === 'event') return { ok: false, error: 'Simulated disconnect' }; if (r.path === 'poll') { const request = queued; queued = null; return { ok: true, data: { request } }; } events.push(r.data); return { ok: true, data: { ok: true, accepted: r.data.type !== 'heartbeat' } }; } } };
+  let queued = null, failBridge = false, rejectEvent = false; const events = [], order = [], attempts = [];
+  page.chrome = { runtime: { sendMessage: async r => { if (r.path === 'event') attempts.push(r.data); if (failBridge && r.path === 'event') return { ok: false, error: 'Simulated disconnect' }; if (r.path === 'poll') { const request = queued; queued = null; return { ok: true, data: { request } }; } events.push(r.data); return { ok: true, data: { ok: true, accepted: rejectEvent !== r.data.requestId && r.data.type !== 'heartbeat' } }; } } };
   page.addEventListener('localgpt:stream-arm', () => order.push('arm')); page.document.querySelector('button').addEventListener('click', () => order.push('click'));
   const globals = ['chrome', 'window', 'document', 'location', 'HTMLTextAreaElement', 'WebSocket', 'CustomEvent', 'crypto', 'sessionStorage', 'setTimeout', 'clearTimeout'];
   new Function(...globals, await readFile('dist/extension/content.js', 'utf8'))(...globals.map(k => k === 'window' ? page : ['setTimeout', 'clearTimeout'].includes(k) ? page[k].bind(page) : page[k]));
   const emit = (id, event) => page.dispatchEvent(new page.CustomEvent('localgpt:response-stream', { detail: JSON.stringify({ requestId: id, messageId: mid, conversationId: target, ...event }) }));
   const find = (id, type) => events.find(e => e.requestId === id && e.type === type);
-  return { page, events, order, queue: r => queued = r, setDisconnected: v => failBridge = v, emit, find, async until(check) { for (let i = 0; i < 250; i++) { const v = check(); if (v) return v; await pause(20); } throw Error('timeout'); } };
+  return { page, events, order, attempts, queue: r => queued = r, setDisconnected: v => failBridge = v, setRejected: v => rejectEvent = v, emit, find, async until(check) { for (let i = 0; i < 250; i++) { const v = check(); if (v) return v; await pause(20); } throw Error('timeout'); } };
 }
 test('background dispatch arms the native stream BEFORE clicking send', async t => {
   const f = await fixture(t); f.queue({ type: 'request', requestId: 'order', text: 'Review', newChat: false, conversationId: target, backgroundJob: true }); await f.until(() => f.order.includes('click'));
@@ -131,4 +131,48 @@ test('native failure in the same tick as an answer preserves acknowledged partia
   const answerIndex=f.events.findIndex(e=>e.requestId===id&&e.type==='answer');
   const errorIndex=f.events.findIndex(e=>e.requestId===id&&e.type==='error');
   assert.ok(answerIndex >= 0 && answerIndex < errorIndex);
+});
+
+
+test('known predispatch disconnect is retained and acknowledged after reconnect without clicking send', { timeout: 20000 }, async t => {
+  const f = await fixture(t), id = 'setup-disconnect';
+  f.page.document.querySelector('button').disabled = true;
+  f.queue({ type: 'request', requestId: id, text: 'Review', newChat: false, conversationId: target, backgroundJob: true, timeoutMs: 5000 });
+  await f.until(() => f.page.document.querySelector('[role="textbox"]').textContent === 'Review');
+  f.setDisconnected(true);
+  await f.until(() => f.attempts.find(e => e.requestId === id && e.type === 'error'));
+  assert.equal(f.find(id, 'error'), undefined);
+  assert.equal(f.order.includes('click'), false);
+  f.setDisconnected(false);
+  const error = await f.until(() => f.find(id, 'error'));
+  assert.equal(error.code, 'setup_browser_disconnected');
+  assert.equal(f.order.includes('click'), false);
+  assert.ok(f.attempts.filter(e => e.requestId === id && e.type === 'error').length > 1);
+});
+
+test('explicit native failure is retained until acknowledged after reconnect without redispatching', { timeout: 20000 }, async t => {
+  const f = await fixture(t), id = 'failure-reconnect';
+  f.queue({ type: 'request', requestId: id, text: 'Review', newChat: false, conversationId: target, backgroundJob: true });
+  await f.until(() => f.order.includes('click'));
+  f.emit(id, { kind: 'started' });
+  f.setDisconnected(true);
+  f.emit(id, { kind: 'error', code: 'chatgpt_generation_failed' });
+  await f.until(() => f.attempts.find(e => e.requestId === id && e.type === 'error'));
+  assert.equal(f.find(id, 'error'), undefined);
+  f.setDisconnected(false);
+  assert.equal((await f.until(() => f.find(id, 'error'))).code, 'chatgpt_generation_failed');
+  assert.equal(f.order.filter(x => x === 'click').length, 1);
+  assert.equal(f.order.filter(x => x === 'arm').length, 1);
+});
+
+test('explicit server rejection releases a definitely unsent setup failure instead of wedging the tab', async t => {
+ const f=await fixture(t),button=f.page.document.querySelector('button');button.disabled=true;
+ f.queue({type:'request',requestId:'forgotten-setup',text:'Review',newChat:false,conversationId:target,backgroundJob:true,timeoutMs:10000});
+ await f.until(()=>f.page.document.querySelector('[role="textbox"]').textContent==='Review');
+ f.setDisconnected(true);await f.until(()=>f.attempts.some(e=>e.requestId==='forgotten-setup'&&e.type==='error'));
+ f.setRejected('forgotten-setup');f.setDisconnected(false);await f.until(()=>f.find('forgotten-setup','error'));await pause(100);
+ assert.equal(f.order.includes('click'),false);
+ button.disabled=false;f.page.document.querySelector('[role="textbox"]').textContent='';
+ f.queue({type:'request',requestId:'after-forgotten',text:'Next',newChat:false,conversationId:target,backgroundJob:true});
+ await f.until(()=>f.order.includes('click'));f.emit('after-forgotten',{kind:'started'});f.emit('after-forgotten',{kind:'answer',text:'Done'});f.emit('after-forgotten',{kind:'stop'});await f.until(()=>f.find('after-forgotten','stop'));
 });

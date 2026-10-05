@@ -26,6 +26,9 @@ type PageWindow = Pick<Window, 'location' | 'dispatchEvent' | 'addEventListener'
   Headers: typeof Headers
   Request: typeof Request
 }
+// Match native editor line endings/outer ASCII whitespace without merging distinct internal text.
+const submittedText = (text: string) =>
+  text.replace(/\r\n?/g, '\n').replace(/^[ \t\n]+|[ \t\n]+$/g, '')
 export function installPageObserver(page: PageWindow) {
   // One armed send at a time; only the request whose exact outgoing user text matches is observed.
   let armed: ReturnType<typeof StreamArmSchema.parse> | null = null
@@ -100,8 +103,9 @@ export function installPageObserver(page: PageWindow) {
             if (
               armed &&
               Array.isArray(message?.content?.parts) &&
-              message.content.parts.filter((part) => typeof part === 'string').join('') ===
-                armed.text
+              submittedText(
+                message.content.parts.filter((part) => typeof part === 'string').join(''),
+              ) === submittedText(armed.text)
             ) {
               const { requestId, timeoutMs, backgroundJob } = armed
               armed = null
