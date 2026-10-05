@@ -1,6 +1,7 @@
 import { attachLocalMcpTools, readLocalMcpConfig, type LocalMcpConfig } from './localmcp'
 import { filePrompt, loadFiles } from './attachments'
 import { createSessionStore, CreateSessionSchema } from './sessions'
+import { createResponseJobStore, ResponseJobStorageError } from './response-jobs'
 import { DotActionSchema } from './dots'
 import express from 'express'
 import { createMcpServer } from './mcp'
@@ -40,26 +41,63 @@ interface Options {
   timeoutMs: number
   bridgeToken?: string
   pollingLeaseMs?: number
+  responseJobsDir?: string
   sessionsFile?: string
   localMcp?: LocalMcpConfig
+}
+// Browser errors after dispatch that say nothing definite about the remote generation.
+const UNKNOWN_OUTCOME = new Set([
+  'browser_timeout',
+  'browser_disconnected',
+  'response_stream_incomplete',
+  'unsupported_response_stream',
+  'unsupported_response_content',
+  'response_stream_too_large',
+  'response_incomplete',
+  'response_stream_unavailable',
+  'stream_interrupted',
+  'response_stream_interrupted',
+  'response_stream_timeout',
+])
+interface GenerationSink {
+  status(code: number): GenerationSink
+  json(value: unknown): unknown
+  setHeader(name: string, value: string): unknown
+  flushHeaders(): void
+  write(chunk: string): unknown
+  end(): unknown
+  on(event: 'close', listener: () => void): unknown
+  answer?(text: string): void
+  admitted?(context: {
+    requestId: string
+    browserId: string
+    sessionId?: string
+    conversationId?: string
+  }): void
+  progress?(phase: 'processing' | 'thinking' | 'answering' | 'unresponsive'): void
+  backgroundJob?: boolean
 }
 interface Pending {
   requestId: string
   sessionId?: string
   navigating?: boolean
+  background?: boolean
+  suspend?: () => void
   event: (event: BrowserEvent) => void
   fail: (status: number, code: string, message: string) => void
 }
 export function createService(options: Options) {
+  const jobs = createResponseJobStore({ dir: options.responseJobsDir })
+  // A restored pending job has an unknown remote outcome; keep the browser reserved until manual recovery.
+  const restoredUnknown = jobs.activeCount() > 0
   const sessions = createSessionStore(options.sessionsFile)
   const app = express()
   const http = createServer(app)
   let wsServer: Server<SocketData> | null = null
   const lanes = new Map<string, BrowserLane>()
-  const sessionOwners = new Map<string, string>()
   const dotOwners = new Map<string, string>()
-  let lastDotLane: string | null = null
-  let legacyOwner: string | null = null
+  let sharedBrowserId: string | null = null
+  const handledRequests = new Set<string>()
   const laneFor = (id: string) => {
     let lane = lanes.get(id)
     if (!lane) {
@@ -68,14 +106,20 @@ export function createService(options: Options) {
     }
     return lane
   }
-  const availableLane = (sessionId?: string) => {
-    const owner = sessionId ? lanes.get(sessionOwners.get(sessionId) ?? '') : undefined
-    return owner && connected(owner) && !owner.pending
-      ? owner
-      : ([...lanes.values()].find((lane) => connected(lane) && !lane.pending) ??
-          [...lanes.values()].find((lane) => connected(lane)) ??
-          laneFor('disconnected'))
+  // ChatGPT tabs share account UI state; permit one browser operation service-wide.
+  const browserBusy = () =>
+    restoredUnknown || [...lanes.values()].some((lane) => lane.pending !== null)
+  const busyMessage =
+    'LocalGPT is processing another browser operation. Wait for it to finish before retrying.'
+  // One shared tab receives all operations. Standby tabs are used only after it disconnects with nothing in flight.
+  const availableLane = () => {
+    const shared = sharedBrowserId ? lanes.get(sharedBrowserId) : undefined
+    if (shared && (connected(shared) || shared.pending)) return shared
+    const replacement = [...lanes.values()].find((lane) => connected(lane))
+    sharedBrowserId = replacement?.id ?? null
+    return replacement ?? laneFor('disconnected')
   }
+  app.use('/bridge/event', express.json({ limit: '12mb' }))
   app.use(express.json({ limit: '1mb' }))
   const wsConnected = (lane: BrowserLane) => lane.browser?.readyState === 1
   const pollingLeaseMs = options.pollingLeaseMs ?? 5000
@@ -85,8 +129,14 @@ export function createService(options: Options) {
   const expireLane = (lane: BrowserLane) => {
     if (lane.polling && !pollingConnected(lane)) {
       lane.polling = null
+      const undelivered = lane.pending && lane.queued?.requestId === lane.pending.requestId
       lane.queued = null
-      lane.pending?.fail(503, 'browser_disconnected', 'ChatGPT HTTP browser connection expired.')
+      // A request never handed to the browser is a definite failure; a delivered one is unknown.
+      if (undelivered)
+        lane.pending?.fail(503, 'browser_undelivered', 'The browser never received the request.')
+      else if (lane.pending?.background) lane.pending.suspend?.()
+      else
+        lane.pending?.fail(503, 'browser_disconnected', 'ChatGPT HTTP browser connection expired.')
     }
   }
   const expirePolling = () => {
@@ -214,17 +264,15 @@ export function createService(options: Options) {
   app.get('/health', (_req, res) => {
     expirePolling()
     const active = [...lanes.values()].filter((lane) => connected(lane))
+    const shared = availableLane()
     res.json({
       status: 'ok',
       browserConnected: active.length > 0,
-      transport: active.some((lane) => wsConnected(lane))
-        ? 'websocket'
-        : active.length
-          ? 'http'
-          : null,
-      busy: active.some((lane) => lane.pending !== null),
+      transport: wsConnected(shared) ? 'websocket' : pollingConnected(shared) ? 'http' : null,
+      busy: browserBusy(),
       browsers: active.length,
-      availableBrowsers: active.filter((lane) => !lane.pending).length,
+      sharedBrowserId: connected(shared) || shared.pending ? shared.id : null,
+      availableBrowsers: active.length > 0 && !browserBusy() ? 1 : 0,
       wsPort: options.wsPort,
     })
   })
@@ -259,16 +307,25 @@ export function createService(options: Options) {
     lane.queued = null
     res.json({ request })
   })
-  app.post('/bridge/event', (req, res) => {
+  app.post('/bridge/event', async (req, res) => {
     const lane = res.locals.lane as BrowserLane
     const parsed = BrowserEventSchema.safeParse(req.body as unknown)
     if (!parsed.success) {
       res.status(400).json({ error: { code: 'invalid_browser_message' } })
       return
     }
-    if (parsed.data.type !== 'heartbeat' && parsed.data.requestId === lane.pending?.requestId)
-      lane.pending.event(parsed.data)
-    res.json({ ok: true })
+    const event = parsed.data
+    if (event.type === 'heartbeat') {
+      res.json({ ok: true, accepted: false })
+      return
+    }
+    const matched = event.requestId === lane.pending?.requestId
+    if (matched) {
+      await lane.pending!.event(event)
+      remember(event.requestId)
+    }
+    // accepted tells an observing browser whether the server took ownership of this event.
+    res.json({ ok: true, accepted: matched || handledRequests.has(event.requestId) })
   })
   const extensionVersion = (
     JSON.parse(readFileSync(resolve('extension/manifest.json'), 'utf8')) as { version: string }
@@ -290,6 +347,10 @@ export function createService(options: Options) {
   app.get('/', info)
   app.get('/v1/chat/completions', info)
   app.get('/v1/responses', info)
+  const remember = (requestId: string) => {
+    handledRequests.add(requestId)
+    if (handledRequests.size > 1000) handledRequests.delete(handledRequests.values().next().value!)
+  }
   const receiveBrowserMessage = (raw: string | Buffer, lane: BrowserLane) => {
     let value: unknown
     try {
@@ -303,8 +364,25 @@ export function createService(options: Options) {
       lane.pending?.fail(502, 'invalid_browser_message', 'Browser message failed validation.')
       return
     }
-    if (parsed.data.type !== 'heartbeat' && parsed.data.requestId === lane.pending?.requestId)
-      lane.pending.event(parsed.data)
+    const event = parsed.data
+    if (event.type === 'heartbeat') return
+    const matched = event.requestId === lane.pending?.requestId
+    const handling = matched ? lane.pending!.event(event) : undefined
+    if (matched) remember(event.requestId)
+    // WebSocket replay needs delivery proof; acknowledge only after the server handled the event.
+    if (event.eventId)
+      void Promise.resolve(handling)
+        .then(() =>
+          lane.browser?.send(
+            JSON.stringify({
+              type: 'event_ack',
+              requestId: event.requestId,
+              eventId: event.eventId,
+              accepted: matched || handledRequests.has(event.requestId),
+            }),
+          ),
+        )
+        .catch(() => lane.pending?.suspend?.())
   }
   app.get('/v1/models', (_req, res) => {
     const lane = availableLane()
@@ -315,8 +393,8 @@ export function createService(options: Options) {
       error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
       return
     }
-    if (lane.pending) {
-      error(409, 'browser_busy', 'The browser is processing another request.')
+    if (browserBusy()) {
+      error(409, 'browser_busy', busyMessage)
       return
     }
     const requestId = randomUUID()
@@ -386,8 +464,8 @@ export function createService(options: Options) {
       error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
       return
     }
-    if (lane.pending) {
-      error(409, 'browser_busy', 'The browser is processing another request.')
+    if (browserBusy()) {
+      error(409, 'browser_busy', busyMessage)
       return
     }
     const requestId = randomUUID()
@@ -467,16 +545,24 @@ export function createService(options: Options) {
     }
     expirePolling()
     const ownerId =
-      operation.data.action === 'list' ? lastDotLane : dotOwners.get(operation.data.dotId)
-    const lane = ownerId ? (lanes.get(ownerId) ?? laneFor('disconnected')) : availableLane()
+      operation.data.action === 'list' ? undefined : dotOwners.get(operation.data.dotId)
+    const lane = availableLane()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
     if (!connected(lane)) {
       error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
       return
     }
-    if (lane.pending) {
-      error(409, 'browser_busy', 'The browser is processing another request.')
+    if (browserBusy()) {
+      error(409, 'browser_busy', busyMessage)
+      return
+    }
+    if (operation.data.action !== 'list' && ownerId && ownerId !== lane.id) {
+      error(
+        409,
+        'dot_browser_changed',
+        'The shared ChatGPT tab changed. List and select the dot again before continuing.',
+      )
       return
     }
     const requestId = randomUUID()
@@ -526,7 +612,6 @@ export function createService(options: Options) {
             return
           }
         }
-        lastDotLane = lane.id
         if (event.result.action === 'list') {
           for (const dot of event.result.dots)
             if (!dotOwners.has(dot.id) || event.result.selected === dot.id)
@@ -547,9 +632,13 @@ export function createService(options: Options) {
       })
     else lane.queued = payload
   })
-  app.post(['/v1/chat/completions', '/v1/responses'], (req, res) => {
+  const generate = (
+    req: { body: unknown; path: string },
+    res: GenerationSink,
+    forceResponses = false,
+  ) => {
     expirePolling()
-    const responsesMode = req.path === '/v1/responses'
+    const responsesMode = forceResponses || req.path === '/v1/responses'
     const responsesParsed = responsesMode
       ? ResponsesRequestSchema.safeParse(req.body as unknown)
       : null
@@ -570,35 +659,13 @@ export function createService(options: Options) {
       )
       return
     }
-    const lane =
-      !parsed.data.session_id && !parsed.data.newChat && legacyOwner
-        ? (lanes.get(legacyOwner) ?? laneFor('disconnected'))
-        : availableLane(parsed.data.session_id)
-    if (
-      [...lanes.values()].some(
-        (other) => other.pending && (!parsed.data.session_id || !other.pending.sessionId),
-      )
-    ) {
-      error(409, 'browser_busy', 'Use distinct session_id values for concurrent requests.')
-      return
-    }
-    if (
-      parsed.data.session_id &&
-      [...lanes.values()].some((other) => other.pending?.sessionId === parsed.data.session_id)
-    ) {
-      error(409, 'session_busy', 'This session is already generating a response.')
+    const lane = availableLane()
+    if (browserBusy()) {
+      error(409, 'browser_busy', busyMessage)
       return
     }
     if (!connected(lane)) {
       error(503, 'browser_disconnected', 'Open ChatGPT with the built userscript enabled.')
-      return
-    }
-    if (lane.pending) {
-      error(
-        409,
-        'browser_busy',
-        'All connected ChatGPT tabs are busy. Open another ChatGPT tab for a different session.',
-      )
       return
     }
     let files: ReturnType<typeof loadFiles>
@@ -650,6 +717,11 @@ export function createService(options: Options) {
     }
     const fail = (status: number, code: string, message: string) => {
       if (finished) return
+      // An observed send may still be generating: transport loss is unknown, never a failure.
+      if (res.backgroundJob && ['browser_disconnected', 'invalid_browser_message'].includes(code)) {
+        res.progress?.('unresponsive')
+        return
+      }
       cleanup()
       if (streamingStarted && responses) {
         responses.fail(text, code, message)
@@ -659,18 +731,43 @@ export function createService(options: Options) {
         res.end()
       } else error(status, code, message)
     }
-    const timer = setTimeout(
-      () => fail(504, 'browser_timeout', 'Timed out waiting for the ChatGPT browser.'),
-      options.timeoutMs,
-    )
+    const background = res.backgroundJob === true
+    // Async jobs have no wall deadline: ChatGPT may still be working.
+    const timer = background
+      ? undefined
+      : setTimeout(
+          () =>
+            fail(
+              504,
+              'browser_timeout',
+              'The response deadline expired. ChatGPT may still be working; the outcome is unknown. Do not automatically resend.',
+            ),
+          options.timeoutMs,
+        )
     lane.pending = {
       requestId,
       fail,
+      background,
+      suspend: () => {
+        if (!finished) res.progress?.('unresponsive')
+      },
       sessionId: body.session_id,
       event(event) {
         if (finished || event.type === 'heartbeat') return
         if (event.type === 'error') {
+          // Only an explicit native failure or a definite pre-send failure ends a job.
+          if (
+            background &&
+            (event.code.startsWith('observation_') || UNKNOWN_OUTCOME.has(event.code))
+          ) {
+            res.progress?.('unresponsive')
+            return
+          }
           fail(502, event.code, event.message)
+          return
+        }
+        if (event.type === 'progress') {
+          res.progress?.(event.phase)
           return
         }
         if (event.type === 'navigate') {
@@ -690,6 +787,8 @@ export function createService(options: Options) {
           return
         }
         if (event.type === 'answer') {
+          res.answer?.(event.text)
+          res.progress?.('answering')
           if (body.stream) {
             startStream()
             // Streaming can append text, but cannot retract a previous delta.
@@ -718,13 +817,11 @@ export function createService(options: Options) {
           }
           try {
             sessions.bind(session.id, event.conversationId, body.model, body.reasoning?.effort)
-            sessionOwners.set(session.id, lane.id)
           } catch {
             fail(502, 'session_mismatch', 'Browser replied from a different conversation.')
             return
           }
         }
-        if (!body.session_id) legacyOwner = lane.id
         cleanup()
         if (body.stream) {
           startStream()
@@ -748,6 +845,12 @@ export function createService(options: Options) {
           })
       },
     }
+    res.admitted?.({
+      requestId,
+      browserId: lane.id,
+      ...(body.session_id ? { sessionId: body.session_id } : {}),
+      ...(session?.conversationId ? { conversationId: session.conversationId } : {}),
+    })
     res.on('close', () => {
       if (!finished) cleanup()
     })
@@ -755,6 +858,8 @@ export function createService(options: Options) {
     const payload: BrowserRequest = {
       type: 'request',
       requestId,
+      timeoutMs: options.timeoutMs,
+      ...(background ? { backgroundJob: true } : {}),
       ...(files.some((file) => file.mode === 'upload')
         ? { files: files.filter((file) => file.mode === 'upload') }
         : {}),
@@ -769,6 +874,162 @@ export function createService(options: Options) {
         if (err) fail(503, 'browser_disconnected', 'Unable to send to the browser.')
       })
     else lane.queued = payload
+  }
+  app.post(['/v1/chat/completions', '/v1/responses'], (req, res) => generate(req, res))
+  app.post('/v1/response-jobs', (req, res) => {
+    const parsed = ResponsesRequestSchema.safeParse(req.body as unknown)
+    if (!parsed.success || parsed.data.stream) {
+      res.status(400).json({
+        error: {
+          code: 'invalid_request',
+          message: 'Response jobs require a valid non-streaming Responses request.',
+        },
+      })
+      return
+    }
+    expirePolling()
+    if (browserBusy()) {
+      res.status(409).json({ error: { code: 'browser_busy', message: busyMessage } })
+      return
+    }
+    let job: ReturnType<typeof jobs.create>
+    try {
+      job = jobs.create()
+    } catch (error) {
+      res.status(503).json({
+        error: {
+          code: error instanceof ResponseJobStorageError ? error.code : 'response_job_capacity',
+          message:
+            error instanceof ResponseJobStorageError
+              ? error.message
+              : 'Response job capacity reached; wait for completed results to expire.',
+        },
+      })
+      return
+    }
+    let admitted = false
+    let status = 200
+    let rejected: unknown
+    const sink: GenerationSink = {
+      status(code) {
+        status = code
+        return sink
+      },
+      json(value) {
+        if (!admitted) {
+          rejected = value
+          return
+        }
+        if (status >= 400) {
+          const failure = value as { error: { code: string; message?: string } }
+          jobs.fail(
+            job.id,
+            failure.error.code,
+            failure.error.message ?? 'Response retrieval failed.',
+          )
+        } else jobs.complete(job.id, value as Record<string, unknown>)
+      },
+      setHeader() {},
+      flushHeaders() {},
+      write() {},
+      end() {},
+      on() {},
+      admitted(context) {
+        admitted = true
+        jobs.context(job.id, context)
+      },
+      backgroundJob: true,
+      progress(phase) {
+        jobs.progress(job.id, phase)
+      },
+      answer(text) {
+        jobs.answer(job.id, text)
+      },
+    }
+    // Direct synchronous admission shares the browser lock with ordinary responses.
+    // The job sink deliberately has no dependency on this HTTP client's lifetime.
+    generate({ body: parsed.data, path: '/v1/responses' }, sink, true)
+    if (!admitted) {
+      jobs.remove(job.id)
+      res.status(status).json(rejected)
+      return
+    }
+    res.setHeader('Cache-Control', 'no-store')
+    res.status(202).json(jobs.get(job.id))
+  })
+  app.get('/v1/response-jobs/:id/events', (req, res) => {
+    const id = req.params.id as string
+    const waitMs = Number(req.query.wait_ms ?? 25000)
+    if (!Number.isInteger(waitMs) || waitMs < 1 || waitMs > 60000) {
+      res.status(400).json({ error: { code: 'invalid_wait_ms' } })
+      return
+    }
+    const job = jobs.get(id)
+    if (!job) {
+      res.status(404).json({ error: { code: 'response_job_not_found' } })
+      return
+    }
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache, no-transform')
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.flushHeaders()
+    let closed = false
+    let unsubscribe = () => {}
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let heartbeat: ReturnType<typeof setInterval> | undefined
+    const finish = () => {
+      if (closed) return
+      closed = true
+      unsubscribe()
+      clearTimeout(timeout)
+      clearInterval(heartbeat)
+      res.end()
+    }
+    const write = (type: string, value: unknown) => {
+      if (closed) return
+      if (res.writableLength > 64 * 1024 * 1024) {
+        finish()
+        return
+      }
+      res.write(`event: ${type}\ndata: ${JSON.stringify(value)}\n\n`)
+    }
+    res.on('close', finish)
+    unsubscribe = jobs.subscribe(id, (event) => {
+      write(event.type, event)
+      if (event.type === 'response_job.updated' && event.job.status !== 'in_progress') finish()
+    })
+    write('response_job.updated', { type: 'response_job.updated', job })
+    const text = jobs.text(id)
+    if (text)
+      write('response.output_text.snapshot', { type: 'response.output_text.snapshot', text })
+    if (job.status !== 'in_progress') {
+      finish()
+      return
+    }
+    timeout = setTimeout(() => {
+      write('response_job.wait_finished', { type: 'response_job.wait_finished', job: jobs.get(id) })
+      finish()
+    }, waitMs)
+    heartbeat = setInterval(() => {
+      const snapshot = jobs.get(id)
+      // Also report inactivity before native response headers have arrived.
+      if (snapshot?.phase === 'unresponsive')
+        write('response_job.updated', { type: 'response_job.updated', job: snapshot })
+      if (res.writableLength > 64 * 1024 * 1024) {
+        finish()
+        return
+      }
+      res.write(': keep-alive\n\n')
+    }, 5000)
+  })
+  app.get('/v1/response-jobs/:id', (req, res) => {
+    const job = jobs.get(req.params.id as string)
+    res.setHeader('Cache-Control', 'no-store')
+    if (!job) {
+      res.status(404).json({ error: { code: 'response_job_not_found' } })
+      return
+    }
+    res.json(job)
   })
   app.use(
     (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -845,7 +1106,8 @@ export function createService(options: Options) {
             const lane = socket.data.lane
             if (socket.data.client === lane.browser) {
               lane.browser = null
-              if (!lane.pending?.navigating)
+              if (lane.pending?.background) lane.pending.suspend?.()
+              else if (!lane.pending?.navigating)
                 lane.pending?.fail(503, 'browser_disconnected', 'ChatGPT browser disconnected.')
             }
           },
@@ -862,10 +1124,12 @@ export function createService(options: Options) {
       return { httpPort: address.port, wsPort: wsServer.port }
     },
     async close() {
+      jobs.close()
       sessions.close()
       clearInterval(leaseTimer)
       for (const lane of lanes.values())
-        lane.pending?.fail(503, 'server_shutdown', 'Server is shutting down.')
+        if (lane.pending?.background) lane.pending.suspend?.()
+        else lane.pending?.fail(503, 'server_shutdown', 'Server is shutting down.')
       await wsServer?.stop(true)
       await new Promise<void>((done) => {
         http.close(() => done())
@@ -880,6 +1144,7 @@ function formatMessages(messages: { role: string; content: string }[]) {
 }
 if (require.main === module) {
   const service = createService({
+    responseJobsDir: process.env.LOCALGPT_RESPONSE_JOBS_DIR,
     localMcp: readLocalMcpConfig(),
     sessionsFile: process.env.SESSIONS_FILE || resolve('.localgpt-sessions.sqlite'),
     host: process.env.HOST || '127.0.0.1',
