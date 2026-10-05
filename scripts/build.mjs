@@ -10,7 +10,7 @@ else try { token = (await readFile(tokenPath, 'utf8')).trim(); } catch (err) { i
 if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('Invalid local pairing token');
 const metadata = await readFile(new URL('../src/userscript.header.txt', import.meta.url), 'utf8');
 await build({ entryPoints: ['src/userscript.ts'], outfile: 'dist/chatgpt-api.user.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', define: { __BRIDGE_TOKEN__: JSON.stringify(token) }, banner: { js: metadata }, legalComments: 'inline' });
-await build({ entryPoints: ['src/server.ts', 'src/protocol.ts', 'src/chatgpt-dom.ts', 'src/extension-handler.ts', 'src/mcp.ts', 'src/capabilities.ts', 'src/page-observer.ts', 'src/dots.ts', 'src/model-selection.ts', 'src/sessions.ts', 'src/attachments.ts', 'src/browser-files.ts', 'src/localmcp.ts'], outdir: 'dist', outExtension: { '.js': '.cjs' }, bundle: true, platform: 'node', target: 'node22', format: 'cjs', packages: 'external' });
+await build({ entryPoints: ['src/server.ts', 'src/protocol.ts', 'src/chatgpt-dom.ts', 'src/extension-handler.ts', 'src/mcp.ts', 'src/capabilities.ts', 'src/page-observer.ts', 'src/dots.ts', 'src/model-selection.ts', 'src/sessions.ts', 'src/attachments.ts', 'src/browser-files.ts', 'src/localmcp.ts', 'src/conversation-stream.ts'], outdir: 'dist', outExtension: { '.js': '.cjs' }, bundle: true, platform: 'node', target: 'node22', format: 'cjs', packages: 'external' });
 
 await build({ entryPoints: ['src/dashboard.ts'], outfile: 'dist/dashboard.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', minify: true });
 await copyFile('public/dashboard.html', 'dist/dashboard.html');

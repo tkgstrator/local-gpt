@@ -1,3 +1,11 @@
+import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
+import {
+  STREAM_ARM_EVENT,
+  STREAM_EVENT,
+  StreamArmSchema,
+  observeConversationResponse,
+  type StreamEvent,
+} from './conversation-stream'
 import { DOT_EVENT, normalizeDots } from './dots'
 import {
   TURN_EVENT,
@@ -19,6 +27,19 @@ type PageWindow = Pick<Window, 'location' | 'dispatchEvent' | 'addEventListener'
   Request: typeof Request
 }
 export function installPageObserver(page: PageWindow) {
+  // One armed send at a time; only the request whose exact outgoing user text matches is observed.
+  let armed: ReturnType<typeof StreamArmSchema.parse> | null = null
+  page.addEventListener(STREAM_ARM_EVENT, (event) => {
+    try {
+      const parsed = StreamArmSchema.safeParse(JSON.parse((event as CustomEvent<string>).detail))
+      if (parsed.success) armed = parsed.data
+    } catch {}
+  })
+  page.addEventListener('localgpt:stream-disarm', (event) => {
+    if ((event as CustomEvent<string>).detail === armed?.requestId) armed = null
+  })
+  const publishStream = (event: StreamEvent) =>
+    page.dispatchEvent(new page.CustomEvent(STREAM_EVENT, { detail: JSON.stringify(event) }))
   let snapshot = emptyCapabilities()
   let dots: ReturnType<typeof normalizeDots> = null
   const publishDots = () => {
@@ -61,17 +82,47 @@ export function installPageObserver(page: PageWindow) {
           if (body.length > 5_000_000) return
           const value = JSON.parse(body) as {
             conversation_id?: unknown
-            messages?: { id?: unknown; author?: { role?: unknown } }[]
+            messages?: {
+              id?: unknown
+              author?: { role?: unknown }
+              content?: { parts?: unknown[] }
+            }[]
           }
           const message = value.messages?.filter((m) => m.author?.role === 'user').at(-1)
           const parsed = SubmittedTurnSchema.safeParse({
             messageId: message?.id,
             conversationId: value.conversation_id ?? null,
           })
-          if (parsed.success)
+          if (parsed.success) {
             page.dispatchEvent(
               new page.CustomEvent(TURN_EVENT, { detail: JSON.stringify(parsed.data) }),
             )
+            if (
+              armed &&
+              Array.isArray(message?.content?.parts) &&
+              message.content.parts.filter((part) => typeof part === 'string').join('') ===
+                armed.text
+            ) {
+              const { requestId, timeoutMs, backgroundJob } = armed
+              armed = null
+              const identity = { requestId, ...parsed.data }
+              publishStream({ ...identity, kind: 'started' })
+              void result
+                .then((response) =>
+                  observeConversationResponse(response.clone(), identity, publishStream, {
+                    timeoutMs: timeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS,
+                    backgroundJob: backgroundJob === true,
+                  }),
+                )
+                .catch(() =>
+                  publishStream({
+                    ...identity,
+                    kind: 'error',
+                    code: 'response_stream_interrupted',
+                  }),
+                )
+            }
+          }
         } catch {}
       }
       if (typeof init?.body === 'string') observeTurn(init.body)

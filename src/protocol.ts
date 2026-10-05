@@ -33,7 +33,15 @@ export const ModelObservationSchema = z.object({
 })
 export const BrowserRequestSchema = z.discriminatedUnion('type', [
   z.object({
+    type: z.literal('event_ack'),
+    requestId: z.string(),
+    eventId: z.string(),
+    accepted: z.boolean(),
+  }),
+  z.object({
     type: z.literal('request'),
+    timeoutMs: z.number().int().positive().max(7200000).optional(),
+    backgroundJob: z.boolean().optional(),
     requestId: z.string().min(1),
     text: z.string().min(1),
     newChat: z.boolean(),
@@ -47,29 +55,36 @@ export const BrowserRequestSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('navigation_ready'), requestId: z.string().min(1) }),
   z.object({ type: z.literal('dots'), requestId: z.string().min(1), operation: DotActionSchema }),
 ])
-export const BrowserEventSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('answer'), requestId: z.string().min(1), text: z.string() }),
-  z.object({
-    type: z.literal('stop'),
-    requestId: z.string().min(1),
-    conversationId: z.string().uuid().optional(),
-  }),
-  z.object({
-    type: z.literal('error'),
-    requestId: z.string().min(1),
-    code: z.string().min(1),
-    message: z.string(),
-  }),
-  z.object({ type: z.literal('heartbeat') }),
-  z.object({
-    type: z.literal('navigate'),
-    requestId: z.string().min(1),
-    conversationId: z.string().uuid(),
-  }),
-  z.object({ type: z.literal('dots'), requestId: z.string().min(1), result: DotResultSchema }),
-  CapabilitiesSchema.extend({ type: z.literal('capabilities'), requestId: z.string().min(1) }),
-  ModelObservationSchema.extend({ type: z.literal('models'), requestId: z.string().min(1) }),
-])
+export const BrowserEventSchema = z
+  .discriminatedUnion('type', [
+    z.object({
+      type: z.literal('progress'),
+      requestId: z.string().min(1),
+      phase: z.enum(['processing', 'thinking', 'answering', 'unresponsive']),
+    }),
+    z.object({ type: z.literal('answer'), requestId: z.string().min(1), text: z.string() }),
+    z.object({
+      type: z.literal('stop'),
+      requestId: z.string().min(1),
+      conversationId: z.string().uuid().optional(),
+    }),
+    z.object({
+      type: z.literal('error'),
+      requestId: z.string().min(1),
+      code: z.string().min(1),
+      message: z.string(),
+    }),
+    z.object({ type: z.literal('heartbeat') }),
+    z.object({
+      type: z.literal('navigate'),
+      requestId: z.string().min(1),
+      conversationId: z.string().uuid(),
+    }),
+    z.object({ type: z.literal('dots'), requestId: z.string().min(1), result: DotResultSchema }),
+    CapabilitiesSchema.extend({ type: z.literal('capabilities'), requestId: z.string().min(1) }),
+    ModelObservationSchema.extend({ type: z.literal('models'), requestId: z.string().min(1) }),
+  ])
+  .and(z.object({ eventId: z.string().max(100).optional() }))
 export type BrowserRequest = z.infer<typeof BrowserRequestSchema>
 export type BrowserEvent = z.infer<typeof BrowserEventSchema>
 export type ChatRequest = z.infer<typeof ChatRequestSchema>
