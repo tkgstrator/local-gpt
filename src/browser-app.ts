@@ -1,3 +1,4 @@
+import { DraftBackups } from './draft-backup'
 import { attachFiles, assertNoManualAttachments } from './browser-files'
 import { selectModel } from './model-selection'
 import { DOT_EVENT, DotListSchema, dotMessages, findDotEditor, type Dot } from './dots'
@@ -9,6 +10,13 @@ import {
   CapabilitiesSchema,
   emptyCapabilities,
 } from './capabilities'
+import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
+import {
+  STREAM_ARM_EVENT,
+  STREAM_EVENT,
+  StreamEventSchema,
+  type StreamEvent,
+} from './conversation-stream'
 import { BrowserRequestSchema, type BrowserEvent, type BrowserRequest } from './protocol'
 import {
   DomError,
@@ -16,6 +24,7 @@ import {
   userTurn,
   findEditor,
   writeEditor,
+  readPlainDraft,
   findSendButton,
   isGenerating,
   assistantNodes,
@@ -39,9 +48,54 @@ declare function GM_xmlhttpRequest(options: {
 const WS_URL = `ws://127.0.0.1:8875/?token=${encodeURIComponent(__BRIDGE_TOKEN__)}`
 const HTTP_URL = 'http://127.0.0.1:8766'
 const TIMEOUT_MS = 170000
+// Native errors that prove ChatGPT itself ended the generation; anything else is an unknown outcome.
+const DEFINITE_FAILURES = [
+  'chatgpt_generation_failed',
+  'chatgpt_generation_cancelled',
+  'chatgpt_http_error',
+  'chatgpt_api_error',
+]
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+// Preserve stable guard codes that already prove the generation was never sent.
+// Other pre-click failures carry an explicit setup_ prefix, including transport loss.
+const DEFINITE_SETUP_FAILURES = new Set([
+  'browser_setup_timeout',
+  'browser_busy',
+  'chat_mode_required',
+  'dot_mode_requires_dot_api',
+  'composer_not_empty',
+  'new_chat_not_found',
+  'model_required',
+  'editor_not_found',
+  'editor_unavailable',
+  'model_selector_unavailable',
+  'model_unavailable',
+  'model_selection_failed',
+  'reasoning_selector_unavailable',
+  'attachment_draft_present',
+  'attachment_input_unavailable',
+  'attachment_upload_failed',
+  'attachment_upload_timeout',
+  'draft_unsupported',
+  'draft_clear_failed',
+  'draft_storage_unavailable',
+  'draft_too_large',
+  'draft_backup_conflict',
+])
 export type HttpBridge = (path: string, data: unknown, browserId: string) => Promise<unknown>
 class App {
+  private responseStream: {
+    requestId: string
+    messageId: string | null
+    conversationId: string | null
+    text: string | null
+    terminal: StreamEvent | null
+    started: boolean
+    forwardedText: string | null
+    wake?: () => void
+    background: boolean
+  } | null = null
+  private acknowledgements = new Map<string, (received: boolean) => void>()
   private submittedReceipt: { messageId: string; conversationId: string | null } | null = null
   private navigating = false
   private navigationReady = new Set<string>()
@@ -51,6 +105,10 @@ class App {
   private socket: WebSocket | null = null
   private active: string | null = null
   private status: HTMLDivElement
+  private drafts = new DraftBackups(() => sessionStorage)
+  private recovery: HTMLDivElement
+  private recoveryValue = ''
+  private draftTimer: ReturnType<typeof setTimeout> | null = null
   private destroyed = false
   private transport: 'websocket' | 'http' = 'websocket'
   private pollingStarted = false
@@ -70,6 +128,70 @@ class App {
   private events: Promise<void> = Promise.resolve()
   private reconnect: ReturnType<typeof setTimeout> | null = null
   constructor(private httpBridge?: HttpBridge) {
+    window.addEventListener(STREAM_EVENT, (event) => {
+      try {
+        const parsed = StreamEventSchema.safeParse(
+          JSON.parse((event as CustomEvent<string>).detail),
+        )
+        const state = this.responseStream
+        if (
+          !parsed.success ||
+          !state ||
+          parsed.data.requestId !== state.requestId ||
+          state.terminal?.kind === 'error'
+        )
+          return
+        const incoming = parsed.data
+        if (
+          (state.messageId && state.messageId !== incoming.messageId) ||
+          (state.conversationId &&
+            incoming.conversationId &&
+            state.conversationId !== incoming.conversationId)
+        ) {
+          state.terminal = { ...incoming, kind: 'error', code: 'conversation_changed' }
+          state.wake?.()
+          return
+        }
+        state.messageId = incoming.messageId
+        state.conversationId = incoming.conversationId ?? state.conversationId
+        state.started = true
+        if (
+          state.background &&
+          incoming.kind === 'error' &&
+          !DEFINITE_FAILURES.includes(incoming.code ?? '')
+        ) {
+          // The native stream outcome is unknown; keep observing and report it as such.
+          this.send({ type: 'progress', requestId: state.requestId, phase: 'unresponsive' })
+          state.wake?.()
+          return
+        }
+        if (incoming.kind === 'progress' && incoming.phase) {
+          this.send({ type: 'progress', requestId: state.requestId, phase: incoming.phase })
+          this.setStatus(
+            incoming.phase === 'thinking'
+              ? '思考中'
+              : incoming.phase === 'unresponsive'
+                ? 'API通信待ち · 状態未確認'
+                : incoming.phase === 'answering'
+                  ? '回答中'
+                  : '処理中',
+          )
+        } else if (incoming.kind === 'answer' && incoming.text !== undefined && !state.terminal)
+          state.text = incoming.text
+        else if ((incoming.kind === 'stop' && !state.terminal) || incoming.kind === 'error')
+          state.terminal = incoming
+        if (
+          state.conversationId &&
+          state.text !== null &&
+          state.text !== state.forwardedText &&
+          !state.background
+        ) {
+          state.forwardedText = state.text
+          this.send({ type: 'answer', requestId: state.requestId, text: state.text })
+        }
+        state.wake?.()
+      } catch {}
+    })
     window.addEventListener(TURN_EVENT, (event) => {
       try {
         const parsed = SubmittedTurnSchema.safeParse(
@@ -105,6 +227,76 @@ class App {
     this.status.style.cssText =
       'position:fixed;bottom:12px;right:12px;z-index:2147483647;padding:8px 12px;border-radius:8px;background:#202020;color:white;font:12px sans-serif;max-width:340px;white-space:pre-wrap;'
     document.body.append(this.status)
+    this.recovery = document.createElement('div')
+    this.recovery.id = 'localgpt-saved-drafts'
+    this.recovery.style.cssText =
+      'position:fixed;bottom:68px;right:12px;z-index:2147483647;padding:12px;border-radius:8px;background:#202020;color:white;font:12px sans-serif;max-width:340px;max-height:40vh;overflow:auto;'
+    this.recovery.hidden = true
+    document.body.append(this.recovery)
+    const watch = () => {
+      if (this.destroyed) return
+      this.recoverDraft()
+      this.draftTimer = setTimeout(watch, 1000)
+    }
+    this.showSavedDrafts()
+    this.draftTimer = setTimeout(watch, 1000)
+  }
+  private showSavedDrafts() {
+    try {
+      const records = this.drafts.list(),
+        value = JSON.stringify(records)
+      if (value === this.recoveryValue) return
+      this.recoveryValue = value
+      this.recovery.replaceChildren()
+      this.recovery.hidden = records.length === 0
+      if (!records.length) return
+      const title = document.createElement('div')
+      title.textContent = 'LocalGPT · 保存した下書き（このタブ内）'
+      this.recovery.append(title)
+      for (const draft of records) {
+        const preview = document.createElement('pre')
+        preview.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;'
+        preview.textContent = draft.text.slice(0, 160)
+        const link = document.createElement('a')
+        link.href = draft.route
+        link.style.color = '#9dccff'
+        link.textContent = '元の会話で復元'
+        const copy = document.createElement('button')
+        copy.type = 'button'
+        copy.textContent = '全文をコピー'
+        copy.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(draft.text)
+            copy.textContent = 'コピーしました'
+          } catch {
+            preview.textContent = draft.text
+            copy.textContent = '表示した本文を選択してコピー'
+          }
+        })
+        this.recovery.append(preview, link, document.createTextNode(' '), copy)
+      }
+    } catch {
+      this.recoveryValue = ''
+      this.recovery.hidden = false
+      this.recovery.textContent =
+        'LocalGPT · 下書き保存領域を読み取れません。入力欄を変更せずに保護しています。'
+    }
+  }
+  private recoverDraft() {
+    if (
+      this.active ||
+      this.navigating ||
+      this.destroyed ||
+      isGenerating(document) ||
+      isWorkMode(document)
+    )
+      return
+    try {
+      this.drafts.restore(document, location.pathname)
+    } catch {
+      // An occupied/unsupported editor or failed native edit keeps the durable backup.
+    }
+    this.showSavedDrafts()
   }
   private setStatus(text: string) {
     this.status.textContent = `LocalGPT · ${text}`
@@ -120,6 +312,58 @@ class App {
           this.setStatus(err instanceof Error ? err.message : 'HTTP event failed')
         })
     } else if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(event))
+  }
+  // Resolves true only when the server confirmed it took the event (HTTP reply or WebSocket event_ack).
+  private async sendObserved(event: BrowserEvent): Promise<boolean | null> {
+    if (this.transport === 'http') {
+      try {
+        await this.events
+        const reply = await this.httpRequest('event', event)
+        this.httpConnected = true
+        if (
+          typeof reply === 'object' &&
+          reply !== null &&
+          'accepted' in reply &&
+          typeof reply.accepted === 'boolean'
+        )
+          return reply.accepted
+        return null
+      } catch {
+        this.httpConnected = false
+        this.responseStream?.wake?.()
+        return null
+      }
+    }
+    if (this.socket?.readyState !== WebSocket.OPEN || event.type === 'heartbeat') return null
+    const eventId = crypto.randomUUID()
+    return new Promise<boolean | null>((resolve) => {
+      const done = (received: boolean | null) => {
+        clearTimeout(timer)
+        this.acknowledgements.delete(eventId)
+        resolve(received)
+      }
+      const timer = setTimeout(() => done(null), 4000)
+      this.acknowledgements.set(eventId, done)
+      try {
+        this.socket!.send(JSON.stringify({ ...event, eventId }))
+      } catch {
+        done(null)
+      }
+    })
+  }
+  private waitForStreamEvent(deadline: number) {
+    const state = this.responseStream
+    if (!state || this.destroyed) return Promise.resolve()
+    if (!Number.isFinite(deadline)) deadline = Date.now() + 1000
+    return new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer)
+        if (state.wake === finish) delete state.wake
+        resolve()
+      }
+      const timer = setTimeout(finish, Math.max(1, deadline - Date.now()))
+      state.wake = finish
+    })
   }
   private async until<T>(read: () => T | null | false, deadline: number): Promise<T> {
     while (Date.now() < deadline) {
@@ -282,6 +526,11 @@ class App {
     }
   }
   private async run(request: BrowserRequest) {
+    if (request.type === 'event_ack') {
+      if (request.requestId === this.active)
+        this.acknowledgements.get(request.eventId)?.(request.accepted)
+      return
+    }
     if (request.type === 'navigation_ready') {
       this.navigationReady.add(request.requestId)
       return
@@ -323,7 +572,12 @@ class App {
     }
     this.active = request.requestId
     this.setStatus('処理中')
-    const deadline = Date.now() + TIMEOUT_MS
+    const background = request.backgroundJob === true
+    // Foreground requests keep their fixed deadline; only job setup follows the server's bound.
+    const setupDeadline = Date.now() + (background ? (request.timeoutMs ?? TIMEOUT_MS) : TIMEOUT_MS)
+    let dispatched = false
+    // Bounded through setup and dispatch; an async job has no wall deadline once actually sent.
+    let deadline = setupDeadline
     try {
       const currentEditor = await this.until(
         () => {
@@ -336,11 +590,6 @@ class App {
         Math.min(deadline, Date.now() + 10000),
       )
       assertNoManualAttachments(currentEditor)
-      const draft =
-        currentEditor instanceof HTMLTextAreaElement
-          ? currentEditor.value
-          : currentEditor.textContent || ''
-      if (draft.trim()) throw new DomError('composer_not_empty', 'An unsent draft is present.')
       if (isGenerating(document))
         throw new DomError('browser_busy', 'ChatGPT is already generating a response.')
       if (isWorkMode(document))
@@ -348,6 +597,8 @@ class App {
           'chat_mode_required',
           'Switch ChatGPT to Chat mode before using LocalGPT.',
         )
+      this.drafts.suspend(document, location.pathname)
+      this.showSavedDrafts()
       if (request.conversationId && location.pathname !== `/c/${request.conversationId}`) {
         this.navigating = true
         this.send({
@@ -373,12 +624,10 @@ class App {
         )
       if (isGenerating(document))
         throw new DomError('browser_busy', 'ChatGPT is already generating a response.')
-      // Never clear a user's manual draft or edit an existing message.
+      // The previous draft was saved before clearing; protect newer manual input.
       const current = findEditor(document)
       assertNoManualAttachments(current)
-      if (
-        (current instanceof HTMLTextAreaElement ? current.value : current.textContent || '').trim()
-      )
+      if (readPlainDraft(current) !== '')
         throw new DomError('composer_not_empty', 'An unsent draft is present.')
       if (
         request.newChat &&
@@ -460,8 +709,39 @@ class App {
       if (!editor.isConnected || findEditor(document) !== editor)
         throw new DomError('conversation_changed', 'The message editor changed before sending.')
       this.submittedReceipt = null
+      if (background) {
+        // Arm before the click so the page observer cannot miss the native request.
+        this.responseStream = {
+          requestId: request.requestId,
+          messageId: null,
+          conversationId: request.conversationId ?? null,
+          text: null,
+          terminal: null,
+          started: false,
+          forwardedText: null,
+          background: true,
+        }
+        window.dispatchEvent(
+          new CustomEvent(STREAM_ARM_EVENT, {
+            detail: JSON.stringify({
+              requestId: request.requestId,
+              text: request.text,
+              newChat: request.newChat,
+              timeoutMs: request.timeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS,
+              backgroundJob: true,
+            }),
+          }),
+        )
+      }
       // Poll immediately after sending; there is no load-event or observer-start race.
+      // A click can invoke page handlers before throwing; once attempted, unsent is no longer proven.
+      dispatched = true
       send.click()
+      if (background) {
+        deadline = Infinity
+        await this.observeBackground(request)
+        return
+      }
       // Capture synchronously, before another UI action can navigate to an old turn.
       submittedTurn = ownTurn()
       let lastText = ''
@@ -533,23 +813,122 @@ class App {
       )
     } catch (err) {
       this.navigating = false
-      const error =
+      let error =
         err instanceof DomError
           ? err
           : new DomError(
               'browser_error',
               err instanceof Error ? err.message : 'Unknown browser error',
             )
-      this.send({
+      if (background && !dispatched) {
+        if (error.code === 'browser_timeout')
+          error = new DomError('browser_setup_timeout', error.message)
+        else if (!DEFINITE_SETUP_FAILURES.has(error.code))
+          error = new DomError(`setup_${error.code}`, error.message)
+      }
+      const failure: BrowserEvent = {
         type: 'error',
         requestId: request.requestId,
-        code: error.code,
+        code:
+          background && dispatched && !DEFINITE_FAILURES.includes(error.code)
+            ? `observation_${error.code}`
+            : error.code,
         message: error.message,
-      })
+      }
+      if (background) {
+        // Retain the active request until ownership is acknowledged; replay events only, never the send.
+        while (!this.destroyed) {
+          const state = this.responseStream
+          if (state?.conversationId && state.text !== null && state.text !== state.forwardedText) {
+            const partial = state.text
+            if (
+              !(await this.sendObserved({
+                type: 'answer',
+                requestId: request.requestId,
+                text: partial,
+              }))
+            ) {
+              await sleep(1000)
+              continue
+            }
+            state.forwardedText = partial
+          }
+          const accepted = await this.sendObserved(failure)
+          // An explicit rejection can release this tab only when no send was ever attempted.
+          if (accepted === true || (!dispatched && accepted === false)) break
+          await sleep(1000)
+        }
+      } else this.send(failure)
       this.setStatus(`${error.code}\n${error.message}`)
       console.error('[LocalGPT]', error.code, error.message)
     } finally {
+      window.dispatchEvent(new CustomEvent('localgpt:stream-disarm', { detail: request.requestId }))
+      this.responseStream?.wake?.()
+      this.responseStream = null
       this.active = null
+      this.recoverDraft()
+    }
+  }
+  // Background jobs finish only from the native response stream, never from the rendered DOM.
+  private async observeBackground(request: Extract<BrowserRequest, { type: 'request' }>) {
+    const state = this.responseStream!
+    // The native request is normally observed within seconds of the click; silence means unknown, not failure.
+    const unseenAt = Date.now() + Math.min(request.timeoutMs ?? TIMEOUT_MS, 10000)
+    for (;;) {
+      if (this.destroyed)
+        throw new DomError(
+          'browser_disconnected',
+          'The page is closing; the job outcome is unknown.',
+        )
+      if (!state.started && Date.now() >= unseenAt)
+        this.send({ type: 'progress', requestId: request.requestId, phase: 'unresponsive' })
+      if (
+        request.conversationId &&
+        state.conversationId &&
+        state.conversationId !== request.conversationId
+      )
+        throw new DomError('conversation_changed', 'The API returned a different conversation.')
+      if (!this.connected()) {
+        // Keep observing locally; the latest text and terminal state replay after reconnection.
+        await this.waitForStreamEvent(Date.now() + 1000)
+        continue
+      }
+      if (state.conversationId && state.text !== null && state.text !== state.forwardedText) {
+        const observed = state.text
+        if (
+          await this.sendObserved({ type: 'answer', requestId: request.requestId, text: observed })
+        )
+          state.forwardedText = observed
+        else {
+          await this.waitForStreamEvent(Date.now() + 1000)
+          continue
+        }
+      }
+      // A final error can arrive in the same task as the last text. Preserve delivery before failing.
+      if (state.terminal?.kind === 'error')
+        throw new DomError(
+          state.terminal.code ?? 'chatgpt_api_error',
+          'ChatGPT response communication failed or was incomplete.',
+        )
+      if (state.terminal?.kind === 'stop') {
+        if (!state.conversationId || !state.text?.trim())
+          throw new DomError(
+            'response_incomplete',
+            'The API did not return a completed text response.',
+          )
+        const sent = await this.sendObserved({
+          type: 'stop',
+          requestId: request.requestId,
+          conversationId: state.conversationId,
+        })
+        if (!sent) {
+          await this.waitForStreamEvent(Date.now() + 1000)
+          continue
+        }
+        this.setStatus('接続済み · 完了')
+        return
+      }
+      await this.waitForStreamEvent(Date.now() + 1000)
     }
   }
   private connected() {
@@ -607,6 +986,8 @@ class App {
         }
         if (this.active) {
           await this.httpRequest('event', { type: 'heartbeat' })
+          this.httpConnected = true
+          this.responseStream?.wake?.()
           await sleep(700)
           continue
         }
@@ -620,6 +1001,7 @@ class App {
         await sleep(700)
       } catch (err) {
         this.httpConnected = false
+        this.responseStream?.wake?.()
         this.setStatus(err instanceof Error ? err.message : 'Local HTTP connection error')
         await sleep(3000)
       }
@@ -678,6 +1060,7 @@ class App {
   stop() {
     this.destroyed = true
     if (this.reconnect) clearTimeout(this.reconnect)
+    if (this.draftTimer) clearTimeout(this.draftTimer)
     this.socket?.close()
   }
 }
