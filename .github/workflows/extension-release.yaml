@@ -1,0 +1,52 @@
+name: Extension Release
+on:
+  workflow_run:
+    workflows: [Integration]
+    types: [completed]
+    branches: [master]
+permissions:
+  contents: write
+concurrency:
+  group: extension-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build public extension without installation credentials
+        env:
+          LOCALGPT_IMAGE_BUILD: '1'
+          LOCALGPT_PUBLIC_EXTENSION: '1'
+        run: bun run build
+      - name: Verify release archive is unpaired
+        run: bun scripts/verify-extension-release.mjs
+      - name: Publish immutable extension assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          version="$(bun -e 'console.log(JSON.parse(await Bun.file("extension/manifest.json").text()).version)')"
+          tag="extension-v$version"
+          if gh release view "$tag" --json isDraft --jq .isDraft > /tmp/release-draft; then
+            if [ "$(cat /tmp/release-draft)" = false ]; then
+              gh release view "$tag" --json assets --jq '.assets[].name' > /tmp/release-assets
+              grep -Fx "localgpt-extension-$version.zip" /tmp/release-assets
+              grep -Fx update-extension.mjs /tmp/release-assets
+              echo "Extension $version already released; keeping existing assets."
+              exit 0
+            fi
+            gh release upload "$tag" "dist/localgpt-extension-$version.zip" dist/update-extension.mjs --clobber
+          else
+            gh release create "$tag" "dist/localgpt-extension-$version.zip" dist/update-extension.mjs \
+              --draft --target "$RELEASE_COMMIT" --title "LocalGPT extension $version" \
+              --notes "LocalGPT browser extension. This public package contains no local pairing key. Use the extension updater to preserve your installation's pairing."
+          fi
+          gh release edit "$tag" --draft=false --latest=false

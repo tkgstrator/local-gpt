@@ -50,7 +50,7 @@ for (const userOnlyConversation of [false, true, 'empty-route', 'extension']) te
       windows: { update: async () => ({ id: 1 }) },
     };
     const localFetch = (url, options) => fetch(`${base}${new URL(url).pathname}`, options);
-    new Function('chrome', 'fetch', await readFile('dist/extension/background.js', 'utf8'))(workerChrome, localFetch);
+    new Function('chrome', 'fetch', 'importScripts', 'LOCALGPT_PAIRING_TOKEN', await readFile('dist/extension/background.js', 'utf8'))(workerChrome, localFetch, () => {}, token);
     page.window.chrome = { runtime: { sendMessage: message => new Promise(resolve => listener(message, { id: 'test-extension', url: 'https://chatgpt.com/', tab: { id: 1 }, frameId: 0 }, resolve)) } };
   }
   const globals = ['unsafeWindow', 'CustomEvent', 'chrome', 'window', 'document', 'location', 'HTMLTextAreaElement', 'WebSocket', 'GM_xmlhttpRequest', 'crypto', 'setTimeout', 'clearTimeout'];
