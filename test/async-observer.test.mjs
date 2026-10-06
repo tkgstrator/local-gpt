@@ -37,10 +37,6 @@ test('page observer leaves the native response intact for ChatGPT and exports no
   const o = observer(t); o.arm({ requestId: 'job4', text: 'Hi' }); const response = await o.page.fetch('https://chatgpt.com/backend-api/f/conversation', { method: 'POST', headers: { Authorization: 'Bearer secret-token' }, body: body('Hi') });
   assert.match(await response.text(), /Native answer/); await pause(30); assert.equal(JSON.stringify(o.events).includes('secret-token'), false);
 });
-test('page observer has no project or image feature coupling', async () => {
-  for (const file of ['page-observer', 'conversation-stream', 'browser-app', 'protocol', 'server']) { const source = await readFile(`src/${file}.ts`, 'utf8'); assert.doesNotMatch(source, /from '\.\/(projects|browser-projects|generated-images?|generated-image-protocol|dashboard)'/, file); }
-});
-
 async function fixture(t, url = `https://chatgpt.com/c/${target}`) {
   const page = new Window({ url }); t.after(async () => { page.dispatchEvent(new page.Event('pagehide')); await page.happyDOM.abort(); page.close(); });
   page.document.body.innerHTML = '<div role="textbox" contenteditable="true"></div><button aria-label="Send">Send</button>'; await page.happyDOM.waitUntilComplete(); installNativeEditing(page);

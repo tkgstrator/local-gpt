@@ -1,3 +1,9 @@
+import { ProjectIdSchema } from './projects'
+import {
+  ImageDataSchema,
+  ImageFileIdSchema,
+  ImageDownloadUrlSchema,
+} from './generated-image-protocol'
 import { FilesSchema, BrowserFileSchema } from './attachment-protocol'
 import { DotActionSchema, DotResultSchema } from './dots'
 import { z } from 'zod'
@@ -39,9 +45,24 @@ export const BrowserRequestSchema = z.discriminatedUnion('type', [
     accepted: z.boolean(),
   }),
   z.object({
+    type: z.literal('move_conversation'),
+    requestId: z.string().min(1),
+    conversationId: z.string().uuid(),
+    projectName: z.string().min(1).max(200),
+    projectId: ProjectIdSchema.optional(),
+  }),
+  z.object({
+    type: z.literal('delete_conversation'),
+    projectId: ProjectIdSchema.optional(),
+    requestId: z.string().min(1),
+    conversationId: z.string().uuid(),
+  }),
+  z.object({
     type: z.literal('request'),
     timeoutMs: z.number().int().positive().max(7200000).optional(),
     backgroundJob: z.boolean().optional(),
+    projectName: z.string().min(1).max(200).optional(),
+    projectId: ProjectIdSchema.optional(),
     requestId: z.string().min(1),
     text: z.string().min(1),
     newChat: z.boolean(),
@@ -62,9 +83,34 @@ export const BrowserEventSchema = z
       requestId: z.string().min(1),
       phase: z.enum(['processing', 'thinking', 'answering', 'unresponsive']),
     }),
+    z.object({
+      type: z.literal('conversation_project'),
+      requestId: z.string().min(1),
+      conversationId: z.string().uuid(),
+      projectId: ProjectIdSchema,
+    }),
+    z
+      .object({
+        type: z.literal('image'),
+        requestId: z.string().min(1),
+        conversationId: z.string().uuid(),
+        fileId: ImageFileIdSchema,
+        downloadUrl: ImageDownloadUrlSchema.optional(),
+        imageData: ImageDataSchema.optional(),
+      })
+      .refine(
+        (image) => Boolean(image.downloadUrl) !== Boolean(image.imageData),
+        'Provide exactly one image payload',
+      ),
+    z.object({
+      type: z.literal('conversation_deleted'),
+      requestId: z.string().min(1),
+      conversationId: z.string().uuid(),
+    }),
     z.object({ type: z.literal('answer'), requestId: z.string().min(1), text: z.string() }),
     z.object({
       type: z.literal('stop'),
+      projectId: ProjectIdSchema.optional(),
       requestId: z.string().min(1),
       conversationId: z.string().uuid().optional(),
     }),

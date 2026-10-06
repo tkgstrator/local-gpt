@@ -14,3 +14,7 @@ workspaces
 .env
 .env.*
 .secrets
+
+# Generated image artifacts (not source code).
+generated-images/
+.localgpt-images/
