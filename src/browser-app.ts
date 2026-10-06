@@ -142,7 +142,13 @@ class App {
   private recovery: HTMLDivElement
   private recoveryValue = ''
   private draftTimer: ReturnType<typeof setTimeout> | null = null
+  private lastManualEdit = -Infinity
+  private markManualEdit = () => {
+    this.lastManualEdit = Date.now()
+  }
   constructor(private httpBridge?: HttpBridge) {
+    window.addEventListener('input', this.markManualEdit, true)
+    window.addEventListener('keydown', this.markManualEdit, true)
     window.addEventListener(STREAM_EVENT, (event) => {
       try {
         const parsed = StreamEventSchema.safeParse(
@@ -1350,6 +1356,77 @@ class App {
       })
     })
   }
+  private safeToReload(): boolean {
+    if (
+      this.destroyed ||
+      this.active ||
+      this.navigating ||
+      this.responseStream ||
+      Date.now() - this.lastManualEdit < 5000 ||
+      isGenerating(document) ||
+      isWorkMode(document)
+    )
+      return false
+    try {
+      if (this.drafts.list().length) return false
+      const editor = findEditor(document)
+      assertNoManualAttachments(editor)
+      if (readPlainDraft(editor) !== '') return false
+      for (const node of document.querySelectorAll<HTMLElement>(
+        '[role="dialog"], [role="alertdialog"], textarea, [contenteditable="true"]',
+      ))
+        if (node !== editor && isVisible(node)) return false
+      return true
+    } catch {
+      return false
+    }
+  }
+  private async reloadWhenSafe() {
+    this.setStatus('拡張機能を更新しました。安全な状態でChatGPTを再読み込みします。')
+    while (!this.destroyed) {
+      if (this.safeToReload()) {
+        this.stop()
+        location.reload()
+        return
+      }
+      await sleep(300)
+    }
+  }
+  private async tryExtensionUpdate(value: unknown): Promise<boolean> {
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      !('version' in value) ||
+      typeof value.version !== 'string' ||
+      !/^\d+\.\d+\.\d+$/.test(value.version)
+    )
+      return false
+    try {
+      const key = 'localgpt:update-attempt'
+      if (sessionStorage.getItem(key) === value.version || !this.safeToReload()) return false
+      const ready = await this.httpRequest('update-ready', { version: value.version })
+      if (!ready || typeof ready !== 'object' || !('ready' in ready) || ready.ready !== true)
+        return false
+      // A person may have started typing while the server was granting the lease.
+      if (!this.safeToReload()) return false
+      sessionStorage.setItem(key, value.version)
+      const result = await this.httpRequest('reload', { version: value.version })
+      if (
+        !result ||
+        typeof result !== 'object' ||
+        !('reloading' in result) ||
+        result.reloading !== true
+      )
+        throw new Error('Extension reload was not confirmed')
+      // Let the acknowledged worker reload finish before replacing the page observer.
+      await sleep(450)
+      await this.reloadWhenSafe()
+      return true
+    } catch {
+      this.setStatus('拡張機能の再読み込みが必要です。入力欄は保持しています。')
+      return false
+    }
+  }
   private async poll() {
     if (this.pollingStarted || this.destroyed) return
     this.pollingStarted = true
@@ -1375,11 +1452,20 @@ class App {
         if (typeof value !== 'object' || value === null || !('request' in value))
           throw new Error('Invalid poll response')
         if (value.request !== null) this.receive(value.request)
+        else if ('update' in value && (await this.tryExtensionUpdate(value.update))) return
         await sleep(700)
       } catch (err) {
         this.httpConnected = false
         this.responseStream?.wake?.()
         this.setStatus(err instanceof Error ? err.message : 'Local HTTP connection error')
+        if (
+          this.httpBridge &&
+          err instanceof Error &&
+          /Extension context invalidated/i.test(err.message)
+        ) {
+          await this.reloadWhenSafe()
+          return
+        }
         await sleep(3000)
       }
     }
@@ -1438,6 +1524,8 @@ class App {
   }
   stop() {
     this.destroyed = true
+    window.removeEventListener('input', this.markManualEdit, true)
+    window.removeEventListener('keydown', this.markManualEdit, true)
     if (this.draftTimer) clearTimeout(this.draftTimer)
     this.responseStream?.wake?.()
     if (this.reconnect) clearTimeout(this.reconnect)
