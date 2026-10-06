@@ -1,21 +1,12 @@
 import { DomError, findEditor, writeEditor, readPlainDraft } from './chatgpt-dom'
 export { readPlainDraft } from './chatgpt-dom'
 import { assertNoManualAttachments } from './browser-files'
-import { z } from 'zod'
+import { parseChatRoute } from './projects'
 
 export const DRAFT_KEY = 'localgpt:draft-backups:v1'
 const LIMIT = 65536
 type SavedDraft = { route: string; text: string }
-const validRoute = (route: string) => {
-  if (route === '/') return true
-  const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-  const direct = new RegExp(`^/c/(?:local-chatgpt%3A)?(${uuid})$`).exec(route)
-  const project = new RegExp(
-    `^/g/g-p-[0-9a-f]{32}(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?/(?:project|c/(?:local-chatgpt%3A)?(${uuid}))$`,
-  ).exec(route)
-  const id = direct?.[1] ?? project?.[1]
-  return id ? z.string().uuid().safeParse(id).success : Boolean(project)
-}
+const validRoute = (route: string) => route === '/' || Boolean(parseChatRoute(route))
 
 function clearEditor(editor: HTMLElement, expected: string) {
   const doc = editor.ownerDocument,

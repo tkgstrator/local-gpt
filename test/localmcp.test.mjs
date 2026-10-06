@@ -7,15 +7,19 @@ import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {InMemoryTransport} from '@modelcontextprotocol/sdk/inMemory.js';
 import {createServer} from 'node:http';
 import {z} from 'zod';
+import {McpError, ErrorCode} from '@modelcontextprotocol/sdk/types.js';
 const require=createRequire(import.meta.url);
 test('LocalMCP proxy preserves schemas, annotations, authentication and results without browser requests',async t=>{
  let calls=0; const http=createServer(async(req,res)=>{
  if(req.headers.authorization!=='Bearer test-token-at-least-16'){res.writeHead(401);res.end();return;}
+ if(req.method!=='POST'){res.writeHead(405);res.end();return;}
+ let bodyText='';for await(const chunk of req)bodyText+=chunk;const body=JSON.parse(bodyText);
+ if(body.method==='tools/call'&&body.params.arguments.path==='missing.txt'){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({jsonrpc:'2.0',id:body.id,error:{code:ErrorCode.InvalidParams,message:'no such file: missing.txt; test-token-at-least-16'}}));return;}
  const upstream=new McpServer({name:'LocalMCP',version:'test'});
  upstream.registerTool('read_file',{description:'Read a file',inputSchema:{path:z.string().min(1)},annotations:{readOnlyHint:true,openWorldHint:false}},async args=>{calls++;return {content:[{type:'text',text:`read:${args.path}`}],structuredContent:{path:args.path}};});
  upstream.registerTool('execute',{inputSchema:{command:z.string()}},async()=>({content:[{type:'text',text:'shell'}]}));
  upstream.registerTool('unexpected_tool',{inputSchema:{}},async()=>({content:[{type:'text',text:'hidden'}]}));
- const transport=new StreamableHTTPServerTransport({sessionIdGenerator:undefined,enableJsonResponse:true});res.on('close',()=>{void transport.close();void upstream.close();});await upstream.connect(transport);await transport.handleRequest(req,res);
+ const transport=new StreamableHTTPServerTransport({sessionIdGenerator:undefined,enableJsonResponse:true});res.on('close',()=>{void transport.close();void upstream.close();});await upstream.connect(transport);await transport.handleRequest(req,res,body);
  });await new Promise(r=>http.listen(0,'127.0.0.1',r));t.after(()=>new Promise(r=>{http.close(r);http.closeAllConnections();}));
  const config={url:`http://127.0.0.1:${http.address().port}/local`,token:'test-token-at-least-16'};
  const server=require('../dist/mcp.cjs').createMcpServer('http://127.0.0.1:8766');
@@ -24,6 +28,7 @@ test('LocalMCP proxy preserves schemas, annotations, authentication and results 
  const names=(await client.listTools()).tools;assert.ok(names.some(t=>t.name==='localmcp_read_file'&&t.annotations.readOnlyHint));assert.ok(names.some(t=>t.name==='localmcp_execute'));assert.ok(!names.some(t=>t.name==='localmcp_unexpected_tool'));
  assert.equal((await client.callTool({name:'localmcp_read_file',arguments:{path:'src/test.ts'}})).structuredContent.path,'src/test.ts');
  assert.equal((await client.callTool({name:'localmcp_read_file',arguments:{path:4}})).isError,true);assert.equal(calls,1);
+ const missing=await client.callTool({name:'localmcp_read_file',arguments:{path:'missing.txt'}});assert.equal(missing.isError,true);assert.match(missing.content[0].text,/no such file: missing.txt/);assert.match(missing.content[0].text,/-32602/);assert.equal(JSON.stringify(missing).includes('test-token-at-least-16'),false);
  assert.equal((await client.callTool({name:'localmcp_status',arguments:{}})).structuredContent.connected,true);
 });
 test('LocalMCP config validates endpoint and does not disclose credentials',()=>{

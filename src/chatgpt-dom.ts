@@ -50,55 +50,116 @@ export function userTurn(doc: Document, id: string) {
     ) ?? null
   )
 }
+const DRAFT_DIAGNOSTIC_NAME_LIMIT = 32
+const DRAFT_DIAGNOSTIC_ATTRIBUTE_LIMIT = 8
+
+function safeDraftDiagnosticName(value: string) {
+  return value.replace(/[^a-zA-Z0-9:_-]/g, '?').slice(0, DRAFT_DIAGNOSTIC_NAME_LIMIT) || '?'
+}
+
+function unsupportedDraft(
+  reason: string,
+  node: Node,
+  path: string,
+  win: Window & typeof globalThis,
+): never {
+  const element = node instanceof win.HTMLElement ? node : null
+  const nodeName = element
+    ? safeDraftDiagnosticName(element.tagName)
+    : node.nodeType === 3
+      ? `#text-${/^[ \t\r\n]*$/.test(node.textContent ?? '') ? 'whitespace' : 'content'}`
+      : node.nodeType === 8
+        ? '#comment'
+        : `#node-${node.nodeType}`
+  const names = element
+    ? [...element.attributes].map((attribute) => safeDraftDiagnosticName(attribute.name)).sort()
+    : []
+  const visibleNames = names.slice(0, DRAFT_DIAGNOSTIC_ATTRIBUTE_LIMIT)
+  const attributes = `${visibleNames.join(',') || '-'}${
+    names.length > visibleNames.length ? `,+${names.length - visibleNames.length}` : ''
+  }`
+  throw new DomError(
+    'draft_unsupported',
+    `The draft structure cannot be safely suspended. [reason=${reason} path=${path} node=${nodeName} attrs=${attributes}]`,
+  )
+}
+
 // Deliberately reject rich editor nodes rather than flattening them into plain text.
 export function readPlainDraft(editor: HTMLElement): string {
   const win = editor.ownerDocument.defaultView!
   if (editor instanceof win.HTMLTextAreaElement) return editor.value
-  const inline = (node: Node): string => {
+  const inline = (node: Node, path: string): string => {
     if (node.nodeType === 3) return node.textContent ?? ''
-    if (
-      !(node instanceof win.HTMLElement) ||
-      node.tagName !== 'BR' ||
-      [...node.attributes].some((a) => a.name !== 'class') ||
-      (node.className && node.className !== 'ProseMirror-trailingBreak')
-    )
-      throw new DomError('draft_unsupported', 'A formatted draft cannot be safely suspended.')
+    if (!(node instanceof win.HTMLElement))
+      return unsupportedDraft('unexpected_inline_node', node, path, win)
+    if (node.tagName !== 'BR') return unsupportedDraft('unexpected_inline_element', node, path, win)
+    if ([...node.attributes].some((a) => a.name !== 'class'))
+      return unsupportedDraft('unexpected_br_attribute', node, path, win)
+    if (node.className && node.className !== 'ProseMirror-trailingBreak')
+      return unsupportedDraft('unexpected_br_class', node, path, win)
     return node.className === 'ProseMirror-trailingBreak' ? '' : '\n'
   }
   const children = [...editor.childNodes]
   // ProseMirror decorates ordinary paragraphs, including its empty placeholder.
   // Unknown metadata may describe semantic content, so keep this allowlist narrow.
-  const plainParagraph = (node: Node): node is HTMLElement =>
-    node instanceof win.HTMLElement &&
-    node.tagName === 'P' &&
-    [...node.attributes].every((a) => ['class', 'dir', 'data-placeholder'].includes(a.name))
+  const paragraphElement = (node: Node): node is HTMLElement =>
+    node instanceof win.HTMLElement && node.tagName === 'P'
   if (children.some((n) => n instanceof win.HTMLElement && n.tagName === 'P')) {
     // Whitespace between block elements is DOM layout, not composer text. NBSP,
     // leading/trailing root text and whitespace within paragraphs remain content.
-    const firstParagraph = children.findIndex(plainParagraph)
-    const lastParagraph = children.length - 1 - [...children].reverse().findIndex(plainParagraph)
-    const paragraphs = children.filter((node, index) => {
-      if (node.nodeType !== 3 || !/^[ \t\r\n]*$/.test(node.textContent ?? '')) return true
-      return !(index > firstParagraph && index < lastParagraph)
-    })
-    if (!paragraphs.every(plainParagraph))
-      throw new DomError('draft_unsupported', 'The draft structure cannot be safely suspended.')
+    const firstParagraph = children.findIndex(paragraphElement)
+    const lastParagraph = children.length - 1 - [...children].reverse().findIndex(paragraphElement)
+    const paragraphs = children
+      .map((node, index) => ({ node, index }))
+      .filter(({ node, index }) => {
+        if (node.nodeType !== 3 || !/^[ \t\r\n]*$/.test(node.textContent ?? '')) return true
+        return !(index > firstParagraph && index < lastParagraph)
+      })
+    for (const { node, index } of paragraphs) {
+      if (!(node instanceof win.HTMLElement))
+        unsupportedDraft('unexpected_root_node', node, `root[${index}]`, win)
+      if (node.tagName !== 'P')
+        unsupportedDraft('unexpected_root_element', node, `root[${index}]`, win)
+      if (
+        [...node.attributes].some(
+          (attribute) =>
+            !['class', 'dir', 'data-empty-paragraph', 'data-placeholder'].includes(
+              attribute.name,
+            ) ||
+            (attribute.name === 'data-empty-paragraph' && !['', 'true'].includes(attribute.value)),
+        )
+      )
+        unsupportedDraft('unexpected_paragraph_attribute', node, `root[${index}]`, win)
+      if (node.hasAttribute('data-empty-paragraph')) {
+        const emptyNodes = [...node.childNodes]
+        if (
+          emptyNodes.length !== 1 ||
+          !(emptyNodes[0] instanceof win.HTMLElement) ||
+          emptyNodes[0].tagName !== 'BR' ||
+          inline(emptyNodes[0], `root[${index}][0]`) !== ''
+        )
+          unsupportedDraft('unexpected_empty_paragraph_content', node, `root[${index}]`, win)
+      }
+    }
     return paragraphs
-      .map((p) => {
+      .map(({ node: paragraph, index: paragraphIndex }) => {
+        const p = paragraph as HTMLElement
         const nodes = [...p.childNodes]
         if (
           nodes.length === 1 &&
           nodes[0] instanceof win.HTMLElement &&
           nodes[0].tagName === 'BR'
         ) {
-          inline(nodes[0])
+          inline(nodes[0], `root[${paragraphIndex}][0]`)
           return ''
         }
-        return nodes.map(inline).join('')
+        return nodes
+          .map((node, index) => inline(node, `root[${paragraphIndex}][${index}]`))
+          .join('')
       })
       .join('\n')
   }
-  return children.map(inline).join('')
+  return children.map((node, index) => inline(node, `root[${index}]`)).join('')
 }
 
 export function writeEditor(doc: Document, text: string, editor = findEditor(doc)) {
@@ -129,12 +190,11 @@ export function writeEditor(doc: Document, text: string, editor = findEditor(doc
     selection?.addRange(range)
     const inserted =
       typeof doc.execCommand === 'function' && doc.execCommand('insertText', false, text)
-    if (!inserted) {
-      editor.textContent = text
-      editor.dispatchEvent(
-        new win.InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }),
+    if (!inserted)
+      throw new DomError(
+        'native_input_unavailable',
+        'The native editor input command is unavailable; the message was not submitted.',
       )
-    }
   }
 }
 export function findSendButton(doc: Document): HTMLButtonElement | null {

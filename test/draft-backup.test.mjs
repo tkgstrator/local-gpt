@@ -53,6 +53,22 @@ test('decorated empty ProseMirror paragraph does not block native submission',t=
  const f=fixture(t);f.editor.innerHTML='<p class="placeholder" data-placeholder="Ask anything"><br class="ProseMirror-trailingBreak"></p>';
  assert.equal(readPlainDraft(f.editor),'');f.backups.suspend(f.doc,route);assert.equal(f.backups.list().length,0);
 });
+test('current ChatGPT empty paragraph decoration does not block native submission',t=>{
+ const f=fixture(t);f.editor.innerHTML='<p class="placeholder" data-empty-paragraph="" data-placeholder="Ask anything"><br class="ProseMirror-trailingBreak"></p>';
+ assert.equal(readPlainDraft(f.editor),'');f.backups.suspend(f.doc,route);assert.equal(f.backups.list().length,0);
+});
+test('current ChatGPT true-valued empty paragraph decoration does not block native submission',t=>{
+ const f=fixture(t);f.editor.innerHTML='<p class="placeholder" data-empty-paragraph="true" data-placeholder="Ask ChatGPT"><br class="ProseMirror-trailingBreak"></p>';
+ assert.equal(readPlainDraft(f.editor),'');f.backups.suspend(f.doc,route);assert.equal(f.backups.list().length,0);
+});
+test('empty paragraph metadata with content remains unsupported',t=>{
+ const f=fixture(t);f.editor.innerHTML='<p data-empty-paragraph="true" data-placeholder="Ask ChatGPT">keep</p>';const original=f.editor.innerHTML;
+ assert.throws(()=>f.backups.suspend(f.doc,route),e=>e.code==='draft_unsupported');assert.equal(f.editor.innerHTML,original);assert.equal(f.backups.list().length,0);
+});
+test('nonempty data-empty-paragraph metadata remains unsupported',t=>{
+ const f=fixture(t);f.editor.innerHTML='<p data-empty-paragraph="semantic" data-placeholder="Ask anything"><br class="ProseMirror-trailingBreak"></p>';const original=f.editor.innerHTML;
+ assert.throws(()=>f.backups.suspend(f.doc,route),e=>e.code==='draft_unsupported');assert.equal(f.editor.innerHTML,original);assert.equal(f.backups.list().length,0);
+});
 test('plain decorated paragraphs suspend and restore exact text despite DOM separators',t=>{
  const f=fixture(t);f.editor.innerHTML='<p class="composer-paragraph" dir="auto">  first</p>\n  <p data-placeholder="Ask anything">second<br class="ProseMirror-trailingBreak"></p>\n<p><br class="ProseMirror-trailingBreak"></p>';
  const text='  first\nsecond\n';assert.equal(readPlainDraft(f.editor),text);f.backups.suspend(f.doc,route);
@@ -73,4 +89,12 @@ test('native clear verifies a recreated decorated placeholder before restoring',
  const f=fixture(t);f.editor.innerHTML='<p class="composer-paragraph">keep</p>';const native=f.doc.execCommand.bind(f.doc);
  f.doc.execCommand=(command,show,text)=>{const result=native(command,show,text);if(command==='delete')f.editor.innerHTML='<p class="placeholder" data-placeholder="Ask anything"><br class="ProseMirror-trailingBreak"></p>';return result;};
  f.backups.suspend(f.doc,route);assert.equal(readPlainDraft(f.editor),'');assert.equal(f.backups.list()[0].text,'keep');assert.equal(f.backups.restore(f.doc,route),true);assert.equal(readPlainDraft(f.editor),'keep');
+});
+
+test('unsupported draft diagnostics identify structure without exposing content or attribute values',t=>{
+ const f=fixture(t);f.editor.innerHTML='<p class="private-class" data-new-attribute="private-value">private text</p><div title="private-title"><span>nested private text</span></div>';
+ let error;assert.throws(()=>f.backups.suspend(f.doc,route),e=>{error=e;return e.code==='draft_unsupported';});
+ assert.match(error.message,/reason=unexpected_paragraph_attribute/);assert.match(error.message,/path=root\[0\]/);assert.match(error.message,/node=P/);assert.match(error.message,/attrs=class,data-new-attribute/);
+ for(const secret of ['private-class','private-value','private text','private-title','nested private text'])assert.equal(error.message.includes(secret),false);
+ assert.ok(new TextEncoder().encode(error.message).length<=512);assert.equal(f.backups.list().length,0);
 });

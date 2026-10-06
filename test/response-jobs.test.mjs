@@ -289,3 +289,30 @@ test('repeated unknown progress is not new activity and produces no writes or du
   for(let i=0;i<20;i++){now++;store.progress(job.id,'unresponsive');}
   assert.equal(await readFile(file,'utf8'),saved);assert.deepEqual(store.get(job.id),first);assert.equal(updates.length,0);
 });
+
+test('MCP automatically starts Pro session jobs and returns saved original pixels on completed polling', async t => {
+  const dir = await tempDir(t); const { base, ws, send, until } = await setup(t, { imagesDir: dir });
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const client = new Client({ name: 'job-test', version: '1' }); t.after(() => client.close());
+  await client.connect(new StreamableHTTPClientTransport(new URL(base + '/mcp')));
+  const tools = (await client.listTools()).tools.map(tool => tool.name);
+  assert.ok(tools.includes('localgpt_response_start')); assert.ok(tools.includes('localgpt_response_get'));
+  const created = await client.callTool({ name: 'localgpt_session_create', arguments: { model: 'gpt-6-pro', projectName: null } });
+  const next = once(ws, 'message');
+  const started = await client.callTool({ name: 'localgpt_respond', arguments: { session_id: created.structuredContent.id, input: 'Generate a tiny image' } });
+  assert.notEqual(started.isError, true); assert.equal(started.structuredContent.object, 'response_job'); assert.equal(started.structuredContent.status, 'in_progress'); assert.equal(started.content.some(content => content.type === 'image'), false);
+  const request = JSON.parse((await next)[0]);
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+  send({ type: 'image', requestId: request.requestId, conversationId, fileId: 'file_generated', imageData: { mimeType: 'image/png', data: png } });
+  send({ type: 'stop', requestId: request.requestId, conversationId });
+  await until(started.structuredContent.id, job => job.status === 'completed');
+  const completed = await client.callTool({ name: 'localgpt_response_get', arguments: { job_id: started.structuredContent.id } });
+  assert.notEqual(completed.isError, true); assert.equal(completed.structuredContent.status, 'completed'); assert.equal(completed.content.find(content => content.type === 'image').data, png); assert.match(completed.structuredContent.result.images[0].path, /\.png$/);
+  const again = once(ws, 'message');
+  const forced = await client.callTool({ name: 'localgpt_respond', arguments: { input: 'Simple task', model: 'gpt-6-instant', background: true } });
+  assert.equal(forced.structuredContent.object, 'response_job');
+  const forcedRequest = JSON.parse((await again)[0]);
+  send({ type: 'error', requestId: forcedRequest.requestId, code: 'chatgpt_generation_failed', message: 'Native stream stopped.' });
+  await until(forced.structuredContent.id, job => job.status === 'failed');
+});
