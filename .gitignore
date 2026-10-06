@@ -240,3 +240,11 @@ $RECYCLE.BIN/
 work/
 workspaces/
 screenshots/
+
+# Generated image artifacts (not source code).
+generated-images/
+.localgpt-images/
+
+# Host-specific Compose and private network deployment overrides.
+/compose.override.yaml
+/deploy/

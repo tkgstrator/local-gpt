@@ -58,3 +58,50 @@ test('MCP tool surface includes start/get and instructions describe unknown reco
   const f = await fixture(t); const tools = (await f.client.listTools()).tools.map(x => x.name); assert.ok(tools.includes('localgpt_response_start')); assert.ok(tools.includes('localgpt_response_get')); assert.equal(tools.some(n => /cancel|stop/.test(n)), false);
   assert.match(f.client.getInstructions(), /do not resend|never resend|Do not automatically resend/i);
 });
+
+test('job SSE pushes native progress and text before completion and finishes immediately', async t => {
+  const f = await fixture(t); const { job, request } = await start(f);
+  const response = await fetch(`${f.base}/v1/response-jobs/${job.id}/events?wait_ms=1000`);
+  assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /text\/event-stream/); assert.equal(response.headers.get('x-accel-buffering'), 'no');
+  const reader = response.body.getReader(); const decoder = new TextDecoder();
+  assert.match(decoder.decode((await reader.read()).value), /response_job.updated/);
+  f.send({ type: 'progress', requestId: request.requestId, phase: 'thinking' });
+  assert.match(decoder.decode((await reader.read()).value), /thinking/);
+  f.send({ type: 'answer', requestId: request.requestId, text: 'First' });
+  let text = ''; while (!text.includes('response.output_text.delta')) text += decoder.decode((await reader.read()).value);
+  assert.match(text, /First/); assert.equal((await (await fetch(f.base + '/health')).json()).busy, true);
+  f.send({ type: 'answer', requestId: request.requestId, text: 'First second' });
+  f.send({ type: 'stop', requestId: request.requestId, conversationId });
+  let rest = ''; for (;;) { const chunk = await reader.read(); if (chunk.done) break; rest += decoder.decode(chunk.value); }
+  assert.match(rest, /second/); assert.match(rest, /completed/); assert.equal((await (await fetch(f.base + '/health')).json()).busy, false);
+});
+
+test('ordinary MCP responses consume SSE deltas and forward progress before completion', async t => {
+  const f = await fixture(t); const progress = [];
+  const result = f.client.callTool(
+    { name: 'localgpt_respond', arguments: { input: 'Normal response' } },
+    undefined,
+    { onprogress: value => progress.push(value.message) },
+  );
+  void result.catch(() => {}); const request = await nextRequest(f);
+  f.send({ type: 'answer', requestId: request.requestId, text: 'Early text' }); await pause(40);
+  assert.ok(progress.includes('Early text'));
+  f.send({ type: 'stop', requestId: request.requestId, conversationId });
+  assert.equal((await result).structuredContent.output[0].content[0].text, 'Early text');
+});
+
+test('model-unspecified MCP calls return a resumable job instead of waiting indefinitely', { timeout: 35000 }, async t => {
+  const service = require('../dist/server.cjs').createService({ host: '127.0.0.1', httpPort: 0, wsPort: 0, timeoutMs: 32000 });
+  const ports = await service.start(); t.after(() => service.close()); const base = `http://127.0.0.1:${ports.httpPort}`;
+  const ws = new WebSocket(`ws://127.0.0.1:${ports.wsPort}`); await once(ws, 'open'); t.after(() => ws.close());
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js'); const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const client = new Client({ name: 'bounded-test', version: '1' }); await client.connect(new StreamableHTTPClientTransport(new URL(base + '/mcp'))); t.after(() => client.close());
+  const next = once(ws, 'message'); const pending = client.callTool({ name: 'localgpt_respond', arguments: { input: 'Long current UI model' } }); void pending.catch(() => {});
+  const request = JSON.parse((await next)[0]);
+  const started = await Promise.race([pending, new Promise(resolve => setTimeout(() => resolve(null), 27000))]);
+  assert.equal(started?.structuredContent?.object, 'response_job'); assert.equal(started.structuredContent.status, 'in_progress'); assert.equal((await (await fetch(base + '/health')).json()).busy, true);
+  ws.send(JSON.stringify({ type: 'answer', requestId: request.requestId, text: 'Late result' }));
+  ws.send(JSON.stringify({ type: 'stop', requestId: request.requestId, conversationId }));
+  const completed = await client.callTool({ name: 'localgpt_response_get', arguments: { job_id: started.structuredContent.id } });
+  assert.equal(completed.structuredContent.status, 'completed');
+});

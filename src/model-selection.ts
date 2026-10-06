@@ -1,35 +1,158 @@
+import { z } from 'zod'
 import { DomError, findModelSelector } from './chatgpt-dom'
-import type { Capabilities } from './capabilities'
-const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
-function menuFor(doc: Document, selector: HTMLElement) {
-  return [...doc.querySelectorAll<HTMLElement>('[role="menu"]')].find(
-    (menu) =>
-      (menu.getAttribute('aria-labelledby') ?? '').split(' ').includes(selector.id) ||
-      menu.getAttribute('aria-label') === 'Select ChatGPT model',
-  )
-}
-async function openMenu(doc: Document) {
-  const selector = findModelSelector(doc)
-  const win = doc.defaultView
-  if (!selector || !win)
-    throw new DomError('model_selector_unavailable', 'Model selector is unavailable.')
-  if (selector.getAttribute('aria-expanded') !== 'true') selector.click()
-  const deadline = Date.now() + 3000
-  while (Date.now() < deadline) {
-    const menu = menuFor(doc, selector)
-    if (menu && selector.getAttribute('aria-expanded') === 'true') return { selector, menu, win }
-    await wait(50)
-  }
-  throw new DomError('model_selector_unavailable', 'Model menu did not open.')
-}
-function closeMenu(selector: HTMLElement, menu: HTMLElement, win: Window) {
-  menu.dispatchEvent(
-    new (win as Window & typeof globalThis).KeyboardEvent('keydown', {
-      key: 'Escape',
-      bubbles: true,
+import { ModelChoiceSchema, type Capabilities } from './capabilities'
+const REQUEST = 'localgpt:model-select'
+const RESULT = 'localgpt:model-selected'
+const Command = z.object({ id: z.string().uuid(), choice: ModelChoiceSchema })
+const Receipt = z.object({ id: z.string().uuid(), code: z.string().optional() })
+const Selection = z.object({
+  slug: z.string(),
+  thinkingEffort: z.string().nullable(),
+  versionId: z.string(),
+})
+const NativeModels = z.object({
+  versionOptions: z.array(
+    z.object({
+      id: z.string(),
+      slugs: z.array(z.string()),
+      modelSlugByLane: z.record(z.string(), z.string()).optional(),
+      options: z.array(
+        z.object({
+          slug: z.string(),
+          lane: z.string().optional(),
+          thinkingEffort: z.string().nullable().optional(),
+          isAvailable: z.boolean(),
+        }),
+      ),
     }),
-  )
-  if (selector.getAttribute('aria-expanded') === 'true') selector.click()
+  ),
+})
+type Fiber = {
+  memoizedProps?: Record<string, unknown>
+  return?: Fiber | null
+  alternate?: Fiber | null
+  stateNode?: { current?: Fiber }
+}
+function nativeState(doc: Document) {
+  const node = findModelSelector(doc)
+  if (!node || node.hasAttribute('disabled') || node.getAttribute('aria-disabled') === 'true')
+    return null
+  const key = Object.keys(node).find((k) => k.startsWith('__reactFiber$'))
+  if (!key) return null
+  let fiber = (node as unknown as Record<string, Fiber>)[key]
+  // A host node can retain the previous render's fiber after React flips trees.
+  let root = fiber
+  for (let i = 0; root?.return && i < 100; i++) root = root.return
+  if (root?.stateNode?.current && root.stateNode.current !== root && fiber?.alternate)
+    fiber = fiber.alternate
+  const seen = new Set<Fiber>()
+  for (let i = 0; fiber && i < 100 && !seen.has(fiber); i++, fiber = fiber.return!) {
+    seen.add(fiber)
+    const props = fiber.memoizedProps
+    if (
+      props &&
+      typeof props.onModelChange === 'function' &&
+      Selection.safeParse(props.selectedModel).success &&
+      NativeModels.safeParse(props.models).success
+    )
+      return {
+        props,
+        change: props.onModelChange as (selection: z.infer<typeof Selection>) => void,
+      }
+  }
+  return null
+}
+// Runs in the page's MAIN world, where the actual React callback is accessible.
+export function installNativeModelSelection(
+  page: Pick<
+    Window,
+    'document' | 'location' | 'addEventListener' | 'dispatchEvent' | 'setTimeout'
+  > & { CustomEvent: typeof CustomEvent },
+) {
+  let busy = false
+  page.addEventListener(REQUEST, (event) => {
+    let command: z.infer<typeof Command>
+    try {
+      command = Command.parse(JSON.parse((event as CustomEvent<string>).detail))
+    } catch {
+      return
+    }
+    const reply = (code?: string) =>
+      page.dispatchEvent(
+        new page.CustomEvent(RESULT, {
+          detail: JSON.stringify({ id: command.id, ...(code ? { code } : {}) }),
+        }),
+      )
+    if (busy) {
+      reply('browser_busy')
+      return
+    }
+    busy = true
+    void (async () => {
+      try {
+        const route = page.location.href
+        const state = nativeState(page.document)
+        if (!state)
+          throw new DomError(
+            'native_model_selection_unavailable',
+            'Native model selection callback is unavailable.',
+          )
+        const models = NativeModels.parse(state.props.models)
+        const version = models.versionOptions.find((v) => v.id === command.choice.version)
+        const allowed =
+          version?.slugs.includes(command.choice.model) &&
+          version.options.some(
+            (o) =>
+              o.isAvailable &&
+              (o.slug === command.choice.model ||
+                (o.lane && version.modelSlugByLane?.[o.lane] === command.choice.model)) &&
+              (o.thinkingEffort ?? null) === command.choice.effort,
+          )
+        if (!allowed)
+          throw new DomError(
+            'model_unavailable',
+            'Requested preset is unavailable in the native model state.',
+          )
+        const target = {
+          slug: command.choice.model,
+          thinkingEffort: command.choice.effort,
+          versionId: command.choice.version,
+        }
+        const matches = () => {
+          const current = nativeState(page.document)
+          if (!current) return false
+          const selected = Selection.parse(current.props.selectedModel)
+          return (
+            selected.slug === target.slug &&
+            selected.thinkingEffort === target.thinkingEffort &&
+            selected.versionId === target.versionId
+          )
+        }
+        if (!matches()) state.change(target)
+        const deadline = Date.now() + 2000
+        while (!matches()) {
+          if (page.location.href !== route)
+            throw new DomError(
+              'conversation_changed',
+              'Conversation changed during model selection.',
+            )
+          if (Date.now() >= deadline)
+            throw new DomError(
+              'model_selection_failed',
+              'Native model selection was not confirmed.',
+            )
+          await new Promise<void>((resolve) => page.setTimeout(resolve, 25))
+        }
+        if (page.location.href !== route)
+          throw new DomError('conversation_changed', 'Conversation changed during model selection.')
+        reply()
+      } catch (error) {
+        reply(error instanceof DomError ? error.code : 'native_model_selection_unavailable')
+      } finally {
+        busy = false
+      }
+    })()
+  })
 }
 export async function selectModel(
   doc: Document,
@@ -38,75 +161,54 @@ export async function selectModel(
   effort?: string,
 ) {
   const choices = capabilities.choices.filter(
-    (choice) => choice.model === model && (effort === undefined || choice.effort === effort),
+    (c) => c.model === model && (effort === undefined || c.effort === effort),
   )
-  const target = choices.find((choice) => choice.effort === 'standard') ?? choices[0]
+  const target = choices.find((c) => c.effort === 'standard') ?? choices[0]
   if (!target)
     throw new DomError(
       'model_unavailable',
       'Requested model/effort was not observed as an available ChatGPT preset.',
     )
-  let controls = await openMenu(doc)
-  try {
-    const toggle = controls.menu.querySelector<HTMLElement>('[data-model-picker-view-toggle]')
-    if (!toggle)
-      throw new DomError('model_selector_unavailable', 'Version selector is unavailable.')
-    toggle.click()
-    await wait(100)
-    const version = [...controls.menu.querySelectorAll<HTMLElement>('[role="menuitemradio"]')].find(
-      (node) =>
-        (node.innerText ?? node.textContent ?? '').trim().split('\n')[0] === target.versionLabel,
-    )
-    if (
-      !version ||
-      version.hasAttribute('data-disabled') ||
-      version.getAttribute('aria-disabled') === 'true'
-    )
-      throw new DomError('model_unavailable', 'Requested model version is unavailable.')
-    version.click()
-    await wait(150)
-    if (version.getAttribute('aria-checked') !== 'true')
-      throw new DomError('model_selection_failed', 'Model version selection was not confirmed.')
-    closeMenu(controls.selector, controls.menu, controls.win)
-    await wait(100)
-    controls = await openMenu(doc)
-    const power = controls.menu.querySelector<HTMLElement>(
-      '[data-reasoning-slider][role="menuitem"]',
-    )
-    const slider = controls.menu.querySelector<HTMLElement>('[role="slider"]')
-    if (
-      !power ||
-      !slider ||
-      power.hasAttribute('data-disabled') ||
-      power.getAttribute('aria-disabled') === 'true' ||
-      Number(slider.getAttribute('aria-valuemax')) !== target.count - 1
-    )
-      throw new DomError(
-        'reasoning_selector_unavailable',
-        'Reasoning control does not match the observed presets.',
-      )
-    power.focus()
-    for (let step = 0; step < 30; step++) {
-      const current = Number(slider.getAttribute('aria-valuenow'))
-      if (!Number.isFinite(current))
-        throw new DomError('model_selection_failed', 'Unable to read reasoning selection.')
-      if (current === target.index) break
-      const key = current < target.index ? 'ArrowRight' : 'ArrowLeft'
-      power.dispatchEvent(
-        new controls.win.KeyboardEvent('keydown', { key, code: key, bubbles: true }),
-      )
-      await wait(100)
-      if (Number(slider.getAttribute('aria-valuenow')) === current)
-        throw new DomError('model_selection_failed', 'Reasoning selection did not change.')
+  const page = doc.defaultView
+  if (!page)
+    throw new DomError('native_model_selection_unavailable', 'Editor window is unavailable.')
+  const id = page.crypto.randomUUID()
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      page.clearTimeout(timer)
+      page.removeEventListener(RESULT, listener)
     }
-    const label = controls.menu.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
-    if (
-      Number(slider.getAttribute('aria-valuenow')) !== target.index ||
-      !label.startsWith(target.title + ',')
+    const listener = (event: Event) => {
+      let receipt: z.infer<typeof Receipt>
+      try {
+        receipt = Receipt.parse(JSON.parse((event as CustomEvent<string>).detail))
+      } catch {
+        return
+      }
+      if (receipt.id !== id) return
+      cleanup()
+      if (receipt.code)
+        reject(
+          new DomError(
+            receipt.code,
+            'Native JS model selection failed; no UI fallback was attempted.',
+          ),
+        )
+      else resolve()
+    }
+    const timer = page.setTimeout(() => {
+      cleanup()
+      reject(
+        new DomError(
+          'native_model_selection_unavailable',
+          'Native JS model selection did not respond. Reload the LocalGPT extension and ChatGPT tab.',
+        ),
+      )
+    }, 5000)
+    page.addEventListener(RESULT, listener)
+    page.dispatchEvent(
+      new page.CustomEvent(REQUEST, { detail: JSON.stringify({ id, choice: target }) }),
     )
-      throw new DomError('model_selection_failed', 'Requested reasoning preset was not confirmed.')
-    return target
-  } finally {
-    closeMenu(controls.selector, controls.menu, controls.win)
-  }
+  })
+  return target
 }
