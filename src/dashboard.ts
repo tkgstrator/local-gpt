@@ -6,6 +6,7 @@ const HealthSchema = z.object({
   browserConnected: z.boolean(),
   transport: z.enum(['websocket', 'http']).nullable(),
   busy: z.boolean(),
+  updating: z.boolean().optional(),
   browsers: z.number().int().nonnegative().optional(),
   availableBrowsers: z.number().int().nonnegative().optional(),
   wsPort: z.number(),
@@ -113,8 +114,9 @@ async function refresh() {
         : health.transport === 'http'
           ? `HTTP · ポート8766${health.browsers ? ` · ${health.browsers}タブ` : ''}`
           : 'ChatGPTでスクリプトを有効にしてください'
-    element('request-status').textContent =
-      health.availableBrowsers !== undefined && health.browsers && health.browsers > 1
+    element('request-status').textContent = health.updating
+      ? '更新中'
+      : health.availableBrowsers !== undefined && health.browsers && health.browsers > 1
         ? `${health.browsers - health.availableBrowsers}件処理中 · ${health.availableBrowsers}タブ受付可能`
         : health.busy
           ? '処理中'
@@ -123,9 +125,11 @@ async function refresh() {
             : '接続後に受付'
     element('connection-notice').dataset.state = health.browserConnected ? 'ready' : 'waiting'
     element('notice-title').textContent = health.browserConnected
-      ? health.busy
-        ? 'ChatGPTが回答を生成しています'
-        : '接続できました。APIを利用できます。'
+      ? health.updating
+        ? '拡張機能を更新しています'
+        : health.busy
+          ? 'ChatGPTが回答を生成しています'
+          : '接続できました。APIを利用できます。'
       : 'サーバーは起動しています。ブラウザーの接続を待っています。'
     element('notice-detail').textContent = health.browserConnected
       ? 'このページを開いたまま、接続したChatGPTのタブも開いておいてください。'

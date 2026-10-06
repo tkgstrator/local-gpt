@@ -44,6 +44,7 @@ interface Options {
   timeoutMs: number
   bridgeToken?: string
   pollingLeaseMs?: number
+  updateLeaseMs?: number
   responseJobsDir?: string
   sessionsFile?: string
   imagesDir?: string
@@ -94,6 +95,11 @@ export function createService(options: Options) {
   const handledRequests = new Set<string>()
   const dotOwners = new Map<string, string>()
   let sharedBrowserId: string | null = null
+  let updateLease: { browserId: string; expiresAt: number; known: Set<string> } | null = null
+  const browserUpdating = () => {
+    if (updateLease && updateLease.expiresAt <= Date.now()) updateLease = null
+    return updateLease !== null
+  }
   const laneFor = (id: string) => {
     let lane = lanes.get(id)
     if (!lane) {
@@ -104,7 +110,9 @@ export function createService(options: Options) {
   }
   // ChatGPT tabs share account UI state; permit one browser operation service-wide.
   const browserBusy = () =>
-    restoredUnknown || [...lanes.values()].some((lane) => lane.pending !== null)
+    browserUpdating() ||
+    restoredUnknown ||
+    [...lanes.values()].some((lane) => lane.pending !== null || lane.queued !== null)
   const busyMessage =
     'LocalGPT is processing another browser operation. Wait for it to finish before retrying.'
   const availableLane = () => {
@@ -178,6 +186,21 @@ export function createService(options: Options) {
       originUrl.port !== String((http.address() as { port: number } | null)?.port)
     ) {
       res.status(403).json({ error: { code: 'invalid_origin' } })
+      return
+    }
+    next()
+  })
+  app.use('/v1', (req, res, next) => {
+    const operatesBrowser =
+      (req.method === 'POST' && req.path !== '/sessions') ||
+      (req.method === 'GET' && ['/models', '/capabilities'].includes(req.path))
+    if (operatesBrowser && browserUpdating()) {
+      res.status(409).json({
+        error: {
+          code: 'browser_updating',
+          message: 'The browser extension is updating; retry after it reconnects.',
+        },
+      })
       return
     }
     next()
@@ -269,6 +292,7 @@ export function createService(options: Options) {
       browserConnected: active.length > 0,
       transport: wsConnected(shared) ? 'websocket' : pollingConnected(shared) ? 'http' : null,
       busy: browserBusy(),
+      updating: browserUpdating(),
       browsers: active.length,
       sharedBrowserId: connected(shared) || shared.pending ? shared.id : null,
       availableBrowsers: active.length > 0 && !browserBusy() ? 1 : 0,
@@ -504,8 +528,46 @@ export function createService(options: Options) {
     res.setHeader('Cache-Control', 'no-store')
     next()
   })
+  app.post('/bridge/update-ready', (req, res) => {
+    const body = req.body as unknown
+    if (
+      !body ||
+      typeof body !== 'object' ||
+      Array.isArray(body) ||
+      Object.keys(body).length !== 1 ||
+      !('version' in body) ||
+      typeof body.version !== 'string' ||
+      !/^\d+\.\d+\.\d+$/.test(body.version)
+    ) {
+      res.status(400).json({ error: { code: 'invalid_update' } })
+      return
+    }
+    const lane = res.locals.lane as BrowserLane
+    if (browserUpdating() && updateLease!.browserId !== lane.id) {
+      res.json({ ready: false, reason: 'browser_updating' })
+      return
+    }
+    if (
+      restoredUnknown ||
+      [...lanes.values()].some((l) => l.pending !== null || l.queued !== null)
+    ) {
+      res.json({ ready: false, reason: 'browser_busy' })
+      return
+    }
+    updateLease = {
+      browserId: lane.id,
+      expiresAt: Date.now() + (options.updateLeaseMs ?? 15000),
+      known: new Set(lanes.keys()),
+    }
+    res.json({ ready: true })
+  })
   app.post('/bridge/poll', (_req, res) => {
     const lane = res.locals.lane as BrowserLane
+    if (
+      browserUpdating() &&
+      (updateLease!.browserId === lane.id || !updateLease!.known.has(lane.id))
+    )
+      updateLease = null
     const request = lane.queued
     lane.queued = null
     res.json({ request })
