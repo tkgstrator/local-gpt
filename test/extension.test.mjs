@@ -18,6 +18,14 @@ test('background rejects arbitrary network URLs', async () => {
   const result = await handleBridgeMessage({ type: 'bridge_request', path: 'https://example.com/', browserId: 'tab1', data: {} }, { id: 'our-id', url: 'https://chatgpt.com/', tab: { id: 1 }, frameId: 0 }, { extensionId: 'our-id', token: 'fixture' });
   assert.equal(result.ok, false); assert.equal(result.error, 'Invalid bridge request');
 });
+test('an unpaired public download never forwards unauthenticated bridge traffic', async () => {
+  const { handleBridgeMessage } = require('../dist/extension-handler.cjs');
+  const result = await handleBridgeMessage({ type: 'bridge_request', path: 'poll', browserId: 'tab1', data: {} },
+    { id: 'our-id', url: 'https://chatgpt.com/', tab: { id: 1 }, frameId: 0 },
+    { extensionId: 'our-id', token: '' }, async () => { throw new Error('Network must not be called'); });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /pairing is missing/);
+});
 
 test('extension archive filename follows the manifest version',async()=>{
  const manifest=JSON.parse(await readFile('dist/extension/manifest.json','utf8'));const archive=await readFile(`dist/localgpt-extension-${manifest.version}.zip`);assert.equal(archive.subarray(0,2).toString(),'PK');
@@ -43,7 +51,7 @@ test('background activates only the requesting ChatGPT tab when a job arrives', 
   };
   let job = null;
   const fetch = async () => { fetched = true; return Response.json({ request: job }); };
-  new Function('chrome', 'fetch', await readFile('dist/extension/background.js', 'utf8'))(chrome, fetch);
+  new Function('chrome', 'fetch', 'importScripts', 'LOCALGPT_PAIRING_TOKEN', await readFile('dist/extension/background.js', 'utf8'))(chrome, fetch, () => {}, 'fixture');
   const request = { type: 'bridge_request', path: 'poll', browserId: 'tab1', data: {} };
   const sender = { id: 'our-id', url: 'https://chatgpt.com/', tab: { id: 7 }, frameId: 0 };
   const invoke = sender => new Promise(resolve => listener(request, sender, resolve));

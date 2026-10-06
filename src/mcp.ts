@@ -283,7 +283,7 @@ export function createMcpServer(baseUrl: string) {
     'localgpt_capabilities',
     {
       description:
-        'Read the connected browser’s ChatGPT API data: available Chat models, reasoning types and thinking effort choices, and account plan. Null means not observed; reload ChatGPT after installing version 2.4.13. Reports observed model selection choices; does not expose personal account information.',
+        'Read the connected browser’s ChatGPT API data: available Chat models, reasoning types and thinking effort choices, and account plan. Null means not observed; reload ChatGPT after installing version 2.4.14. Reports observed model selection choices; does not expose personal account information.',
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false },
     },

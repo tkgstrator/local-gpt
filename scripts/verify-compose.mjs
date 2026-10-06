@@ -22,6 +22,6 @@ try {
   assert.equal(response.status, 200);
   const files = unzipSync(new Uint8Array(await response.arrayBuffer()));
   const token = readFileSync(process.env.BRIDGE_TOKEN_FILE || '/var/lib/localgpt-credentials/browser-bridge', 'utf8').trim();
-  assert.ok(new TextDecoder().decode(files['background.js']).includes(token));
+  assert.ok(new TextDecoder().decode(files['pairing.js']).includes(token));
   console.log('Compose: combined MCP write/edit/read and installation-paired extension download passed.');
 } finally { await client.close(); }
