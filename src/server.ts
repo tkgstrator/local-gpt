@@ -1,7 +1,10 @@
+import { createResponseJobStore, ResponseJobStorageError } from './response-jobs'
+import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
+import { createImageStore } from './generated-images'
+import { MAX_GENERATED_IMAGES, type GeneratedImage } from './generated-image-protocol'
 import { attachLocalMcpTools, readLocalMcpConfig, type LocalMcpConfig } from './localmcp'
 import { filePrompt, loadFiles } from './attachments'
-import { createSessionStore, CreateSessionSchema } from './sessions'
-import { createResponseJobStore, ResponseJobStorageError } from './response-jobs'
+import { createSessionStore, CreateSessionSchema, DeleteSessionSchema } from './sessions'
 import { DotActionSchema } from './dots'
 import express from 'express'
 import { createMcpServer } from './mcp'
@@ -43,22 +46,11 @@ interface Options {
   pollingLeaseMs?: number
   responseJobsDir?: string
   sessionsFile?: string
+  imagesDir?: string
+  imagesHostDir?: string
+  imageFetcher?: typeof fetch
   localMcp?: LocalMcpConfig
 }
-// Browser errors after dispatch that say nothing definite about the remote generation.
-const UNKNOWN_OUTCOME = new Set([
-  'browser_timeout',
-  'browser_disconnected',
-  'response_stream_incomplete',
-  'unsupported_response_stream',
-  'unsupported_response_content',
-  'response_stream_too_large',
-  'response_incomplete',
-  'response_stream_unavailable',
-  'stream_interrupted',
-  'response_stream_interrupted',
-  'response_stream_timeout',
-])
 interface GenerationSink {
   status(code: number): GenerationSink
   json(value: unknown): unknown
@@ -83,21 +75,25 @@ interface Pending {
   navigating?: boolean
   background?: boolean
   suspend?: () => void
-  event: (event: BrowserEvent) => void
+  event: (event: BrowserEvent) => void | Promise<void>
   fail: (status: number, code: string, message: string) => void
 }
 export function createService(options: Options) {
   const jobs = createResponseJobStore({ dir: options.responseJobsDir })
-  // A restored pending job has an unknown remote outcome; keep the browser reserved until manual recovery.
   const restoredUnknown = jobs.activeCount() > 0
   const sessions = createSessionStore(options.sessionsFile)
+  const imagesStore = createImageStore(
+    options.imagesDir ?? resolve('.localgpt-images'),
+    options.imagesHostDir,
+    options.imageFetcher,
+  )
   const app = express()
   const http = createServer(app)
   let wsServer: Server<SocketData> | null = null
   const lanes = new Map<string, BrowserLane>()
+  const handledRequests = new Set<string>()
   const dotOwners = new Map<string, string>()
   let sharedBrowserId: string | null = null
-  const handledRequests = new Set<string>()
   const laneFor = (id: string) => {
     let lane = lanes.get(id)
     if (!lane) {
@@ -111,9 +107,9 @@ export function createService(options: Options) {
     restoredUnknown || [...lanes.values()].some((lane) => lane.pending !== null)
   const busyMessage =
     'LocalGPT is processing another browser operation. Wait for it to finish before retrying.'
-  // One shared tab receives all operations. Standby tabs are used only after it disconnects with nothing in flight.
   const availableLane = () => {
     const shared = sharedBrowserId ? lanes.get(sharedBrowserId) : undefined
+    // Keep ownership during navigation/reconnection; never move an in-flight request.
     if (shared && (connected(shared) || shared.pending)) return shared
     const replacement = [...lanes.values()].find((lane) => connected(lane))
     sharedBrowserId = replacement?.id ?? null
@@ -131,9 +127,12 @@ export function createService(options: Options) {
       lane.polling = null
       const undelivered = lane.pending && lane.queued?.requestId === lane.pending.requestId
       lane.queued = null
-      // A request never handed to the browser is a definite failure; a delivered one is unknown.
       if (undelivered)
-        lane.pending?.fail(503, 'browser_undelivered', 'The browser never received the request.')
+        lane.pending?.fail(
+          503,
+          'browser_undelivered',
+          'ChatGPT HTTP browser connection expired before the request was delivered.',
+        )
       else if (lane.pending?.background) lane.pending.suspend?.()
       else
         lane.pending?.fail(503, 'browser_disconnected', 'ChatGPT HTTP browser connection expired.')
@@ -193,7 +192,7 @@ export function createService(options: Options) {
     const mcp = createMcpServer(`http://127.0.0.1:${address.port}`)
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
-      enableJsonResponse: true,
+      enableJsonResponse: false,
     })
     let upstream: Awaited<ReturnType<typeof attachLocalMcpTools>>
     res.on('close', () => {
@@ -276,6 +275,210 @@ export function createService(options: Options) {
       wsPort: options.wsPort,
     })
   })
+  app.post('/v1/sessions/project', (req, res) => {
+    const parsed = DeleteSessionSchema.safeParse(req.body as unknown)
+    if (!parsed.success) {
+      res.status(400).json({ error: { code: 'invalid_session' } })
+      return
+    }
+    const session = sessions.get(parsed.data.session_id)
+    if (!session) {
+      res.status(404).json({ error: { code: 'session_not_found' } })
+      return
+    }
+    if (!session.projectName) {
+      res.status(400).json({ error: { code: 'project_target_disabled' } })
+      return
+    }
+    if (!session.conversationId) {
+      res.json(session)
+      return
+    }
+    expirePolling()
+    if (browserBusy()) {
+      res.status(409).json({ error: { code: 'browser_busy', message: busyMessage } })
+      return
+    }
+    const lane = availableLane()
+    if (!connected(lane)) {
+      res.status(503).json({ error: { code: 'browser_disconnected' } })
+      return
+    }
+    const requestId = randomUUID()
+    const payload: BrowserRequest = {
+      type: 'move_conversation',
+      requestId,
+      conversationId: session.conversationId,
+      projectName: session.projectName,
+      ...(session.projectId ? { projectId: session.projectId } : {}),
+    }
+    let finished = false
+    const cleanup = () => {
+      finished = true
+      clearTimeout(timer)
+      if (lane.pending?.requestId === requestId) lane.pending = null
+      if (lane.queued?.requestId === requestId) lane.queued = null
+    }
+    const fail = (status: number, code: string, message: string) => {
+      if (finished) return
+      cleanup()
+      res.status(status).json({ error: { code, message } })
+    }
+    const timer = setTimeout(
+      () =>
+        fail(
+          504,
+          'browser_timeout',
+          'Project movement may already have happened. Do not automatically retry.',
+        ),
+      Math.min(options.timeoutMs, 30000),
+    )
+    lane.pending = {
+      requestId,
+      sessionId: session.id,
+      fail,
+      event(event) {
+        if (finished || event.type === 'heartbeat') return
+        if (event.type === 'error') {
+          fail(502, event.code, event.message)
+          return
+        }
+        if (event.type === 'navigate' && event.conversationId === session.conversationId) {
+          if (lane.pending) lane.pending.navigating = true
+          lane.queued = payload
+          if (wsConnected(lane))
+            lane.browser!.send(JSON.stringify({ type: 'navigation_ready', requestId }))
+          return
+        }
+        if (
+          event.type !== 'conversation_project' ||
+          event.conversationId !== session.conversationId
+        ) {
+          fail(
+            502,
+            'invalid_browser_message',
+            'Expected project confirmation for the bound conversation.',
+          )
+          return
+        }
+        const updated = sessions.setProject(session.id, session.projectName, event.projectId)
+        cleanup()
+        res.setHeader('Cache-Control', 'no-store')
+        res.json(updated)
+      },
+    }
+    res.on('close', () => {
+      if (!finished) cleanup()
+    })
+    if (wsConnected(lane))
+      lane.browser!.send(JSON.stringify(payload), (err) => {
+        if (err) fail(503, 'browser_disconnected', 'Unable to send to browser.')
+      })
+    else lane.queued = payload
+  })
+  app.post('/v1/sessions/delete', (req, res) => {
+    const parsed = DeleteSessionSchema.safeParse(req.body as unknown)
+    if (!parsed.success) {
+      res.status(400).json({ error: { code: 'invalid_session' } })
+      return
+    }
+    const session = sessions.get(parsed.data.session_id)
+    if (!session) {
+      res.status(404).json({ error: { code: 'session_not_found' } })
+      return
+    }
+    expirePolling()
+    if ([...lanes.values()].some((lane) => lane.pending?.sessionId === session.id)) {
+      res.status(409).json({ error: { code: 'browser_busy', message: busyMessage } })
+      return
+    }
+    const deleted = (conversationDeleted: boolean) => {
+      sessions.delete(session.id)
+      res.setHeader('Cache-Control', 'no-store')
+      res.json({ session_id: session.id, deleted: true, conversationDeleted })
+    }
+    if (!session.conversationId) {
+      deleted(false)
+      return
+    }
+    const lane = availableLane()
+    if (browserBusy()) {
+      res.status(409).json({ error: { code: 'browser_busy', message: busyMessage } })
+      return
+    }
+    if (!connected(lane)) {
+      res.status(503).json({ error: { code: 'browser_disconnected' } })
+      return
+    }
+    const requestId = randomUUID()
+    const payload: BrowserRequest = {
+      type: 'delete_conversation',
+      requestId,
+      conversationId: session.conversationId,
+      ...(session.projectId ? { projectId: session.projectId } : {}),
+    }
+    let finished = false
+    const cleanup = () => {
+      finished = true
+      clearTimeout(timer)
+      if (lane.pending?.requestId === requestId) lane.pending = null
+      if (lane.queued?.requestId === requestId) lane.queued = null
+    }
+    const fail = (status: number, code: string, message: string) => {
+      if (finished) return
+      cleanup()
+      res.status(status).json({ error: { code, message } })
+    }
+    const timer = setTimeout(
+      () =>
+        fail(
+          504,
+          'browser_timeout',
+          'Deletion may already have happened. Inspect the browser before retrying.',
+        ),
+      Math.min(options.timeoutMs, 30000),
+    )
+    lane.pending = {
+      requestId,
+      sessionId: session.id,
+      fail,
+      event(event) {
+        if (finished || event.type === 'heartbeat') return
+        if (event.type === 'error') {
+          fail(502, event.code, event.message)
+          return
+        }
+        if (event.type === 'navigate' && event.conversationId === session.conversationId) {
+          if (lane.pending) lane.pending.navigating = true
+          lane.queued = payload
+          if (wsConnected(lane))
+            lane.browser!.send(JSON.stringify({ type: 'navigation_ready', requestId }))
+          return
+        }
+        if (
+          event.type !== 'conversation_deleted' ||
+          event.conversationId !== session.conversationId
+        ) {
+          fail(
+            502,
+            'invalid_browser_message',
+            'Expected deletion confirmation for the bound conversation.',
+          )
+          return
+        }
+        cleanup()
+        deleted(true)
+      },
+    }
+    res.on('close', () => {
+      if (!finished) cleanup()
+    })
+    if (wsConnected(lane))
+      lane.browser!.send(JSON.stringify(payload), (err) => {
+        if (err) fail(503, 'browser_disconnected', 'Unable to send to browser.')
+      })
+    else lane.queued = payload
+  })
   app.use('/bridge', (req, res, next) => {
     expirePolling()
     if (!options.bridgeToken || req.get('X-Bridge-Token') !== options.bridgeToken) {
@@ -324,13 +527,21 @@ export function createService(options: Options) {
       await lane.pending!.event(event)
       remember(event.requestId)
     }
-    // accepted tells an observing browser whether the server took ownership of this event.
     res.json({ ok: true, accepted: matched || handledRequests.has(event.requestId) })
   })
   const extensionVersion = (
     JSON.parse(readFileSync(resolve('extension/manifest.json'), 'utf8')) as { version: string }
   ).version
   if (!/^\d+\.\d+\.\d+$/.test(extensionVersion)) throw new Error('Invalid extension version')
+  app.get('/v1/images/:id', (req, res) => {
+    const image = imagesStore.read(req.params.id)
+    if (!image) {
+      res.status(404).json({ error: { code: 'image_not_found' } })
+      return
+    }
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable')
+    res.type(image.metadata.mimeType).sendFile(image.file)
+  })
   app.get('/extension', (_req, res) =>
     res.download(
       resolve(`dist/localgpt-extension-${extensionVersion}.zip`),
@@ -365,12 +576,10 @@ export function createService(options: Options) {
       return
     }
     const event = parsed.data
-    if (event.type === 'heartbeat') return
-    const matched = event.requestId === lane.pending?.requestId
+    const matched = event.type !== 'heartbeat' && event.requestId === lane.pending?.requestId
     const handling = matched ? lane.pending!.event(event) : undefined
     if (matched) remember(event.requestId)
-    // WebSocket replay needs delivery proof; acknowledge only after the server handled the event.
-    if (event.eventId)
+    if (event.type !== 'heartbeat' && event.eventId)
       void Promise.resolve(handling)
         .then(() =>
           lane.browser?.send(
@@ -389,12 +598,12 @@ export function createService(options: Options) {
     expirePolling()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
-    if (!connected(lane)) {
-      error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
-      return
-    }
     if (browserBusy()) {
       error(409, 'browser_busy', busyMessage)
+      return
+    }
+    if (!connected(lane)) {
+      error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
       return
     }
     const requestId = randomUUID()
@@ -460,12 +669,12 @@ export function createService(options: Options) {
     expirePolling()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
-    if (!connected(lane)) {
-      error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
-      return
-    }
     if (browserBusy()) {
       error(409, 'browser_busy', busyMessage)
+      return
+    }
+    if (!connected(lane)) {
+      error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
       return
     }
     const requestId = randomUUID()
@@ -549,12 +758,12 @@ export function createService(options: Options) {
     const lane = availableLane()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
-    if (!connected(lane)) {
-      error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
-      return
-    }
     if (browserBusy()) {
       error(409, 'browser_busy', busyMessage)
+      return
+    }
+    if (!connected(lane)) {
+      error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
       return
     }
     if (operation.data.action !== 'list' && ownerId && ownerId !== lane.id) {
@@ -613,9 +822,7 @@ export function createService(options: Options) {
           }
         }
         if (event.result.action === 'list') {
-          for (const dot of event.result.dots)
-            if (!dotOwners.has(dot.id) || event.result.selected === dot.id)
-              dotOwners.set(dot.id, lane.id)
+          for (const dot of event.result.dots) dotOwners.set(dot.id, lane.id)
         } else if (event.result.action === 'select') dotOwners.set(event.result.dot.id, lane.id)
         cleanup()
         res.setHeader('Cache-Control', 'no-store')
@@ -633,7 +840,7 @@ export function createService(options: Options) {
     else lane.queued = payload
   })
   const generate = (
-    req: { body: unknown; path: string },
+    req: Pick<express.Request, 'body' | 'path'>,
     res: GenerationSink,
     forceResponses = false,
   ) => {
@@ -698,6 +905,11 @@ export function createService(options: Options) {
     const responses = responsesBody
       ? createResponsesWriter((data) => res.write(data), requestId, responsesBody)
       : null
+    const imageDownloads: Promise<GeneratedImage | null>[] = []
+    const imageIds = new Set<string>()
+    const downloadAbort = new AbortController()
+    let imageConversation: string | null = null
+    let completing = false
     let text = ''
     let streamingStarted = false
     let finished = false
@@ -711,17 +923,27 @@ export function createService(options: Options) {
     }
     const cleanup = () => {
       finished = true
+      downloadAbort.abort()
       clearTimeout(timer)
       if (lane.pending?.requestId === requestId) lane.pending = null
       if (lane.queued?.requestId === requestId) lane.queued = null
     }
     const fail = (status: number, code: string, message: string) => {
       if (finished) return
-      // An observed send may still be generating: transport loss is unknown, never a failure.
       if (res.backgroundJob && ['browser_disconnected', 'invalid_browser_message'].includes(code)) {
         res.progress?.('unresponsive')
         return
       }
+      console.error(
+        JSON.stringify({
+          event: 'generation_failed',
+          requestId,
+          code,
+          status,
+          receivedText: text.length > 0,
+          receivedImages: imageIds.size,
+        }),
+      )
       cleanup()
       if (streamingStarted && responses) {
         responses.fail(text, code, message)
@@ -752,13 +974,25 @@ export function createService(options: Options) {
         if (!finished) res.progress?.('unresponsive')
       },
       sessionId: body.session_id,
-      event(event) {
+      async event(event) {
         if (finished || event.type === 'heartbeat') return
         if (event.type === 'error') {
-          // Only an explicit native failure or a definite pre-send failure ends a job.
           if (
             background &&
-            (event.code.startsWith('observation_') || UNKNOWN_OUTCOME.has(event.code))
+            (event.code.startsWith('observation_') ||
+              [
+                'browser_timeout',
+                'browser_disconnected',
+                'response_stream_incomplete',
+                'unsupported_response_stream',
+                'unsupported_response_content',
+                'response_stream_too_large',
+                'response_incomplete',
+                'response_stream_unavailable',
+                'stream_interrupted',
+                'response_stream_interrupted',
+                'response_stream_timeout',
+              ].includes(event.code))
           ) {
             res.progress?.('unresponsive')
             return
@@ -782,8 +1016,45 @@ export function createService(options: Options) {
           return
         }
         if (lane.pending) lane.pending.navigating = false
-        if (event.type === 'models' || event.type === 'capabilities' || event.type === 'dots') {
+        if (
+          event.type === 'models' ||
+          event.type === 'capabilities' ||
+          event.type === 'dots' ||
+          event.type === 'conversation_deleted' ||
+          event.type === 'conversation_project'
+        ) {
           fail(502, 'invalid_browser_message', 'Unexpected model reply for a generation request.')
+          return
+        }
+        if (event.type === 'image') {
+          if (
+            completing ||
+            (session?.conversationId && session.conversationId !== event.conversationId) ||
+            (imageConversation && imageConversation !== event.conversationId)
+          ) {
+            fail(502, 'image_mismatch', 'Unexpected image conversation or late image.')
+            return
+          }
+          imageConversation = event.conversationId
+          if (imageIds.has(event.fileId)) return
+          if (imageIds.size >= MAX_GENERATED_IMAGES) {
+            fail(502, 'too_many_generated_images', 'At most four generated images are supported.')
+            return
+          }
+          imageIds.add(event.fileId)
+          imageDownloads.push(
+            (event.imageData
+              ? imagesStore.saveData(event.fileId, event.imageData)
+              : imagesStore.save(event.fileId, event.downloadUrl!, downloadAbort.signal)
+            ).catch(() => {
+              fail(
+                502,
+                'image_download_failed',
+                'The generated image could not be downloaded and saved.',
+              )
+              return null
+            }),
+          )
           return
         }
         if (event.type === 'answer') {
@@ -806,6 +1077,16 @@ export function createService(options: Options) {
           text = event.text
           return
         }
+        if (completing) return
+        completing = true
+        if (imageConversation && imageConversation !== event.conversationId) {
+          fail(502, 'image_mismatch', 'Image and response conversations differ.')
+          return
+        }
+        const images = (await Promise.all(imageDownloads)).filter(
+          (image): image is GeneratedImage => image !== null,
+        )
+        if (finished) return
         if (session) {
           if (!event.conversationId) {
             fail(
@@ -815,7 +1096,25 @@ export function createService(options: Options) {
             )
             return
           }
+          if (session.conversationId && session.conversationId !== event.conversationId) {
+            fail(502, 'session_mismatch', 'Browser replied from a different conversation.')
+            return
+          }
+          if (session.projectName && !event.projectId) {
+            fail(
+              502,
+              'project_unconfirmed',
+              'Project membership was not confirmed. Do not automatically resend.',
+            )
+            return
+          }
+          if (session.projectId && event.projectId !== session.projectId) {
+            fail(502, 'project_mismatch', 'Browser replied from a different project.')
+            return
+          }
           try {
+            if (session.projectName && event.projectId)
+              sessions.setProject(session.id, session.projectName, event.projectId)
             sessions.bind(session.id, event.conversationId, body.model, body.reasoning?.effort)
           } catch {
             fail(502, 'session_mismatch', 'Browser replied from a different conversation.')
@@ -825,13 +1124,13 @@ export function createService(options: Options) {
         cleanup()
         if (body.stream) {
           startStream()
-          if (responses) responses.complete(text)
+          if (responses) responses.complete(text, images)
           else
             res.write(
               `data: ${JSON.stringify({ id: requestId, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`,
             )
           res.end()
-        } else if (responses) res.json(responses.response(text, 'completed'))
+        } else if (responses) res.json(responses.response(text, 'completed', null, images))
         else
           res.json({
             id: requestId,
@@ -839,6 +1138,7 @@ export function createService(options: Options) {
             created: Math.floor(Date.now() / 1000),
             model: body.model || 'browser-selected',
             session_id: body.session_id ?? null,
+            images,
             choices: [
               { index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' },
             ],
@@ -868,6 +1168,8 @@ export function createService(options: Options) {
       ...(body.model ? { model: body.model } : {}),
       ...(body.reasoning ? { reasoning: body.reasoning } : {}),
       ...(session?.conversationId ? { conversationId: session.conversationId } : {}),
+      ...(session?.projectName ? { projectName: session.projectName } : {}),
+      ...(session?.projectId ? { projectId: session.projectId } : {}),
     }
     if (wsConnected(lane))
       lane.browser!.send(JSON.stringify(payload), (err) => {
@@ -1144,13 +1446,15 @@ function formatMessages(messages: { role: string; content: string }[]) {
 }
 if (require.main === module) {
   const service = createService({
-    responseJobsDir: process.env.LOCALGPT_RESPONSE_JOBS_DIR,
+    imagesDir: process.env.LOCALGPT_IMAGES_DIR || resolve('.localgpt-images'),
+    imagesHostDir: process.env.LOCALGPT_IMAGES_HOST_DIR,
     localMcp: readLocalMcpConfig(),
+    responseJobsDir: process.env.LOCALGPT_RESPONSE_JOBS_DIR,
     sessionsFile: process.env.SESSIONS_FILE || resolve('.localgpt-sessions.sqlite'),
     host: process.env.HOST || '127.0.0.1',
     httpPort: Number(process.env.HTTP_PORT || 8766),
     wsPort: Number(process.env.WS_PORT || 8875),
-    timeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 180000),
+    timeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || DEFAULT_GENERATION_TIMEOUT_MS),
     bridgeToken: readFileSync(
       process.env.BRIDGE_TOKEN_FILE || resolve('.bridge-token'),
       'utf8',

@@ -1,4 +1,4 @@
-import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js'
+import { CallToolResultSchema, McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -108,7 +108,22 @@ export async function attachLocalMcpTools(server: McpServer, config?: LocalMcpCo
                 { signal: extra.signal, timeout: 190000 },
               ),
             )
-          } catch {
+          } catch (cause) {
+            if (
+              cause instanceof McpError &&
+              [ErrorCode.InvalidParams, ErrorCode.MethodNotFound].includes(cause.code)
+            ) {
+              const message = cause.message.split(config.token).join('[redacted]').slice(0, 2000)
+              return {
+                isError: true,
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `localmcp_tool_error (${cause.code}): ${message}`,
+                  },
+                ],
+              }
+            }
             return {
               isError: true,
               content: [

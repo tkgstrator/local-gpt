@@ -1,13 +1,32 @@
+import { installNativeModelSelection } from './model-selection'
 import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
+import { conversationFinalOutput, readConversationGraph } from './conversation-recovery'
+import { ProjectIdSchema, parseChatRoute } from './projects'
+import {
+  PROJECT_CHECK_EVENT,
+  PROJECT_ARM_EVENT,
+  PROJECT_EVENT,
+  ProjectReceiptSchema,
+} from './browser-projects'
+import {
+  ImageDownloadUrlSchema,
+  ImageFileIdSchema,
+  ImageMimeSchema,
+  MAX_IMAGE_BYTES,
+  type ImageData,
+} from './generated-image-protocol'
 import {
   STREAM_ARM_EVENT,
   STREAM_EVENT,
   StreamArmSchema,
   observeConversationResponse,
+  type StreamIdentity,
   type StreamEvent,
 } from './conversation-stream'
 import { DOT_EVENT, normalizeDots } from './dots'
 import {
+  CONVERSATION_DELETED_EVENT,
+  ConversationDeletedSchema,
   TURN_EVENT,
   SubmittedTurnSchema,
   CAPABILITY_EVENT,
@@ -18,8 +37,12 @@ import {
   normalizePlanDetails,
 } from './capabilities'
 // Runs in the page world at document_start. Observes exact metadata routes and sanitized outgoing message identifiers.
-// Authentication remains inside ChatGPT's own fetch call; it is never copied.
-type PageWindow = Pick<Window, 'location' | 'dispatchEvent' | 'addEventListener'> & {
+// Authentication and same-origin native download URLs stay private. Only validated signed CDN URLs
+// or bounded image bytes are exported through the existing sanitized image events.
+type PageWindow = Pick<
+  Window,
+  'location' | 'document' | 'setTimeout' | 'clearTimeout' | 'dispatchEvent' | 'addEventListener'
+> & {
   fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
   CustomEvent: typeof CustomEvent
   URL: typeof URL
@@ -29,20 +52,155 @@ type PageWindow = Pick<Window, 'location' | 'dispatchEvent' | 'addEventListener'
 // Match native editor line endings/outer ASCII whitespace without merging distinct internal text.
 const submittedText = (text: string) =>
   text.replace(/\r\n?/g, '\n').replace(/^[ \t\n]+|[ \t\n]+$/g, '')
+
 export function installPageObserver(page: PageWindow) {
-  // One armed send at a time; only the request whose exact outgoing user text matches is observed.
-  let armed: ReturnType<typeof StreamArmSchema.parse> | null = null
+  installNativeModelSelection(page)
+  type ImageScope = {
+    identity: StreamIdentity
+    refs: Set<string>
+    downloads: Map<string, { url: string; conversationId: string | null }>
+    nativeImages: Map<string, ImageData>
+    nativeDownloads: Map<string, { url: string; headers: Headers; conversationId: string | null }>
+    fetching: Map<string, Promise<void>>
+    capturing: Map<string, Promise<void>>
+    metadataPending: Map<string, Promise<void>>
+    sent: Set<string>
+    expires: number
+    recoveryDeadline?: number
+    holdImages: boolean
+    failed: boolean
+  }
+  let imageScope: ImageScope | null = null
+  const publishStream = (event: StreamEvent) =>
+    page.dispatchEvent(new page.CustomEvent(STREAM_EVENT, { detail: JSON.stringify(event) }))
+  const scopeActive = (scope: ImageScope, cid = scope.identity.conversationId) =>
+    scope === imageScope &&
+    !scope.failed &&
+    page.location.origin === 'https://chatgpt.com' &&
+    Date.now() < Math.min(scope.expires, scope.recoveryDeadline ?? Number.MAX_SAFE_INTEGER) &&
+    scope.identity.conversationId === cid
+  // Passive observation owns a clone, never the native request or its consumer.
+  const observePassive = (scope: ImageScope, work: (signal: AbortSignal) => Promise<void>) => {
+    const controller = new AbortController(),
+      limit = Date.now() + 15000
+    let timer: ReturnType<typeof page.setTimeout> | undefined
+    const aborted = new Promise<void>((resolve) =>
+      controller.signal.addEventListener('abort', () => resolve(), { once: true }),
+    )
+    const check = () => {
+      if (controller.signal.aborted) return
+      if (!scopeActive(scope) || Date.now() >= limit) {
+        controller.abort()
+        return
+      }
+      timer = page.setTimeout(
+        check,
+        Math.min(
+          100,
+          Math.max(1, limit - Date.now()),
+          Math.max(
+            1,
+            Math.min(scope.expires, scope.recoveryDeadline ?? scope.expires) - Date.now(),
+          ),
+        ),
+      )
+    }
+    check()
+    return Promise.race([work(controller.signal).catch(() => {}), aborted]).finally(() => {
+      if (timer !== undefined) page.clearTimeout(timer)
+      controller.abort()
+    })
+  }
+  const publishImages = (scope: ImageScope) => {
+    if (!scopeActive(scope) || scope.holdImages || !scope.identity.conversationId) return
+    for (const fileId of scope.refs) {
+      if (!scopeActive(scope) || scope.holdImages) return
+      fetchNativeImage(scope, fileId)
+      const native = scope.nativeImages.get(fileId)
+      if (native && !scope.sent.has(fileId)) {
+        scope.sent.add(fileId)
+        publishStream({ ...scope.identity, kind: 'image', fileId, imageData: native })
+        continue
+      }
+      const download = scope.downloads.get(fileId)
+      if (
+        !download ||
+        scope.sent.has(fileId) ||
+        (download.conversationId && download.conversationId !== scope.identity.conversationId)
+      )
+        continue
+      scope.sent.add(fileId)
+      publishStream({ ...scope.identity, kind: 'image', fileId, downloadUrl: download.url })
+    }
+  }
+  const memberships = new Map<string, string>()
+  let projectCheck: { conversationId: string; projectId: string; expires: number } | null = null
+  const rememberProject = (cid: string, pid: string) => {
+    memberships.delete(cid)
+    memberships.set(cid, pid)
+    if (memberships.size > 32) memberships.delete(memberships.keys().next().value!)
+    if (
+      projectCheck &&
+      Date.now() < projectCheck.expires &&
+      projectCheck.conversationId === cid &&
+      projectCheck.projectId === pid
+    ) {
+      projectCheck = null
+      page.dispatchEvent(
+        new page.CustomEvent(PROJECT_EVENT, {
+          detail: JSON.stringify({ conversationId: cid, projectId: pid }),
+        }),
+      )
+    }
+  }
+  page.addEventListener(PROJECT_CHECK_EVENT, (event) => {
+    try {
+      const value = ProjectReceiptSchema.safeParse(
+        JSON.parse((event as CustomEvent<string>).detail),
+      )
+      if (value.success) projectCheck = { ...value.data, expires: Date.now() + 30000 }
+      if (value.success && memberships.get(value.data.conversationId) === value.data.projectId) {
+        projectCheck = null
+        page.dispatchEvent(
+          new page.CustomEvent(PROJECT_EVENT, { detail: JSON.stringify(value.data) }),
+        )
+      }
+    } catch {}
+  })
+  let projectArm: { conversationId: string; projectId: string; expires: number } | null = null
+  page.addEventListener(PROJECT_ARM_EVENT, (event) => {
+    try {
+      const parsed = ProjectReceiptSchema.safeParse(
+        JSON.parse((event as CustomEvent<string>).detail),
+      )
+      if (parsed.success) projectArm = { ...parsed.data, expires: Date.now() + 30000 }
+    } catch {}
+  })
+  page.addEventListener('localgpt:project-disarm', () => {
+    projectArm = null
+    projectCheck = null
+  })
+  let armed: {
+    requestId: string
+    text: string
+    projectId?: string
+    newChat?: boolean
+    timeoutMs?: number
+    backgroundJob?: boolean
+  } | null = null
   page.addEventListener(STREAM_ARM_EVENT, (event) => {
     try {
       const parsed = StreamArmSchema.safeParse(JSON.parse((event as CustomEvent<string>).detail))
-      if (parsed.success) armed = parsed.data
+      if (parsed.success) {
+        armed = parsed.data
+        imageScope = null
+      }
     } catch {}
   })
   page.addEventListener('localgpt:stream-disarm', (event) => {
     if ((event as CustomEvent<string>).detail === armed?.requestId) armed = null
+    if ((event as CustomEvent<string>).detail === imageScope?.identity.requestId) imageScope = null
   })
-  const publishStream = (event: StreamEvent) =>
-    page.dispatchEvent(new page.CustomEvent(STREAM_EVENT, { detail: JSON.stringify(event) }))
   let snapshot = emptyCapabilities()
   let dots: ReturnType<typeof normalizeDots> = null
   const publishDots = () => {
@@ -61,6 +219,244 @@ export function installPageObserver(page: PageWindow) {
     publishDots()
   })
   const original = page.fetch
+  const captureNativeImage = (
+    scope: ImageScope,
+    fileId: string,
+    response: Response,
+    owned = false,
+  ): Promise<void> => {
+    const pending = scope.capturing.get(fileId)
+    if (pending || scope.nativeImages.has(fileId) || !scopeActive(scope)) {
+      return (async () => {
+        if (owned) await response.body?.cancel().catch(() => {})
+        await pending
+      })()
+    }
+    const cid = scope.identity.conversationId
+    const captureActive = () =>
+      scopeActive(scope) && (!cid || scope.identity.conversationId === cid)
+    const collect = async (signal?: AbortSignal) => {
+      if (signal?.aborted || !captureActive()) return
+      const source = owned ? response : response.clone()
+      const mimeType = ImageMimeSchema.safeParse(
+        response.headers.get('content-type')?.split(';')[0]?.trim(),
+      )
+      const reader = source.body?.getReader()
+      if (!reader) return
+      const cancel = () => {
+        void reader.cancel().catch(() => {})
+      }
+      signal?.addEventListener('abort', cancel, { once: true })
+      const chunks: Uint8Array[] = []
+      let size = 0
+      try {
+        if (
+          !response.ok ||
+          !mimeType.success ||
+          Number(response.headers.get('content-length')) > MAX_IMAGE_BYTES
+        )
+          return
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (signal?.aborted || !captureActive()) return
+          if (done) break
+          size += value.byteLength
+          if (size > MAX_IMAGE_BYTES) return
+          chunks.push(value)
+        }
+        if (!size || signal?.aborted || !captureActive()) return
+        const bytes = new Uint8Array(size)
+        let offset = 0
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset)
+          offset += chunk.length
+        }
+        let binary = ''
+        for (let i = 0; i < bytes.length; i += 32768)
+          binary += String.fromCharCode(...bytes.subarray(i, i + 32768))
+        scope.nativeImages.set(fileId, { mimeType: mimeType.data, data: btoa(binary) })
+        const unmatched = [...scope.nativeImages.keys()].filter((id) => !scope.refs.has(id))
+        for (const id of unmatched.slice(0, Math.max(0, unmatched.length - 8)))
+          scope.nativeImages.delete(id)
+        publishImages(scope)
+      } finally {
+        signal?.removeEventListener('abort', cancel)
+        const cancelling = reader.cancel().catch(() => {})
+        if (owned) await cancelling
+        reader.releaseLock()
+      }
+    }
+    const task = (owned ? collect() : observePassive(scope, collect)).finally(() => {
+      if (scope.capturing.get(fileId) === task) scope.capturing.delete(fileId)
+    })
+    scope.capturing.set(fileId, task)
+    return task
+  }
+  const fetchNativeImage = (scope: ImageScope, fileId: string) => {
+    const download = scope.nativeDownloads.get(fileId)
+    if (
+      !download ||
+      !scope.refs.has(fileId) ||
+      !scope.identity.conversationId ||
+      (download.conversationId && download.conversationId !== scope.identity.conversationId) ||
+      scope.sent.has(fileId) ||
+      scope.nativeImages.has(fileId) ||
+      scope.fetching.has(fileId) ||
+      scope.capturing.has(fileId) ||
+      scope.fetching.size >= 4 ||
+      !scopeActive(scope)
+    )
+      return
+    const cid = scope.identity.conversationId
+    const invalidateDownload = () => {
+      if (scope.nativeDownloads.get(fileId) === download) scope.nativeDownloads.delete(fileId)
+    }
+    const task = original
+      .call(page, download.url, {
+        method: 'GET',
+        headers: download.headers,
+        credentials: 'include',
+        redirect: 'error',
+        signal: AbortSignal.timeout(
+          Math.min(
+            15000,
+            Math.max(
+              1,
+              Math.min(scope.expires, scope.recoveryDeadline ?? scope.expires) - Date.now(),
+            ),
+          ),
+        ),
+      })
+      .then(async (response) => {
+        if (!scopeActive(scope, cid)) {
+          await response.body?.cancel().catch(() => {})
+          return
+        }
+        await captureNativeImage(scope, fileId, response, true)
+        if (!scope.nativeImages.has(fileId)) invalidateDownload()
+      })
+      .catch(() => {
+        invalidateDownload()
+      })
+      .finally(() => {
+        scope.fetching.delete(fileId)
+      })
+    scope.fetching.set(fileId, task)
+  }
+  const privateHeaders = (source: HeadersInit | undefined) => {
+    const native = new page.Headers(source),
+      headers = new page.Headers()
+    for (const name of ['authorization', 'chatgpt-account-id']) {
+      const value = native.get(name)
+      if (value) headers.set(name, value)
+    }
+    return headers
+  }
+  const captureImageDownload = async (
+    scope: ImageScope,
+    fileId: string,
+    cid: string | null,
+    response: Response,
+    headers: Headers,
+    passiveSignal?: AbortSignal,
+  ) => {
+    const value = await readConversationGraph(response, 100000, {
+      awaitCancellation: !passiveSignal,
+      signal: passiveSignal,
+    })
+    if (
+      passiveSignal?.aborted ||
+      !scopeActive(scope) ||
+      (cid && scope.identity.conversationId && cid !== scope.identity.conversationId) ||
+      !value ||
+      typeof value !== 'object' ||
+      !('download_url' in value) ||
+      typeof value.download_url !== 'string'
+    )
+      return
+    const signed = ImageDownloadUrlSchema.safeParse(value.download_url)
+    if (signed.success) scope.downloads.set(fileId, { url: signed.data, conversationId: cid })
+    else {
+      let native: URL
+      try {
+        native = new URL(value.download_url, 'https://chatgpt.com')
+      } catch {
+        return
+      }
+      if (
+        native.origin !== 'https://chatgpt.com' ||
+        native.username ||
+        native.password ||
+        native.pathname !== '/backend-api/estuary/content' ||
+        native.searchParams.getAll('id').length !== 1 ||
+        native.searchParams.get('id') !== fileId
+      )
+        return
+      scope.nativeDownloads.set(fileId, { url: native.href, headers, conversationId: cid })
+    }
+    for (const cache of [scope.downloads, scope.nativeDownloads]) {
+      const unmatched = [...cache.keys()].filter((id) => !scope.refs.has(id))
+      for (const id of unmatched.slice(0, Math.max(0, unmatched.length - 8))) cache.delete(id)
+    }
+    publishImages(scope)
+  }
+  const resolveRecoveredImage = async (
+    scope: ImageScope,
+    fileId: string,
+    cid: string,
+    headers: Headers,
+  ) => {
+    if (!scopeActive(scope, cid)) return false
+    await scope.capturing.get(fileId)
+    if (!scopeActive(scope, cid)) return false
+    await scope.metadataPending.get(fileId)
+    if (!scopeActive(scope, cid)) return false
+    for (const cache of [scope.downloads, scope.nativeDownloads]) {
+      const entry = cache.get(fileId)
+      if (entry?.conversationId && entry.conversationId !== cid) cache.delete(fileId)
+    }
+    if (
+      !scope.sent.has(fileId) &&
+      !scope.nativeImages.has(fileId) &&
+      !scope.downloads.has(fileId) &&
+      !scope.nativeDownloads.has(fileId)
+    ) {
+      const task = original
+        .call(
+          page,
+          `https://chatgpt.com/backend-api/files/download/${fileId}?conversation_id=${cid}`,
+          {
+            method: 'GET',
+            headers,
+            credentials: 'include',
+            redirect: 'error',
+            signal: AbortSignal.timeout(
+              Math.min(15000, Math.max(1, (scope.recoveryDeadline ?? scope.expires) - Date.now())),
+            ),
+          },
+        )
+        .then(async (response) => {
+          if (!scopeActive(scope, cid)) {
+            await response.body?.cancel().catch(() => {})
+            return
+          }
+          await captureImageDownload(scope, fileId, cid, response, headers)
+        })
+        .catch(() => {})
+        .finally(() => {
+          scope.metadataPending.delete(fileId)
+        })
+      scope.metadataPending.set(fileId, task)
+      await task
+      if (!scopeActive(scope, cid)) return false
+    }
+    publishImages(scope)
+    await scope.fetching.get(fileId)
+    if (!scopeActive(scope, cid)) return false
+    await scope.capturing.get(fileId)
+    if (!scopeActive(scope, cid)) return false
+    return scope.sent.has(fileId)
+  }
   page.fetch = function (input, init) {
     let url: URL | undefined
     let observedRequest: Request | undefined
@@ -71,7 +467,8 @@ export function installPageObserver(page: PageWindow) {
       )
       if (
         url.origin === 'https://chatgpt.com' &&
-        url.pathname === '/backend-api/f/conversation' &&
+        (url.pathname === '/backend-api/f/conversation' ||
+          /^\/backend-api\/conversation\/[a-f0-9-]{36}$/.test(url.pathname)) &&
         input instanceof page.Request &&
         typeof init?.body !== 'string'
       )
@@ -85,6 +482,7 @@ export function installPageObserver(page: PageWindow) {
           if (body.length > 5_000_000) return
           const value = JSON.parse(body) as {
             conversation_id?: unknown
+            gizmo_id?: unknown
             messages?: {
               id?: unknown
               author?: { role?: unknown }
@@ -107,24 +505,207 @@ export function installPageObserver(page: PageWindow) {
                 message.content.parts.filter((part) => typeof part === 'string').join(''),
               ) === submittedText(armed.text)
             ) {
-              const { requestId, timeoutMs, backgroundJob } = armed
+              const requestId = armed.requestId
+              const expectedProject = armed.projectId
+              const expectedNewChat = armed.newChat
+              const timeoutMs = armed.timeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS
+              const backgroundJob = armed.backgroundJob === true
+              const observedProject = ProjectIdSchema.safeParse(value.gizmo_id)
               armed = null
-              const identity = { requestId, ...parsed.data }
-              publishStream({ ...identity, kind: 'started' })
+              if (expectedNewChat && value.conversation_id != null) {
+                publishStream({
+                  requestId,
+                  ...parsed.data,
+                  kind: 'error',
+                  code: 'conversation_changed',
+                })
+                return
+              }
+              if (
+                expectedProject &&
+                (!observedProject.success || observedProject.data !== expectedProject)
+              ) {
+                publishStream({
+                  requestId,
+                  ...parsed.data,
+                  kind: 'error',
+                  code: 'project_mismatch',
+                })
+                return
+              }
+              const identity: StreamIdentity = {
+                requestId,
+                ...parsed.data,
+                ...(observedProject.success ? { projectId: observedProject.data } : {}),
+              }
+              const scope: ImageScope = {
+                identity,
+                refs: new Set(),
+                downloads: new Map(),
+                nativeImages: new Map(),
+                nativeDownloads: new Map(),
+                fetching: new Map(),
+                capturing: new Map(),
+                metadataPending: new Map(),
+                sent: new Set(),
+                expires: backgroundJob ? Number.MAX_SAFE_INTEGER : Date.now() + timeoutMs + 5000,
+                holdImages: false,
+                failed: false,
+              }
+              imageScope = scope
+              let observedConversationId: string | null = null
+              let observedText = ''
+              const observedNodes = new Set<string>()
+              let recovering = false
+              const nativeHeaders = new page.Headers(
+                init?.headers ?? (input instanceof page.Request ? input.headers : undefined),
+              )
+              const recoveryHeaders = privateHeaders(nativeHeaders)
+              const recover = async () => {
+                const deadline = backgroundJob ? scope.expires : scope.expires - 5000
+                scope.recoveryDeadline = deadline
+                while (Date.now() < deadline) {
+                  if (
+                    scope !== imageScope ||
+                    Date.now() > scope.expires ||
+                    page.location.origin !== 'https://chatgpt.com'
+                  )
+                    return
+                  const route = parseChatRoute(page.location.pathname)
+                  const cid =
+                    observedConversationId ??
+                    (!route?.provisionalId ? route?.conversationId : null) ??
+                    null
+                  if (cid && (!identity.conversationId || identity.conversationId === cid)) {
+                    try {
+                      const response = await original.call(
+                        page,
+                        `https://chatgpt.com/backend-api/conversation/${cid}`,
+                        {
+                          method: 'GET',
+                          headers: recoveryHeaders,
+                          credentials: 'include',
+                          redirect: 'error',
+                          signal: AbortSignal.timeout(
+                            Math.min(15000, Math.max(1, deadline - Date.now())),
+                          ),
+                        },
+                      )
+                      if (!scopeActive(scope)) {
+                        await response.body?.cancel().catch(() => {})
+                        return
+                      }
+                      const output = conversationFinalOutput(
+                        await readConversationGraph(response),
+                        cid,
+                        identity.messageId,
+                        { text: observedText, fileIds: scope.refs, messageIds: observedNodes },
+                      )
+                      if (!scopeActive(scope)) return
+                      if (output && 'error' in output) {
+                        publish({
+                          ...identity,
+                          conversationId: cid,
+                          kind: 'error',
+                          code: output.error,
+                        })
+                        return
+                      }
+                      if (output) {
+                        identity.conversationId = cid
+                        scope.holdImages = true
+                        for (const fileId of output.fileIds) {
+                          if (!scope.refs.has(fileId))
+                            publish({ ...identity, kind: 'image_ref', fileId })
+                        }
+                        scope.holdImages = false
+                        let resolved = true
+                        for (const fileId of output.fileIds) {
+                          if (!(await resolveRecoveredImage(scope, fileId, cid, recoveryHeaders))) {
+                            resolved = false
+                            break
+                          }
+                          if (!scopeActive(scope, cid)) return
+                        }
+                        if (!scopeActive(scope, cid)) return
+                        if (!resolved) {
+                          await new Promise<void>((resolve) =>
+                            page.setTimeout(
+                              resolve,
+                              Math.min(5000, Math.max(1, deadline - Date.now())),
+                            ),
+                          )
+                          continue
+                        }
+                        if (output.text.trim())
+                          publish({ ...identity, kind: 'answer', text: output.text })
+                        publish({ ...identity, conversationId: cid, kind: 'stop' })
+                        return
+                      }
+                    } catch {}
+                  }
+                  await new Promise<void>((resolve) =>
+                    page.setTimeout(resolve, Math.min(5000, Math.max(1, deadline - Date.now()))),
+                  )
+                }
+              }
+              const publish = (event: StreamEvent) => {
+                if (scope !== imageScope) return
+                if (event.kind === 'answer') observedText = event.text ?? observedText
+                if (
+                  event.kind === 'error' &&
+                  [
+                    'unsupported_response_stream',
+                    'unsupported_response_content',
+                    'response_incomplete',
+                    'response_stream_interrupted',
+                    'response_stream_timeout',
+                    'response_stream_too_large',
+                    'unsupported_image_asset',
+                    'too_many_generated_images',
+                  ].includes(event.code ?? '')
+                ) {
+                  publishStream({
+                    ...event,
+                    kind: 'progress',
+                    code: undefined,
+                    phase: 'unresponsive',
+                  })
+                  if (!recovering) {
+                    recovering = true
+                    void recover()
+                  }
+                  return
+                }
+                if (event.conversationId) scope.identity.conversationId = event.conversationId
+                if (event.kind === 'error') scope.failed = true
+                if (event.kind === 'image_ref' && event.fileId) scope.refs.add(event.fileId)
+                if (event.kind === 'stop' && event.conversationId && identity.projectId)
+                  rememberProject(event.conversationId, identity.projectId)
+                publishStream(event)
+                publishImages(scope)
+              }
+              publish({ ...identity, kind: 'started' })
               void result
                 .then((response) =>
-                  observeConversationResponse(response.clone(), identity, publishStream, {
-                    timeoutMs: timeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS,
-                    backgroundJob: backgroundJob === true,
+                  observeConversationResponse(response.clone(), identity, publish, {
+                    timeoutMs,
+                    backgroundJob,
+                    onConversationId: (cid) => {
+                      observedConversationId = cid
+                    },
+                    onOutputNode: (id) => {
+                      observedNodes.add(id)
+                    },
                   }),
                 )
-                .catch(() =>
-                  publishStream({
+                .catch(() => {
+                  publish({
                     ...identity,
                     kind: 'error',
                     code: 'response_stream_interrupted',
-                  }),
-                )
+                  })
+                })
             }
           }
         } catch {}
@@ -135,6 +716,144 @@ export function installPageObserver(page: PageWindow) {
           .text()
           .then(observeTurn)
           .catch(() => {})
+    }
+    const fileDownload =
+      url.origin === 'https://chatgpt.com'
+        ? /^\/backend-api\/files\/download\/(file[_-][a-zA-Z0-9_-]+)$/.exec(url.pathname)
+        : null
+    const scope = imageScope
+    if (fileDownload && scope && Date.now() < scope.expires) {
+      const fileId = ImageFileIdSchema.safeParse(fileDownload[1])
+      const conversationId = url.searchParams.get('conversation_id')
+      if (fileId.success && !scope.metadataPending.has(fileId.data)) {
+        const headers = privateHeaders(
+          init?.headers ?? (input instanceof page.Request ? input.headers : undefined),
+        )
+        const task = observePassive(scope, async (signal) => {
+          const response = await result
+          if (signal.aborted || !scopeActive(scope)) return
+          await captureImageDownload(
+            scope,
+            fileId.data,
+            conversationId,
+            response.clone(),
+            headers,
+            signal,
+          )
+        }).finally(() => {
+          if (scope.metadataPending.get(fileId.data) === task)
+            scope.metadataPending.delete(fileId.data)
+        })
+        scope.metadataPending.set(fileId.data, task)
+      }
+    }
+    if (
+      scope &&
+      url.origin === 'https://chatgpt.com' &&
+      url.pathname === '/backend-api/estuary/content'
+    ) {
+      const fileId = ImageFileIdSchema.safeParse(url.searchParams.get('id'))
+      if (
+        fileId.success &&
+        url.searchParams.getAll('id').length === 1 &&
+        Date.now() < scope.expires
+      )
+        void result
+          .then((response) => captureNativeImage(scope, fileId.data, response))
+          .catch(() => {})
+    }
+
+    const deletionId =
+      url.origin === 'https://chatgpt.com'
+        ? /^\/backend-api\/conversation\/([a-f0-9-]{36})$/.exec(url.pathname)?.[1]
+        : undefined
+    if (deletionId) {
+      const method = (
+        init?.method ?? (input instanceof page.Request ? input.method : 'GET')
+      ).toUpperCase()
+      const body =
+        typeof init?.body === 'string'
+          ? Promise.resolve(init.body)
+          : observedRequest
+            ? observedRequest.text()
+            : Promise.resolve('')
+      if (method === 'GET')
+        void result
+          .then(async (response) => {
+            if (!response.ok || !response.headers.get('content-type')?.includes('json')) return
+            const reader = response.clone().body?.getReader()
+            if (!reader) return
+            let text = '',
+              size = 0
+            const decoder = new TextDecoder()
+            try {
+              for (;;) {
+                const chunk = await reader.read()
+                if (chunk.done) break
+                size += chunk.value.byteLength
+                if (size > 8_000_000) return
+                text += decoder.decode(chunk.value, { stream: true })
+              }
+              text += decoder.decode()
+              const value = JSON.parse(text) as { gizmo_id?: unknown }
+              const receipt = ProjectReceiptSchema.safeParse({
+                conversationId: deletionId,
+                projectId: value.gizmo_id,
+              })
+              if (receipt.success)
+                rememberProject(receipt.data.conversationId, receipt.data.projectId)
+              else memberships.delete(deletionId)
+            } finally {
+              void reader.cancel().catch(() => {})
+              reader.releaseLock()
+            }
+          })
+          .catch(() => {})
+      void Promise.all([result, body])
+        .then(([response, text]) => {
+          if (!response.ok) return
+          if (method !== 'DELETE') {
+            if (method !== 'PATCH' || text.length > 10000) return
+            const value = JSON.parse(text) as {
+              is_visible?: unknown
+              is_archived?: unknown
+              gizmo_id?: unknown
+            }
+            const parsedProject = ProjectIdSchema.safeParse(value.gizmo_id)
+            if (parsedProject.success) rememberProject(deletionId, parsedProject.data)
+            else if ('gizmo_id' in value) memberships.delete(deletionId)
+            const moving = projectArm
+            if (
+              moving &&
+              Date.now() < moving.expires &&
+              moving.conversationId === deletionId &&
+              value.gizmo_id === moving.projectId
+            ) {
+              page.dispatchEvent(
+                new page.CustomEvent(PROJECT_EVENT, {
+                  detail: JSON.stringify({
+                    conversationId: deletionId,
+                    projectId: moving.projectId,
+                  }),
+                }),
+              )
+              projectArm = null
+              return
+            }
+            if (value.is_visible !== false || value.is_archived === true) return
+          }
+          memberships.delete(deletionId)
+          const parsed = ConversationDeletedSchema.safeParse({ conversationId: deletionId })
+          if (parsed.success)
+            page.dispatchEvent(
+              new page.CustomEvent(CONVERSATION_DELETED_EVENT, {
+                detail: JSON.stringify(parsed.data),
+              }),
+            )
+        })
+        .catch(() => {
+          /* Observation must never break ChatGPT. */
+        })
     }
     const kind =
       url.origin === 'https://chatgpt.com' && url.pathname === '/backend-api/tbo'

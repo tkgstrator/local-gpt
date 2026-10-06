@@ -1,3 +1,4 @@
+import type { GeneratedImage } from './generated-image-protocol'
 import { FilesSchema } from './attachment-protocol'
 import { z } from 'zod'
 import type { ChatRequest } from './protocol'
@@ -71,6 +72,7 @@ export function createResponsesWriter(
     text: string,
     status: string,
     error: { code: string; message: string } | null = null,
+    images: GeneratedImage[] = [],
   ) => ({
     id,
     object: 'response',
@@ -88,6 +90,7 @@ export function createResponsesWriter(
     instructions: body.instructions ?? null,
     usage: null,
     store: false,
+    images,
     tools: [],
     tool_choice: 'none',
     parallel_tool_calls: false,
@@ -113,11 +116,12 @@ export function createResponsesWriter(
     delta(delta: string) {
       emit('response.output_text.delta', { ...indexes, delta, logprobs: [] })
     },
-    complete(text: string) {
+    complete(text: string, images: GeneratedImage[] = []) {
       emit('response.output_text.done', { ...indexes, text, logprobs: [] })
       emit('response.content_part.done', { ...indexes, part: part(text) })
       emit('response.output_item.done', { output_index: 0, item: item(text, 'completed') })
-      emit('response.completed', { response: response(text, 'completed') })
+      for (const image of images) emit('response.image.saved', { image })
+      emit('response.completed', { response: response(text, 'completed', null, images) })
     },
     fail(text: string, code: string, message: string) {
       emit('response.failed', { response: response(text, 'failed', { code, message }) })
