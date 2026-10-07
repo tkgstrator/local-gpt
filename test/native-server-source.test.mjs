@@ -385,12 +385,12 @@ test('native readiness can recover after boot contracts are initially unavailabl
 })
 
 test('lost readiness receipts expire without releasing generation ownership', async t => {
- const f=await fixture(t,{nativeReadinessTimeoutMs:25,pollingLeaseMs:5000});await f.ready()
+ const f=await fixture(t,{nativeReadinessTimeoutMs:500,pollingLeaseMs:5000});await f.ready()
  const sid=await f.session(),A=await startNative(f,sid)
  await f.bridge('event',A.event({type:'native_intent'}))
  // A fresh connection owns a probe whose response is lost.
  const first=(await f.bridge('poll',{nativeProtocol:1},'new-owner')).request
- await new Promise(r=>setTimeout(r,40))
+ await new Promise(r=>setTimeout(r,550))
  const retry=(await f.bridge('poll',{nativeProtocol:1},'new-owner')).request
  assert.equal(retry?.type,'native_readiness');assert.notEqual(retry.requestId,first.requestId)
  assert.equal((await f.bridge('event',{type:'native_ready',requestId:first.requestId,protocol:1,ready:true},'new-owner')).accepted,false)
