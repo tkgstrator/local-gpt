@@ -763,14 +763,16 @@ export function installPageObserver(page: PageWindow) {
           .catch(() => {})
     }
 
-    const deletionId =
+    const deletionMatch =
       url.origin === 'https://chatgpt.com'
-        ? /^\/backend-api\/conversation\/([a-f0-9-]{36})$/.exec(url.pathname)?.[1]
+        ? /^\/backend-api\/conversation\/(id\/)?([a-f0-9-]{36})$/.exec(url.pathname)
         : undefined
+    const deletionId = deletionMatch?.[2]
     if (deletionId) {
       const method = (
         init?.method ?? (input instanceof page.Request ? input.method : 'GET')
       ).toUpperCase()
+      if (deletionMatch?.[1] && method !== 'DELETE') return result
       const body =
         typeof init?.body === 'string'
           ? Promise.resolve(init.body)

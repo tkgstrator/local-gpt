@@ -6,7 +6,7 @@ const target='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef3';
 test('conversation cleanup confirms only the targeted chat and waits for removal', async t => {
  const f=await fixture(t,`https://chatgpt.com/c/${target}`);
  f.page.document.body.insertAdjacentHTML('beforeend',`<main><button aria-label="More">More</button></main><a href="/c/${target}">Test chat</a>`);
- f.page.document.querySelector('[aria-label="More"]').addEventListener('click',()=>{
+ f.page.document.querySelector('[aria-label="More"]').addEventListener('pointerdown',()=>{
    const menu=f.page.document.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';f.page.document.body.append(menu);
    menu.querySelector('button').addEventListener('click',()=>{
      menu.remove();f.page.document.querySelector('[role="textbox"]').setAttribute('aria-hidden','true');const dialog=f.page.document.createElement('div');dialog.setAttribute('role','dialog');dialog.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';f.page.document.body.append(dialog);
@@ -21,7 +21,7 @@ test('conversation cleanup confirms only the targeted chat and waits for removal
 test('conversation cleanup refuses a changed chat before the final delete click',async t=>{
  const f=await fixture(t,`https://chatgpt.com/c/${target}`);let confirmed=false;
  f.page.document.body.insertAdjacentHTML('beforeend','<main><button aria-label="More">More</button></main>');
- f.page.document.querySelector('[aria-label="More"]').addEventListener('click',()=>{
+ f.page.document.querySelector('[aria-label="More"]').addEventListener('pointerdown',()=>{
    const menu=f.page.document.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';f.page.document.body.append(menu);
    menu.querySelector('button').addEventListener('click',()=>{
      menu.remove();f.page.history.pushState({},'','/c/6ac07bb1-b2b4-43e8-8304-5424a5cf2ef4');
@@ -96,12 +96,12 @@ test('new session follows its submitted message ID when React replaces the user 
 });
 
 const neighborId='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef4';
-async function sidebarDeleteFixture(t,{receipt=true}={}){
+async function sidebarDeleteFixture(t,{receipt=true,deep=false,trigger='pointerdown'}={}){
  const f=await fixture(t,`https://chatgpt.com/c/${target}`);const clicks={target:0,neighbor:0,confirm:0};
- f.page.document.body.insertAdjacentHTML('beforeend',`<nav id="sidebar"><a id="skip" href="/c/${target}#main">Skip to content</a><div id="neighbor-row"><a href="/c/${neighborId}">Neighbor</a><button id="neighbor-action" aria-label="Chat actions"></button></div><div id="target-row"><a href="/c/${target}">Ours</a><button id="target-action" aria-label="Chat actions"></button></div></nav>`);
- const doc=f.page.document;
+ f.page.document.body.insertAdjacentHTML('beforeend',`<nav id="sidebar"><a id="skip" href="/c/${target}#main">Skip to content</a><div id="neighbor-row"><a href="/c/${neighborId}">Neighbor</a><button id="neighbor-action" aria-label="Chat actions"></button></div>${deep?`<div id="target-row"><div role="group"><div><div><div><a href="/c/${target}">Ours</a></div></div></div><button id="target-action" aria-label="Chat actions"></button></div></div>`:`<div id="target-row"><a href="/c/${target}">Ours</a><button id="target-action" aria-label="Chat actions"></button></div>`}</nav>${deep?`<div id="titlebar" data-testid="app-shell-header-context-menu-surface"><button id="header-more" aria-label="More">More</button></div>`:''}`);
+ const doc=f.page.document;const headerMore={count:0};doc.getElementById('header-more')?.addEventListener('click',()=>headerMore.count++);
  doc.getElementById('neighbor-action').addEventListener('click',()=>clicks.neighbor++);
- doc.getElementById('target-action').addEventListener('click',()=>{
+ doc.getElementById('target-action').addEventListener(trigger,()=>{
   clicks.target++;const menu=doc.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';doc.body.append(menu);
   menu.querySelector('button').addEventListener('click',()=>{menu.remove();const dialog=doc.createElement('div');dialog.setAttribute('role','dialog');dialog.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';doc.body.append(dialog);
    doc.getElementById('sidebar').setAttribute('aria-hidden','true');
@@ -109,7 +109,7 @@ async function sidebarDeleteFixture(t,{receipt=true}={}){
   });
  });
  const terminal=async id=>{for(let i=0;i<150;i++){const e=f.events.find(e=>e.requestId===id&&['error','conversation_deleted'].includes(e.type));if(e)return e;await new Promise(r=>setTimeout(r,20));}return undefined;};
- return {f,clicks,doc,terminal};
+ return {f,clicks,doc,terminal,headerMore};
 }
 test('built cleanup ignores a skip link and neighbor row, requires the native receipt and removes only the exact target',async t=>{
  const {f,clicks,doc,terminal}=await sidebarDeleteFixture(t);
@@ -137,7 +137,7 @@ async function rowReuseFixture(t,phase){
  const f=await fixture(t,`https://chatgpt.com/c/${target}`);const clicks={menu:0,confirm:0};const doc=f.page.document;
  doc.body.insertAdjacentHTML('beforeend',`<nav id="sidebar"><div id="target-row"><a id="target-link" href="/c/${target}">Ours</a><button id="target-action" aria-label="Chat actions"></button></div></nav>`);
  const reuse=()=>doc.getElementById('target-link').setAttribute('href',`/c/${neighborId}`);
- doc.getElementById('target-action').addEventListener('click',()=>{
+ doc.getElementById('target-action').addEventListener('pointerdown',()=>{
   const menu=doc.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';doc.body.append(menu);
   if(phase==='action')reuse();
   menu.querySelector('button').addEventListener('click',()=>{clicks.menu++;menu.remove();
@@ -165,7 +165,7 @@ test('built cleanup refuses the final confirm when the target row is reused afte
 test('cleanup never treats navigation after a failed deletion as success',async t=>{
  const f=await fixture(t,`https://chatgpt.com/c/${target}`);
  f.page.document.body.insertAdjacentHTML('beforeend','<main><button aria-label="More">More</button></main>');
- f.page.document.querySelector('[aria-label="More"]').onclick=()=>{
+ f.page.document.querySelector('[aria-label="More"]').onpointerdown=()=>{
   const menu=f.page.document.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';f.page.document.body.append(menu);
   menu.querySelector('button').onclick=()=>{menu.remove();const d=f.page.document.createElement('div');d.setAttribute('role','dialog');d.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';f.page.document.body.append(d);d.querySelector('button').onclick=()=>{d.remove();f.page.history.pushState({},'','/');};};
  };
@@ -175,7 +175,7 @@ test('cleanup never treats navigation after a failed deletion as success',async 
 test('cleanup preserves drafts entered while opening the deletion dialog',async t=>{
  const f=await fixture(t,`https://chatgpt.com/c/${target}`);let confirmed=false;
  f.page.document.body.insertAdjacentHTML('beforeend','<main><button aria-label="More">More</button></main>');
- f.page.document.querySelector('[aria-label="More"]').onclick=()=>{
+ f.page.document.querySelector('[aria-label="More"]').onpointerdown=()=>{
   const menu=f.page.document.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';f.page.document.body.append(menu);
   menu.querySelector('button').onclick=()=>{menu.remove();f.page.document.querySelector('[role="textbox"]').textContent='New draft';const d=f.page.document.createElement('div');d.setAttribute('role','dialog');d.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';f.page.document.body.append(d);d.querySelector('button').onclick=()=>confirmed=true;};
  };
@@ -391,4 +391,167 @@ test('native answer remains correlated when ChatGPT recycles an existing assista
  const recycled=f.page.document.querySelector('[data-chatgpt-selection-message-id]');f.page.document.querySelector('button').addEventListener('click',()=>{recycled.setAttribute('data-chatgpt-selection-message-id','new-answer');recycled.querySelector('[data-markdown-text-style]').textContent='Fresh review result';});
  f.queue({type:'request',requestId:'recycled',text:'Review this diff',newChat:false});let stop;for(let i=0;i<200;i++){stop=f.events.find(e=>e.requestId==='recycled'&&e.type==='stop');if(stop)break;await new Promise(r=>setTimeout(r,20));}
  assert.equal(f.events.find(e=>e.requestId==='recycled'&&e.type==='answer')?.text,'Fresh review result');assert.equal(stop?.conversationId,target);
+});
+
+async function headerDeleteFixture(t,{receipt=true,detach=false,header='<button id="header-more" aria-label="More">More</button>',routeAfterMore=false,outside="",trigger='pointerdown'}={}){
+ const f=await fixture(t,`https://chatgpt.com/c/${target}`);const clicks={more:0,menu:0,confirm:0};const doc=f.page.document;
+ doc.body.insertAdjacentHTML('beforeend',`<div id="titlebar" data-testid="app-shell-header-context-menu-surface">${header}</div><nav id="sidebar"><a href="/c/${neighborId}">Neighbor</a><button id="neighbor-action" aria-label="Chat actions"></button></nav>${outside}`);
+ doc.getElementById('neighbor-action').addEventListener('click',()=>clicks.more+=100);
+ doc.querySelectorAll('#titlebar button,#outside-more').forEach(b=>b.addEventListener(trigger,()=>{
+  clicks.more++;if(routeAfterMore)f.page.history.pushState({},'',`/c/${neighborId}`);const menu=doc.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';doc.body.append(menu);
+  menu.querySelector('button').addEventListener('click',()=>{clicks.menu++;menu.remove();if(detach)doc.getElementById('titlebar').remove();const dialog=doc.createElement('div');dialog.setAttribute('role','dialog');dialog.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';doc.body.append(dialog);
+   dialog.querySelector('button').addEventListener('click',()=>{clicks.confirm++;dialog.remove();f.page.history.pushState({},'','/');if(receipt)f.page.dispatchEvent(new f.page.CustomEvent('localgpt:conversation-deleted',{detail:JSON.stringify({conversationId:target})}));});
+  });
+ }));
+ const terminal=async id=>{for(let i=0;i<150;i++){const e=f.events.find(e=>e.requestId===id&&['error','conversation_deleted'].includes(e.type));if(e)return e;await new Promise(r=>setTimeout(r,20));}return undefined;};
+ return {f,clicks,doc,terminal};
+}
+test('built cleanup deletes through the app-shell titlebar More outside main with receipt, route change and no row',async t=>{
+ const {f,clicks,doc,terminal}=await headerDeleteFixture(t);
+ f.queue({type:'delete_conversation',requestId:'header-delete',conversationId:target});
+ const done=await terminal('header-delete');
+ assert.equal(done?.type,'conversation_deleted',JSON.stringify(done));assert.equal(done.conversationId,target);
+ assert.deepEqual(clicks,{more:1,menu:1,confirm:1});assert.equal(f.page.location.pathname,'/');assert.equal(doc.querySelector(`a[href="/c/${target}"]`),null);assert.ok(doc.querySelector(`a[href="/c/${neighborId}"]`));
+});
+test('built titlebar cleanup without the native receipt never reports success',async t=>{
+ const {f,clicks}=await headerDeleteFixture(t,{receipt:false});
+ f.queue({type:'delete_conversation',requestId:'header-no-receipt',conversationId:target});
+ await new Promise(r=>setTimeout(r,1300));
+ assert.equal(f.events.some(e=>e.type==='conversation_deleted'),false);assert.deepEqual(clicks,{more:1,menu:1,confirm:1});
+});
+test('built titlebar cleanup preserves a draft and never opens the menu',async t=>{
+ const {f,clicks,doc}=await headerDeleteFixture(t);doc.querySelector('[role="textbox"]').textContent='Keep my draft';
+ f.queue({type:'delete_conversation',requestId:'header-draft',conversationId:target});
+ assert.equal((await f.event('header-draft')).code,'composer_not_empty');assert.equal(doc.querySelector('[role="textbox"]').textContent,'Keep my draft');assert.deepEqual(clicks,{more:0,menu:0,confirm:0});
+});
+test('built titlebar cleanup refuses to confirm when the titlebar owner is detached mid-flow',async t=>{
+ const {f,clicks}=await headerDeleteFixture(t,{detach:true});
+ f.queue({type:'delete_conversation',requestId:'header-detached',conversationId:target});
+ assert.equal((await f.event('header-detached')).code,'conversation_changed');assert.deepEqual(clicks,{more:1,menu:1,confirm:0});assert.equal(f.page.location.pathname,`/c/${target}`);
+});
+for(const [name,header,extra] of [
+ ['two More buttons in the exact titlebar surface','<button aria-label="More">More</button><button aria-label="More">More</button>',''],
+ ['a More outside the allowed roots','','<div id="elsewhere"><button id="outside-more" aria-label="More">More</button></div>'],
+]) test(`built titlebar fallback refuses ${name} and never opens any menu`,async t=>{
+ const {f,clicks,doc}=await headerDeleteFixture(t,{header,outside:extra});
+ f.queue({type:'delete_conversation',requestId:'header-refuse',conversationId:target});
+ await new Promise(r=>setTimeout(r,1300));
+ assert.equal(f.events.some(e=>e.type==='conversation_deleted'),false);assert.deepEqual(clicks,{more:0,menu:0,confirm:0});assert.equal(doc.querySelector('[role="menu"],[role="dialog"]'),null);
+});
+test('built titlebar cleanup aborts when the route changes after More but before menu Delete',async t=>{
+ const {f,clicks}=await headerDeleteFixture(t,{routeAfterMore:true});
+ f.queue({type:'delete_conversation',requestId:'header-route',conversationId:target});
+ assert.equal((await f.event('header-route')).code,'conversation_changed');assert.deepEqual(clicks,{more:1,menu:0,confirm:0});assert.equal(f.events.some(e=>e.type==='conversation_deleted'),false);
+});
+test('built cleanup prefers a deep depth-4 owned sidebar row over a coexisting titlebar More',async t=>{
+ const {f,clicks,doc,terminal,headerMore}=await sidebarDeleteFixture(t,{deep:true});
+ f.queue({type:'delete_conversation',requestId:'deep-row',conversationId:target});
+ const done=await terminal('deep-row');
+ assert.equal(done?.type,'conversation_deleted',JSON.stringify(done));assert.equal(done.conversationId,target);
+ assert.deepEqual(clicks,{target:1,neighbor:0,confirm:1});assert.equal(headerMore.count,0);assert.equal(doc.getElementById('target-row'),null);
+});
+
+// Characterize pointer-triggered More menus with sidebar and legacy-titlebar fixtures.
+// A bare click cannot open these fixtures; current native titlebars without Delete must fail closed.
+// Production mutation caught: runDelete calling `more.click()` instead of a revalidated pointerdown/pointerup pair.
+async function pointerDeleteFixture(t,{where='row',receipt='ok',activate=true,noPointerEvent=false,prevent=false,preventActivation=false,mutate=null,confirmLabel='Delete'}={}){
+ const f=await fixture(t,`https://chatgpt.com/c/${target}`);const doc=f.page.document;const PE=f.page.PointerEvent;
+ const log=[];const counts={menuOpens:0,menuToggles:0,delete:0,confirm:0};
+ doc.body.insertAdjacentHTML('beforeend',`<div id="titlebar" data-testid="app-shell-header-context-menu-surface"><button id="header-more" aria-label="More">More</button></div><nav id="sidebar"><div id="neighbor-row"><a href="/c/${neighborId}">Neighbor</a><button id="neighbor-action" aria-label="Chat actions"></button></div>${where==='row'?`<div id="target-row"><a id="target-link" href="/c/${target}">Ours</a><button id="target-action" aria-label="Chat actions"></button></div>`:''}</nav><div id="elsewhere"></div>`);
+ const owner=where==='row'?'target-action':'header-more';const other=where==='row'?'header-more':'target-action';
+ const button=doc.getElementById(owner);
+ button.setAttribute('aria-haspopup','menu');button.setAttribute('aria-controls',`${owner}-menu`);
+ for(const id of ['neighbor-action','header-more','target-action'])for(const type of ['pointerdown','pointerup','click'])doc.getElementById(id)?.addEventListener(type,()=>log.push(`${id}:${type}`));
+ const validPointerdown=e=>e instanceof PE&&e.type==='pointerdown'&&e.bubbles&&e.cancelable&&e.button===0&&e.isPrimary&&e.pointerType==='mouse'&&!e.ctrlKey;
+ const confirmDialog=()=>{const dialog=doc.createElement('div');dialog.setAttribute('role','dialog');dialog.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';dialog.querySelector('button').textContent=confirmLabel;doc.body.append(dialog);
+  dialog.querySelector('button').addEventListener('click',()=>{counts.confirm++;dialog.remove();doc.getElementById('target-row')?.remove();f.page.history.pushState({},'','/');
+   const id={ok:target,wrong:neighborId}[receipt];if(id)f.page.dispatchEvent(new f.page.CustomEvent('localgpt:conversation-deleted',{detail:JSON.stringify({conversationId:id})}));});};
+ const receiptNow=id=>f.page.dispatchEvent(new f.page.CustomEvent('localgpt:conversation-deleted',{detail:JSON.stringify({conversationId:id})}));
+ const mutations={
+  route:()=>f.page.history.pushState({},'',`/c/${neighborId}`),
+  detach:()=>button.remove(),
+  draft:()=>{doc.querySelector('[role="textbox"]').textContent='Typed after pointerdown';},
+  lifecycle:()=>f.page.dispatchEvent(new f.page.Event('pagehide')),
+  'reuse-link':()=>doc.getElementById('target-link').setAttribute('href',`/c/${neighborId}`),
+  'move-node':()=>(where==='row'?doc.getElementById('neighbor-row'):doc.getElementById('elsewhere')).append(button),
+ };
+ button.addEventListener('pointerdown',e=>{
+  if(preventActivation){e.preventDefault();return;}
+  if(!activate||!validPointerdown(e))return;
+  const existing=doc.querySelector('[role="menu"]');counts.menuToggles++;
+  if(existing){existing.remove();}
+  else{counts.menuOpens++;const menu=doc.createElement('div');menu.id=`${owner}-menu`;menu.setAttribute('role','menu');menu.setAttribute('aria-labelledby',owner);menu.innerHTML='<button role="menuitem">Delete</button>';doc.body.append(menu);
+   menu.querySelector('button').addEventListener('click',()=>{counts.delete++;menu.remove();confirmDialog();});}
+  if(receipt==='stale')receiptNow(target);
+  if(mutate)mutations[mutate]();
+  if(prevent)e.preventDefault();
+ });
+ button.addEventListener('pointerup',e=>{if(prevent)e.preventDefault();});
+ if(noPointerEvent)f.page.PointerEvent=undefined;
+ const terminal=async id=>{for(let i=0;i<150;i++){const e=f.events.find(e=>e.requestId===id&&['error','conversation_deleted'].includes(e.type));if(e)return e;await new Promise(r=>setTimeout(r,20));}return undefined;};
+ const untouched=()=>log.filter(x=>!x.startsWith(`${owner}:`));
+ return {f,doc,log,counts,terminal,untouched,owner,other,button};
+}
+for(const where of ['row','header'])for(const prevent of [false,true])test(`built ${where} cleanup opens More only with a cancelable pointerdown, completes one pointer pair and needs the native receipt${prevent?' even when handlers preventDefault after opening':''}`,async t=>{
+ const x=await pointerDeleteFixture(t,{where,prevent});x.f.queue({type:'delete_conversation',requestId:'ptr-ok',conversationId:target});
+ const done=await x.terminal('ptr-ok');
+ assert.equal(done?.type,'conversation_deleted',JSON.stringify(done));assert.equal(done.conversationId,target);
+ assert.deepEqual(x.log.filter(e=>e.startsWith(`${x.owner}:`)),[`${x.owner}:pointerdown`,`${x.owner}:pointerup`],'exactly one pointer pair and no click on the owned More');
+ assert.deepEqual(x.untouched(),[],'no other action receives pointer or click events');
+ assert.deepEqual(x.counts,{menuOpens:1,menuToggles:1,delete:1,confirm:1});
+ assert.equal(x.f.page.location.pathname,'/');assert.equal(x.doc.getElementById('target-row'),null);assert.equal(x.doc.querySelector(`a[href="/c/${target}"]`),null);assert.ok(x.doc.getElementById('neighbor-row'));
+});
+for(const receipt of ['none','wrong','stale'])for(const where of ['row','header'])test(`built ${where} pointer cleanup never reports success with a ${receipt} native receipt even after route change and row removal`,async t=>{
+ const x=await pointerDeleteFixture(t,{where,receipt});x.f.queue({type:'delete_conversation',requestId:'ptr-receipt',conversationId:target});
+ await new Promise(r=>setTimeout(r,1300));
+ assert.equal(x.f.events.some(e=>e.type==='conversation_deleted'),false);assert.deepEqual(x.counts,{menuOpens:1,menuToggles:1,delete:1,confirm:1});
+ assert.equal(x.log.filter(e=>e===`${x.owner}:click`).length,0);
+});
+const pointerMutations=[['route','conversation_changed','row'],['detach','conversation_changed','row'],['reuse-link','conversation_changed','row'],['move-node','conversation_changed','row'],['draft','composer_not_empty','row'],
+ ['route','conversation_changed','header'],['detach','conversation_changed','header'],['move-node','conversation_changed','header'],['draft','composer_not_empty','header'],['lifecycle','browser_disconnected','row'],['lifecycle','browser_disconnected','header']];
+for(const [mutate,code,where] of pointerMutations)test(`built ${where} cleanup revalidates after pointerdown and never pointerups, deletes or confirms after a synchronous ${mutate}`,async t=>{
+ const x=await pointerDeleteFixture(t,{where,mutate});x.f.queue({type:'delete_conversation',requestId:'ptr-race',conversationId:target});
+ const done=await x.terminal('ptr-race');
+ assert.equal(done?.code,code,JSON.stringify(done));
+ assert.equal(x.log.some(e=>e.endsWith(':pointerup')),false,'pointerup must not be dispatched at the mutated node or any replacement');
+ assert.equal(x.log.some(e=>e.endsWith(':click')),false);assert.deepEqual(x.untouched(),[]);
+ assert.equal(x.counts.delete,0);assert.equal(x.counts.confirm,0);assert.equal(x.f.events.some(e=>e.type==='conversation_deleted'),false);
+});
+for(const where of ['row','header'])test(`built ${where} cleanup preserves one click fallback when pointer events are unavailable`,async t=>{
+ const x=where==='row'?await sidebarDeleteFixture(t,{trigger:'click'}):await headerDeleteFixture(t,{trigger:'click'});x.f.page.PointerEvent=undefined;
+ x.f.queue({type:'delete_conversation',requestId:'ptr-missing',conversationId:target});
+ const done=await x.terminal('ptr-missing');assert.equal(done?.type,'conversation_deleted',JSON.stringify(done));assert.equal(done.conversationId,target);
+ assert.deepEqual(x.clicks,where==='row'?{target:1,neighbor:0,confirm:1}:{more:1,menu:1,confirm:1});assert.equal(x.f.page.location.pathname,'/');
+ assert.ok(x.doc.querySelector(`a[href="/c/${neighborId}"]`));
+});
+for(const where of ['row','header'])for(const preventActivation of [false,true])test(`built ${where} cleanup with available but ${preventActivation?'prevented':'nonactivating'} pointer events completes one pair and does not auto click or retry`,async t=>{
+ const x=await pointerDeleteFixture(t,{where,activate:false,preventActivation});x.f.queue({type:'delete_conversation',requestId:'ptr-inert',conversationId:target});
+ await new Promise(r=>setTimeout(r,1300));
+ assert.deepEqual(x.log,[`${x.owner}:pointerdown`,`${x.owner}:pointerup`],'exactly one owned pair even when activation is prevented, no click or retry');assert.deepEqual(x.untouched(),[]);
+ assert.deepEqual(x.counts,{menuOpens:0,menuToggles:0,delete:0,confirm:0});assert.equal(x.f.events.some(e=>e.type==='conversation_deleted'),false);
+});
+test('built header pointer cleanup refuses a connected foreign-document action before its first dispatch',async t=>{
+ const x=await pointerDeleteFixture(t,{where:'header'});const foreign=new Window({url:`https://chatgpt.com/c/${target}`});
+ t.after(async()=>{await foreign.happyDOM.abort();foreign.close();});
+ const original=x.button.getAttribute.bind(x.button);let scheduled=false;
+ // Schedule real DOM adoption at the async discovery boundary, before runDelete resumes.
+ x.button.getAttribute=name=>{if(name==='aria-label'&&!scheduled){scheduled=true;queueMicrotask(()=>foreign.document.body.append(x.doc.getElementById('titlebar')));}return original(name);};
+ x.f.queue({type:'delete_conversation',requestId:'ptr-foreign-doc',conversationId:target});
+ const done=await x.terminal('ptr-foreign-doc');assert.equal(done?.code,'conversation_changed',JSON.stringify(done));
+ assert.equal(x.button.isConnected,true);assert.equal(x.button.ownerDocument,foreign.document);assert.deepEqual(x.log,[],'no first event enters the foreign document');
+ assert.equal(x.counts.delete,0);assert.equal(x.counts.confirm,0);
+});
+for(const activate of [false,true])test(`built pointer cleanup ${activate?'selects only its owned portal beside a foreign menu':'never selects a foreign portal when its own trigger is inert'}`,async t=>{
+ const x=await pointerDeleteFixture(t,{activate});let foreignClicks=0;
+ x.button.addEventListener('pointerdown',()=>{const menu=x.doc.createElement('div');menu.id='foreign-menu';menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';menu.querySelector('button').addEventListener('click',()=>foreignClicks++);x.doc.body.append(menu);});
+ x.f.queue({type:'delete_conversation',requestId:'ptr-portal',conversationId:target});
+ if(activate){const done=await x.terminal('ptr-portal');assert.equal(done?.type,'conversation_deleted',JSON.stringify(done));assert.equal(x.counts.confirm,1);}
+ else{await new Promise(r=>setTimeout(r,1300));assert.equal(x.counts.confirm,0);assert.equal(x.f.events.some(e=>e.type==='conversation_deleted'),false);}
+ assert.equal(foreignClicks,0,'never click another portal Delete');assert.ok(x.doc.getElementById('neighbor-row'));
+});
+for(const where of ['row','header'])for(const confirmLabel of ['Delete chat','Delete all chats'])test(`built ${where} cleanup ${confirmLabel==='Delete chat'?'accepts the observed native confirmation label':'rejects an unrelated destructive confirmation label'}`,async t=>{
+ const x=await pointerDeleteFixture(t,{where,confirmLabel});x.f.queue({type:'delete_conversation',requestId:'native-confirm-label',conversationId:target});const done=await x.terminal('native-confirm-label');
+ if(confirmLabel==='Delete chat'){assert.equal(done?.type,'conversation_deleted',JSON.stringify(done));assert.equal(done.conversationId,target);assert.equal(x.counts.confirm,1);}
+ else{assert.equal(done?.code,'delete_confirmation_unavailable',JSON.stringify(done));assert.equal(x.counts.confirm,0);assert.equal(x.f.events.some(e=>e.type==='conversation_deleted'),false);}
+ assert.ok(x.doc.getElementById('neighbor-row'));
 });

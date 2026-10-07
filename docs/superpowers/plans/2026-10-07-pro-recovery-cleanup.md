@@ -16,7 +16,7 @@
 - No conversation bodies, hidden reasoning or authentication may be stored as diagnostic fixtures.
 - Keep strict outgoing-user/branch correlation, draft/attachment/generation guards and successful native DELETE receipt requirements.
 - No select-first behavior for distinct target action buttons; no expansion of filesystem mounts or permissions.
-- Bump both extension version sources from 2.4.15 to 2.4.16 before deployment.
+- Bump both extension version sources: 2.4.16 for the first release, then 2.4.17 for the native acceptance follow-up.
 - Implementation worker must not commit/push; Codex verifies native tests and guarded Git policy.
 
 ## Review Focus
@@ -54,10 +54,10 @@
 
 ### Task 3: Integration, review and release verification
 
-**Files:** `extension/manifest.json`, `src/userscript.header.txt` (confirm actual manifest path before editing).
+**Files:** `extension/manifest.json`, `src/userscript.header.txt`.
 
 - [ ] Resolve independent LocalGPT conceptual and Claude file-aware plan review findings before production changes; report unavailable worker file access honestly.
-- [ ] Bump extension version to 2.4.16 and run full `bun run test` (baseline: 371 pass, 0 fail).
+- [ ] Bump extension version to 2.4.17 and run full `bun run test` (initial baseline: 371 pass, 0 fail).
 - [ ] Request independent Claude actual-diff review, fix material findings and rerun verification.
 - [ ] Apply fresh gh identity checks; commit with recognized AI credit, normal guarded push, PR CI and merge according to existing user authorization.
 - [ ] Publish extension release and verify update of installed extension/server through existing updater workflow, preserving pairing and permissions.
@@ -66,3 +66,11 @@
 ## Implementation verification
 
 Tasks 1 and 2: implemented and independently reviewed. Added 23 regressions; native Bun 1.3.11 full suite: 394 pass, 0 fail. Build/typecheck and formatting passed. Empty/whitespace href ownership was additionally reproduced RED, fixed and independently re-reviewed. Integration and live acceptance remain deployment gates.
+
+### Native acceptance follow-up
+
+The first native 2.4.16 acceptance run still failed. Read-only structural diagnostics confirmed an additional `thoughts` intermediate before `reasoning_recap`, and actual sidebar action depth 4 (outside the previous bound). The current header More is inside `data-testid="app-shell-header-context-menu-surface"`, not `main`.
+
+Follow-up 2.4.17 excludes only the additionally observed `thoughts` type, extends bounded traversal to eight levels with foreign-link and semantic-row boundaries, and derives header lookup/ownership selectors from the same exact observed root list. Synthetic thoughts/recap/final, actual-depth and titlebar regressions must pass, then a temporary local build is tested natively before official release. Final deployment remains the verified GitHub Release package, with unchanged pairing and permissions.
+
+Follow-up verification: standard native `bun run test` passed all 419 tests, build/typecheck/formatting passed, and independent actual-diff review found no blockers. Native Reload approval and acceptance remain pending; no native success is claimed from unit tests alone.

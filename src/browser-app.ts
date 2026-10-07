@@ -1190,6 +1190,9 @@ class App {
       if (parseChatRoute(location.pathname)?.conversationId !== request.conversationId)
         throw new DomError('conversation_changed', 'Refusing to delete a different conversation.')
     }
+    const headerRoots = ['main', '[data-testid="app-shell-header-context-menu-surface"]']
+    const HEADER_MORE_ROOTS = headerRoots.join(', ')
+    const HEADER_MORE_BUTTONS = headerRoots.map((root) => `${root} button`).join(', ')
     const action = (root: ParentNode, selector: string, name: RegExp) => {
       const matches = [...root.querySelectorAll<HTMLElement>(selector)].filter(
         (node) =>
@@ -1245,15 +1248,31 @@ class App {
       const picked = await this.until(() => {
         const row = conversationActions(document, request.conversationId)
         if (row) return { button: row, row: true }
-        const header = action(document, 'main button', /^(More|その他|その他の操作)$/)
+        const header = action(document, HEADER_MORE_BUTTONS, /^(More|その他|その他の操作)$/)
         return header ? { button: header, row: false } : null
       }, deadline)
       const more = picked.button
+      const controlledMenu = more.getAttribute('aria-haspopup') === 'menu'
+      const triggerId = more.id
+      const ownedMenu = () => {
+        const id = more.getAttribute('aria-controls')
+        if (!id || !triggerId || more.id !== triggerId) return null
+        const matches = [...document.querySelectorAll<HTMLElement>('[role="menu"]')].filter(
+          (menu) =>
+            menu.id === id &&
+            (menu.getAttribute('aria-labelledby') ?? '').split(/\s+/).includes(triggerId),
+        )
+        return matches.length === 1 ? matches[0]! : null
+      }
       const assertAction = () => {
+        if (this.destroyed || !this.connected())
+          throw new DomError('browser_disconnected', 'Local server disconnected.')
         assertTarget()
-        const valid = picked.row
-          ? conversationActionOwned(document, request.conversationId, more)
-          : more.isConnected && !!more.closest('main')
+        const valid =
+          more.ownerDocument === document &&
+          (picked.row
+            ? conversationActionOwned(document, request.conversationId, more)
+            : more.isConnected && !!more.closest(HEADER_MORE_ROOTS))
         if (!valid)
           throw new DomError(
             'conversation_changed',
@@ -1262,18 +1281,47 @@ class App {
       }
       assertAction()
       assertReady()
-      more.click()
-      const remove = await this.until(
-        () =>
-          action(
-            document,
-            '[role="menu"] [role="menuitem"], [role="menu"] button',
-            /^(Delete|削除|チャットを削除)$/,
-          ),
-        deadline,
-      )
+      // Use the model-menu pointer sequence for More, revalidating the single pair in between.
+      const win = document.defaultView
+      if (win && typeof win.PointerEvent === 'function') {
+        const init = {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          pointerType: 'mouse',
+          isPrimary: true,
+        }
+        // A prevented default after opening is not a failure, so the dispatch result is ignored.
+        more.dispatchEvent(new win.PointerEvent('pointerdown', init))
+        if (more.ownerDocument !== document || !more.isConnected)
+          throw new DomError(
+            'conversation_changed',
+            'The conversation action no longer belongs to the target conversation.',
+          )
+        assertAction()
+        assertReady()
+        more.dispatchEvent(new win.PointerEvent('pointerup', init))
+      } else more.click()
+      const removal = await this.until(() => {
+        const root = controlledMenu ? ownedMenu() : document
+        if (!root) return null
+        const item = action(
+          root,
+          '[role="menu"] [role="menuitem"], [role="menu"] button',
+          /^(Delete|削除|チャットを削除)$/,
+        )
+        const menu = item?.closest<HTMLElement>('[role="menu"]')
+        return item && menu ? { item, menu } : null
+      }, deadline)
+      const { item: remove, menu: deleteMenu } = removal
       assertAction()
       assertReady()
+      if (
+        !deleteMenu.isConnected ||
+        !deleteMenu.contains(remove) ||
+        (controlledMenu && ownedMenu() !== deleteMenu)
+      )
+        throw new DomError('conversation_changed', 'The deletion menu changed ownership.')
       remove.click()
       const dialog = await this.until(() => {
         const matches = [
@@ -1283,7 +1331,7 @@ class App {
         const heading = matches[0]!.querySelector('h1, h2, h3, [role="heading"]')?.textContent ?? ''
         return /delete.*chat|チャット.*削除|会話.*削除/i.test(heading) ? matches[0]! : null
       }, deadline)
-      const confirm = action(dialog, 'button', /^(Delete|削除|チャットを削除)$/)
+      const confirm = action(dialog, 'button', /^(Delete|Delete chat|削除|チャットを削除)$/)
       if (!confirm)
         throw new DomError(
           'delete_confirmation_unavailable',

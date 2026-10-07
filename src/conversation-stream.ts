@@ -53,6 +53,7 @@ export function isVisibleAssistantOutput(
     object(value.content) &&
     value.content.content_type !== 'model_editable_context' &&
     value.content.content_type !== 'reasoning_recap' &&
+    value.content.content_type !== 'thoughts' &&
     (value.channel === undefined || value.channel === null || value.channel === 'final') &&
     (value.recipient === undefined || value.recipient === 'all') &&
     !(object(value.metadata) && value.metadata.is_visually_hidden_from_conversation === true)

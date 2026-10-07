@@ -79,6 +79,20 @@ test('deletion observer requires a successful exact chat deletion and exports on
  assert.equal(events.length,1);await send('DELETE',{});assert.equal(events.length,2);
  await page.fetch(new Request(`https://chatgpt.com${path}`,{method:'PATCH',body:JSON.stringify({is_visible:false})}));await new Promise(r=>setTimeout(r,30));assert.equal(events.length,3);
 });
+for(const status of [200,204])for(const requestObject of [false,true])test(`native id-route deletion receipt accepts successful DELETE ${status} with ${requestObject?'Request':'URL'} input without leaking credentials`,async t=>{
+ const page=new Window({url:'https://chatgpt.com/'});t.after(()=>page.close());page.Request=Request;
+ const nativeResponse=Promise.resolve(new Response(status===204?null:'{}',{status}));page.fetch=()=>nativeResponse;require('../dist/page-observer.cjs').installPageObserver(page);
+ const id='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef3',url=`https://chatgpt.com/backend-api/conversation/id/${id}`;const events=[];page.addEventListener('localgpt:conversation-deleted',e=>events.push(JSON.parse(e.detail)));
+ const init={method:'DELETE',headers:{Authorization:'Bearer never-export'},body:'never-export'};const result=requestObject?page.fetch(new Request(url,init)):page.fetch(url,init);assert.equal(result,nativeResponse);await result;
+ for(let i=0;i<30&&!events.length;i++)await new Promise(r=>setTimeout(r,10));assert.deepEqual(events,[{conversationId:id}]);assert.equal(JSON.stringify(events).includes('never-export'),false);
+});
+for(const [name,method,suffix,status,origin] of [
+ ['failed deletion','DELETE','',500,'https://chatgpt.com'],['already absent','DELETE','',404,'https://chatgpt.com'],['GET','GET','',200,'https://chatgpt.com'],['PATCH','PATCH','',200,'https://chatgpt.com'],['POST','POST','',200,'https://chatgpt.com'],['trailing path','DELETE','/extra',200,'https://chatgpt.com'],['foreign origin','DELETE','',200,'https://example.com'],
+])test(`native id-route deletion receipt rejects ${name}`,async t=>{
+ const page=new Window({url:'https://chatgpt.com/'});t.after(()=>page.close());page.Request=Request;page.fetch=()=>Promise.resolve(new Response('{}',{status}));require('../dist/page-observer.cjs').installPageObserver(page);
+ const id='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef3';const events=[];page.addEventListener('localgpt:conversation-deleted',e=>events.push(JSON.parse(e.detail)));
+ await page.fetch(`${origin}/backend-api/conversation/id/${id}${suffix}`,{method,...(method==='GET'?{}:{body:JSON.stringify({is_visible:false,is_archived:false})})});await new Promise(r=>setTimeout(r,40));assert.deepEqual(events,[]);
+});
 test('stream observer reads only the armed matching send and preserves native response',async t=>{
  const page=new Window({url:'https://chatgpt.com/'});t.after(()=>page.close());
  const id='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef3',messageId='f5eadb59-b96e-4ef5-9342-2f49d62b3c6f';
