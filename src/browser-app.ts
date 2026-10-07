@@ -1,6 +1,8 @@
 import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
+import { z } from 'zod'
+import { NATIVE_REQUEST_EVENT, NATIVE_RESULT_EVENT } from './native-chat'
 import { DraftBackups } from './draft-backup'
-import { parseChatRoute, conversationPath } from './projects'
+import { parseChatRoute, conversationPath, ProjectIdSchema } from './projects'
 import {
   ensureProjectTarget,
   openProjectChat,
@@ -95,7 +97,42 @@ const DEFINITE_SETUP_FAILURES = new Set([
   'draft_backup_conflict',
 ])
 export type HttpBridge = (path: string, data: unknown, browserId: string) => Promise<unknown>
+const NativeResultSchema = z.object({
+  requestId: z.string().min(1),
+  kind: z.enum(['ready', 'prepared', 'identity', 'error', 'dispatch_refused']),
+  ready: z.boolean().optional(),
+  nativeUserMessageId: z.string().uuid().optional(),
+  conversationId: z.string().uuid().optional(),
+  clientThreadId: z.string().min(1).max(200).optional(),
+  projectId: ProjectIdSchema.optional(),
+  code: z.string().optional(),
+  message: z.string().optional(),
+  preDispatch: z.boolean().optional(),
+})
+type NativeResult = z.infer<typeof NativeResultSchema>
+type NativeContext = {
+  request: Extract<BrowserRequest, { type: 'request' }>
+  userId: string
+  dispatched: boolean
+  dispatchRefused?: { code: string; message: string }
+  prepared?: (result: NativeResult) => void
+  identities: BrowserEvent[]
+  identityConversation: string | null
+  conversationId: string | null
+  messageId: string | null
+  text: string | null
+  forwardedText: string | null
+  terminal: StreamEvent | null
+  imageRefs: Set<string>
+  images: Map<string, { downloadUrl?: string; imageData?: ImageData }>
+  sentImages: Set<string>
+  wake?: () => void
+}
 class App {
+  private nativeContexts = new Map<string, NativeContext>()
+  // Tombstones prevent duplicate transport delivery from ever invoking dispatch again.
+  private nativeRequests = new Set<string>()
+  private nativeProbes = new Map<string, (ready: boolean) => void>()
   private responseStream: {
     requestId: string
     messageId: string | null
@@ -149,6 +186,7 @@ class App {
     this.lastManualEdit = Date.now()
   }
   constructor(private httpBridge?: HttpBridge) {
+    window.addEventListener(NATIVE_RESULT_EVENT, this.nativeResult)
     window.addEventListener('input', this.markManualEdit, true)
     window.addEventListener('keydown', this.markManualEdit, true)
     window.addEventListener(STREAM_EVENT, (event) => {
@@ -156,6 +194,10 @@ class App {
         const parsed = StreamEventSchema.safeParse(
           JSON.parse((event as CustomEvent<string>).detail),
         )
+        if (parsed.success && this.nativeContexts.has(parsed.data.requestId)) {
+          this.nativeStream(parsed.data)
+          return
+        }
         const state = this.responseStream
         if (
           !parsed.success ||
@@ -317,6 +359,7 @@ class App {
   private recoverDraft() {
     if (
       this.active ||
+      this.nativeContexts.size > 0 ||
       this.navigating ||
       this.destroyed ||
       isGenerating(document) ||
@@ -333,7 +376,10 @@ class App {
   private setStatus(text: string) {
     this.status.textContent = `LocalGPT · ${text}`
   }
-  private acknowledgements = new Map<string, (received: boolean | null) => void>()
+  private acknowledgements = new Map<
+    string,
+    { requestId: string; done: (received: boolean | null) => void }
+  >()
   // Resolves true only when the server confirmed it took the event (HTTP reply or WebSocket event_ack).
   // null means the outcome of delivery is unknown (transport failure, timeout, malformed reply).
   private async sendObserved(event: BrowserEvent): Promise<boolean | null> {
@@ -352,6 +398,7 @@ class App {
         return null
       } catch {
         this.httpConnected = false
+        this.wakeNative()
         this.responseStream?.wake?.()
         return null
       }
@@ -365,7 +412,7 @@ class App {
         resolve(received)
       }
       const timer = setTimeout(() => done(null), 4000)
-      this.acknowledgements.set(eventId, done)
+      this.acknowledgements.set(eventId, { requestId: event.requestId, done })
       try {
         this.socket!.send(JSON.stringify({ ...event, eventId }))
       } catch {
@@ -392,6 +439,7 @@ class App {
         })
         .catch((err) => {
           this.httpConnected = false
+          this.wakeNative()
           this.responseStream?.wake?.()
           this.setStatus(err instanceof Error ? err.message : 'HTTP event failed')
         })
@@ -571,10 +619,457 @@ class App {
       this.active = null
     }
   }
+  private wakeNative() {
+    for (const state of this.nativeContexts.values()) state.wake?.()
+  }
+  private nativeResult = (event: Event) => {
+    try {
+      const parsed = NativeResultSchema.safeParse(JSON.parse((event as CustomEvent<string>).detail))
+      if (!parsed.success) return
+      const result = parsed.data
+      if (result.kind === 'ready') {
+        this.nativeProbes.get(result.requestId)?.(result.ready === true)
+        return
+      }
+      const state = this.nativeContexts.get(result.requestId)
+      if (!state || (result.nativeUserMessageId && result.nativeUserMessageId !== state.userId))
+        return
+      if (!state.dispatched && (result.kind === 'prepared' || result.kind === 'error')) {
+        state.prepared?.(result)
+        return
+      }
+      if (!state.dispatched) return
+      if (result.kind === 'identity' && result.nativeUserMessageId === state.userId) {
+        if (
+          result.conversationId &&
+          state.conversationId &&
+          result.conversationId !== state.conversationId
+        ) {
+          this.send({
+            type: 'progress',
+            requestId: result.requestId,
+            nativeUserMessageId: state.userId,
+            phase: 'unresponsive',
+          })
+          return
+        }
+        if (result.conversationId) state.conversationId = result.conversationId
+        state.identities.push({
+          type: 'native_identity',
+          requestId: result.requestId,
+          nativeUserMessageId: state.userId,
+          ...(result.clientThreadId ? { clientThreadId: result.clientThreadId } : {}),
+          ...(result.conversationId ? { conversationId: result.conversationId } : {}),
+        })
+      } else if (result.kind === 'dispatch_refused') {
+        state.dispatchRefused = {
+          code: result.code ?? 'native_dispatch_refused',
+          message: result.message ?? 'Native SDK was not invoked.',
+        }
+      } else if (result.kind === 'error') {
+        // A completion callback/exception never proves that the remote generation ended.
+        this.send({
+          type: 'progress',
+          requestId: result.requestId,
+          nativeUserMessageId: state.userId,
+          phase: 'unresponsive',
+        })
+      }
+      state.wake?.()
+    } catch {}
+  }
+  private nativeStream(incoming: StreamEvent) {
+    const state = this.nativeContexts.get(incoming.requestId)!
+    if (!state.dispatched || incoming.nativeUserMessageId !== state.userId) return
+    if (
+      (state.conversationId &&
+        incoming.conversationId &&
+        state.conversationId !== incoming.conversationId) ||
+      (state.messageId && state.messageId !== incoming.messageId)
+    )
+      return
+    state.messageId = incoming.messageId
+    if (incoming.conversationId && !state.conversationId)
+      state.conversationId = incoming.conversationId
+    if (incoming.kind === 'progress' && incoming.phase)
+      this.send({
+        type: 'progress',
+        requestId: incoming.requestId,
+        nativeUserMessageId: state.userId,
+        phase: incoming.phase,
+      })
+    if (incoming.kind === 'image_ref' && incoming.fileId) {
+      // Retain one overflow sentinel but never grow an unbounded image collection.
+      if (state.imageRefs.size > MAX_GENERATED_IMAGES) return
+      state.imageRefs.add(incoming.fileId)
+      if (state.imageRefs.size > MAX_GENERATED_IMAGES) {
+        this.send({
+          type: 'progress',
+          requestId: incoming.requestId,
+          nativeUserMessageId: state.userId,
+          phase: 'unresponsive',
+        })
+        return
+      }
+    } else if (
+      incoming.kind === 'image' &&
+      incoming.fileId &&
+      state.imageRefs.has(incoming.fileId) &&
+      (incoming.downloadUrl || incoming.imageData)
+    ) {
+      state.images.set(incoming.fileId, {
+        downloadUrl: incoming.downloadUrl,
+        imageData: incoming.imageData,
+      })
+    } else if (incoming.kind === 'answer' && incoming.text !== undefined && !state.terminal)
+      state.text = incoming.text
+    else if (
+      (incoming.kind === 'stop' || incoming.kind === 'error') &&
+      incoming.terminalEvidence === true
+    )
+      state.terminal = incoming
+    else if (incoming.kind === 'error')
+      this.send({
+        type: 'progress',
+        requestId: incoming.requestId,
+        nativeUserMessageId: state.userId,
+        phase: 'unresponsive',
+      })
+    state.wake?.()
+  }
+  private waitNative(state: Pick<NativeContext, 'wake'>) {
+    if (this.destroyed) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer)
+        if (state.wake === finish) delete state.wake
+        resolve()
+      }
+      const timer = setTimeout(finish, 1000)
+      state.wake = finish
+    })
+  }
+  // Only a true ACK proves durable acceptance; false may be a transient storage failure.
+  private async ackUntilTrue(event: BrowserEvent, state: Pick<NativeContext, 'wake'>) {
+    while (!this.destroyed) {
+      if ((await this.sendObserved(event)) === true) return true
+      await this.waitNative(state)
+    }
+    return false
+  }
+  private async probeNative(requestId: string) {
+    const ready = await new Promise<boolean>((resolve) => {
+      const done = (value: boolean) => {
+        clearTimeout(timer)
+        this.nativeProbes.delete(requestId)
+        resolve(value)
+      }
+      const timer = setTimeout(() => done(false), 10000)
+      this.nativeProbes.set(requestId, done)
+      window.dispatchEvent(
+        new CustomEvent(NATIVE_REQUEST_EVENT, {
+          detail: JSON.stringify({ action: 'probe', requestId }),
+        }),
+      )
+    })
+    this.send({ type: 'native_ready', requestId, protocol: 1, ready })
+  }
+  private async runNative(request: Extract<BrowserRequest, { type: 'request' }>) {
+    if (this.nativeRequests.has(request.requestId)) return
+    if (this.active || this.navigating) {
+      this.nativeRequests.add(request.requestId)
+      await this.ackUntilTrue(
+        {
+          type: 'error',
+          requestId: request.requestId,
+          code: 'browser_busy',
+          message: 'UI operation is running.',
+          preDispatch: true,
+          nativeUserMessageId: request.nativeUserMessageId,
+        },
+        {},
+      )
+      return
+    }
+    this.nativeRequests.add(request.requestId)
+    const state: NativeContext = {
+      request,
+      userId: request.nativeUserMessageId ?? '',
+      dispatched: false,
+      identities: [],
+      identityConversation: null,
+      conversationId: request.conversationId ?? null,
+      messageId: null,
+      text: null,
+      forwardedText: null,
+      terminal: null,
+      imageRefs: new Set(),
+      images: new Map(),
+      sentImages: new Set(),
+    }
+    this.nativeContexts.set(request.requestId, state)
+    let released = false
+    try {
+      if (!z.string().uuid().safeParse(state.userId).success)
+        throw new Error('native_identity_required')
+      const prepared = await new Promise<NativeResult>((resolve) => {
+        const done = (result: NativeResult) => {
+          clearTimeout(timer)
+          delete state.prepared
+          resolve(result)
+        }
+        const timer = setTimeout(
+          () =>
+            done({ requestId: request.requestId, kind: 'error', code: 'native_prepare_timeout' }),
+          request.timeoutMs ?? TIMEOUT_MS,
+        )
+        state.prepared = done
+        window.dispatchEvent(
+          new CustomEvent(NATIVE_REQUEST_EVENT, {
+            detail: JSON.stringify({ ...request, action: 'prepare' }),
+          }),
+        )
+      })
+      if (this.destroyed) throw new Error('native_browser_disconnected')
+      if (prepared.kind !== 'prepared' || prepared.nativeUserMessageId !== state.userId)
+        throw new Error(prepared.code ?? 'native_prepare_failed')
+      // Replay the identical receipt until durably accepted; never retry dispatch.
+      await this.ackUntilTrue(
+        {
+          type: 'native_intent',
+          requestId: request.requestId,
+          nativeUserMessageId: state.userId,
+        },
+        state,
+      )
+      if (this.destroyed) throw new Error('native_browser_disconnected')
+      // The intent must be durably accepted BEFORE arming or invoking page dispatch.
+      state.dispatched = true
+      window.dispatchEvent(
+        new CustomEvent(STREAM_ARM_EVENT, {
+          detail: JSON.stringify({
+            requestId: request.requestId,
+            text: request.text,
+            newChat: request.newChat,
+            native: true,
+            nativeUserMessageId: state.userId,
+            conversationId: request.conversationId,
+            timeoutMs: request.timeoutMs ?? TIMEOUT_MS,
+            backgroundJob: true,
+            ...(prepared.projectId ? { projectId: prepared.projectId } : {}),
+          }),
+        }),
+      )
+      window.dispatchEvent(
+        new CustomEvent(NATIVE_REQUEST_EVENT, {
+          detail: JSON.stringify({
+            action: 'dispatch',
+            requestId: request.requestId,
+            nativeUserMessageId: state.userId,
+          }),
+        }),
+      )
+      while (!this.destroyed) {
+        if (!this.connected()) {
+          await this.waitNative(state)
+          continue
+        }
+        if (state.dispatchRefused) {
+          if (
+            (await this.sendObserved({
+              type: 'native_dispatch_refused',
+              requestId: request.requestId,
+              nativeUserMessageId: state.userId,
+              ...state.dispatchRefused,
+            })) !== true
+          ) {
+            await this.waitNative(state)
+            continue
+          }
+          released = true
+          return
+        }
+        // Replay receipts only. Never replay the native dispatch command.
+        const identity =
+          state.identities[0] ??
+          (state.messageId &&
+          state.conversationId &&
+          state.identityConversation !== state.conversationId
+            ? {
+                type: 'native_identity' as const,
+                requestId: request.requestId,
+                nativeUserMessageId: state.userId,
+                conversationId: state.conversationId,
+              }
+            : null)
+        if (identity) {
+          if ((await this.sendObserved(identity)) !== true) {
+            await this.waitNative(state)
+            continue
+          }
+          if (identity.type === 'native_identity' && identity.conversationId)
+            state.identityConversation = identity.conversationId
+          if (state.identities[0] === identity) state.identities.shift()
+          continue
+        }
+        // A correlated HTTP refusal can prove termination before a new server
+        // conversation exists. Never invent a CID merely to forward that proof.
+        if (
+          state.terminal?.kind === 'error' &&
+          !state.conversationId &&
+          !state.imageRefs.size &&
+          state.text === null
+        ) {
+          if (
+            (await this.sendObserved({
+              type: 'error',
+              requestId: request.requestId,
+              nativeUserMessageId: state.userId,
+              terminalEvidence: true,
+              code: state.terminal.code ?? 'chatgpt_api_error',
+              message: 'Correlated ChatGPT generation failed.',
+            })) !== true
+          ) {
+            await this.waitNative(state)
+            continue
+          }
+          released = true
+          return
+        }
+        if (!state.conversationId || state.identityConversation !== state.conversationId) {
+          await this.waitNative(state)
+          continue
+        }
+        let retry = false
+        for (const [fileId, image] of state.images) {
+          if (state.sentImages.has(fileId)) continue
+          if (
+            (await this.sendObserved({
+              type: 'image',
+              requestId: request.requestId,
+              nativeUserMessageId: state.userId,
+              conversationId: state.conversationId,
+              fileId,
+              ...image,
+            })) !== true
+          ) {
+            retry = true
+            break
+          }
+          state.sentImages.add(fileId)
+        }
+        if (state.text !== null && state.forwardedText !== state.text) {
+          const text = state.text
+          if (
+            (await this.sendObserved({
+              type: 'answer',
+              requestId: request.requestId,
+              nativeUserMessageId: state.userId,
+              text,
+            })) !== true
+          ) {
+            await this.waitNative(state)
+            continue
+          }
+          state.forwardedText = text
+        }
+        if (
+          retry ||
+          !state.terminal ||
+          (state.terminal.kind !== 'error' &&
+            (state.imageRefs.size !== state.images.size ||
+              state.imageRefs.size > MAX_GENERATED_IMAGES))
+        ) {
+          await this.waitNative(state)
+          continue
+        }
+        const terminal = state.terminal
+        if (terminal.kind === 'stop' && !state.text?.trim() && !state.images.size) {
+          await this.waitNative(state)
+          continue
+        }
+        const event: BrowserEvent =
+          terminal.kind === 'error'
+            ? {
+                type: 'error',
+                requestId: request.requestId,
+                code: terminal.code ?? 'chatgpt_api_error',
+                message: 'Correlated ChatGPT generation failed.',
+                nativeUserMessageId: state.userId,
+                terminalEvidence: true,
+              }
+            : {
+                type: 'stop',
+                requestId: request.requestId,
+                conversationId: state.conversationId,
+                nativeUserMessageId: state.userId,
+                terminalEvidence: true,
+                ...(terminal.projectId ? { projectId: terminal.projectId } : {}),
+              }
+        if ((await this.sendObserved(event)) !== true) {
+          await this.waitNative(state)
+          continue
+        }
+        released = true
+        return
+      }
+    } catch (error) {
+      const failure: BrowserEvent = {
+        type: 'error',
+        requestId: request.requestId,
+        code: error instanceof Error ? error.message : 'native_browser_unknown',
+        message: 'Native request could not be confirmed.',
+        ...(state.userId ? { nativeUserMessageId: state.userId } : {}),
+        preDispatch: !state.dispatched,
+      }
+      if (!state.dispatched) {
+        if (await this.ackUntilTrue(failure, state)) {
+          released = true
+          return
+        }
+      } else
+        this.send({
+          type: 'progress',
+          requestId: request.requestId,
+          nativeUserMessageId: state.userId,
+          phase: 'unresponsive',
+        })
+    } finally {
+      if (released || (!state.dispatched && this.destroyed)) {
+        window.dispatchEvent(
+          new CustomEvent('localgpt:stream-disarm', { detail: request.requestId }),
+        )
+        state.wake?.()
+        this.nativeContexts.delete(request.requestId)
+      }
+    }
+  }
   private async run(request: BrowserRequest) {
     if (request.type === 'event_ack') {
-      if (request.requestId === this.active)
-        this.acknowledgements.get(request.eventId)?.(request.accepted)
+      const ack = this.acknowledgements.get(request.eventId)
+      if (ack?.requestId === request.requestId) ack.done(request.accepted)
+      return
+    }
+    if (request.type === 'native_readiness') {
+      await this.probeNative(request.requestId)
+      return
+    }
+    if (request.type === 'request' && request.native === true) {
+      await this.runNative(request)
+      return
+    }
+    if (
+      this.nativeContexts.size &&
+      request.type !== 'capabilities' &&
+      request.type !== 'models' &&
+      !(request.type === 'dots' && ['list', 'messages'].includes(request.operation.action))
+    ) {
+      this.send({
+        type: 'error',
+        requestId: request.requestId,
+        code: 'browser_busy',
+        message: 'Native generations are still owned by this tab.',
+      })
       return
     }
     if (request.type === 'navigation_ready') {
@@ -1070,6 +1565,7 @@ class App {
       console.error('[LocalGPT]', error.code, error.message)
     } finally {
       window.dispatchEvent(new CustomEvent('localgpt:stream-disarm', { detail: request.requestId }))
+      this.wakeNative()
       this.responseStream?.wake?.()
       this.responseStream = null
       this.active = null
@@ -1418,6 +1914,7 @@ class App {
     if (
       this.destroyed ||
       this.active ||
+      this.nativeContexts.size > 0 ||
       this.navigating ||
       this.responseStream ||
       Date.now() - this.lastManualEdit < 5000 ||
@@ -1499,11 +1996,12 @@ class App {
         if (this.active) {
           await this.httpRequest('event', { type: 'heartbeat' })
           this.httpConnected = true
+          this.wakeNative()
           this.responseStream?.wake?.()
           await sleep(700)
           continue
         }
-        const value = await this.httpRequest('poll', {})
+        const value = await this.httpRequest('poll', { nativeProtocol: 1 })
         if (this.navigating) continue
         this.httpConnected = true
         if (!this.active) this.setStatus('接続済み · HTTP 8766')
@@ -1514,6 +2012,7 @@ class App {
         await sleep(700)
       } catch (err) {
         this.httpConnected = false
+        this.wakeNative()
         this.responseStream?.wake?.()
         this.setStatus(err instanceof Error ? err.message : 'Local HTTP connection error')
         if (
@@ -1544,7 +2043,9 @@ class App {
     }
     this.setStatus('接続中 · 8875')
     try {
-      this.socket = new WebSocket(`${WS_URL}&browserId=${encodeURIComponent(this.browserId)}`)
+      this.socket = new WebSocket(
+        `${WS_URL}&browserId=${encodeURIComponent(this.browserId)}&nativeProtocol=1`,
+      )
     } catch {
       void this.poll()
       return
@@ -1569,11 +2070,13 @@ class App {
     }
     this.socket.onerror = () => {
       clearTimeout(fallback)
+      this.wakeNative()
       this.responseStream?.wake?.()
       void this.poll()
     }
     this.socket.onclose = () => {
       clearTimeout(fallback)
+      this.wakeNative()
       this.responseStream?.wake?.()
       if (this.destroyed || this.transport === 'http') return
       this.setStatus('未接続 · 8875 / 再接続待ち')
@@ -1582,9 +2085,19 @@ class App {
   }
   stop() {
     this.destroyed = true
+    window.removeEventListener(NATIVE_RESULT_EVENT, this.nativeResult)
+    for (const done of this.nativeProbes.values()) done(false)
+    for (const state of this.nativeContexts.values())
+      state.prepared?.({
+        requestId: state.request.requestId,
+        kind: 'error',
+        code: 'native_browser_disconnected',
+      })
+    for (const ack of this.acknowledgements.values()) ack.done(null)
     window.removeEventListener('input', this.markManualEdit, true)
     window.removeEventListener('keydown', this.markManualEdit, true)
     if (this.draftTimer) clearTimeout(this.draftTimer)
+    this.wakeNative()
     this.responseStream?.wake?.()
     if (this.reconnect) clearTimeout(this.reconnect)
     this.socket?.close()

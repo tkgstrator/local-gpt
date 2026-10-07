@@ -55,7 +55,7 @@ test('MCP migrates a pre-existing bound LocalGPT session and exposes routing ins
   const {base,ws,send}=await setup(t,path);
   const {Client}=await import('@modelcontextprotocol/sdk/client/index.js'); const {StreamableHTTPClientTransport}=await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
   const client=new Client({name:'project-test',version:'1'}); t.after(()=>client.close()); await client.connect(new StreamableHTTPClientTransport(new URL(base+'/mcp')));
-  assert.match(client.getInstructions(),/one at a time service-wide/); assert.match(client.getInstructions(),/Never autonomously use Computer Use/);
+  assert.match(client.getInstructions(),/verified nativeReady browser can run generations concurrently/); assert.match(client.getInstructions(),/Legacy clients remain serial/); assert.match(client.getInstructions(),/Never autonomously use Computer Use/);
   assert.ok((await client.listTools()).tools.some(tool=>tool.name==='localgpt_session_project'));
   const next=once(ws,'message'); const result=client.callTool({name:'localgpt_session_project',arguments:{session_id:old.id}}); const move=JSON.parse((await next)[0]);
   assert.equal(move.conversationId,conversationId); assert.equal(move.projectName,'LocalGPT'); send({type:'conversation_project',requestId:move.requestId,conversationId,projectId});

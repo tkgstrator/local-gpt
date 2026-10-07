@@ -7,6 +7,26 @@ const object = (value: unknown): value is ObjectValue =>
 export const MAX_RECOVERY_BYTES = 8_000_000
 const MAX_RECOVERY_NODES = 5000
 
+export function boundedConversationSnapshot(value: unknown): unknown {
+  if (
+    !object(value) ||
+    !object(value.mapping) ||
+    Object.keys(value.mapping).length > MAX_RECOVERY_NODES
+  )
+    return null
+  try {
+    const serialized = JSON.stringify(value)
+    if (
+      serialized.length > MAX_RECOVERY_BYTES ||
+      new TextEncoder().encode(serialized).byteLength > MAX_RECOVERY_BYTES
+    )
+      return null
+    return value
+  } catch {
+    return null
+  }
+}
+
 export function conversationFinalText(
   value: unknown,
   conversationId: string,
@@ -20,18 +40,55 @@ export function conversationFinalOutput(
   value: unknown,
   conversationId: string,
   messageId: string,
-  observed: { text?: string; fileIds?: Iterable<string>; messageIds?: Iterable<string> } = {},
+  observed: {
+    native?: boolean
+    nativeTerminal?: boolean
+    text?: string
+    fileIds?: Iterable<string>
+    messageIds?: Iterable<string>
+  } = {},
 ): { text: string; fileIds: string[] } | { error: string } | null {
   if (
     !object(value) ||
     value.conversation_id !== conversationId ||
     !object(value.mapping) ||
-    typeof value.current_node !== 'string' ||
+    (!observed.native && typeof value.current_node !== 'string') ||
     Object.keys(value.mapping).length > MAX_RECOVERY_NODES
   )
     return null
   const mapping = value.mapping
-  if (!Object.hasOwn(mapping, value.current_node)) return null
+  if (observed.native) {
+    // Validate all terminal branches against exact ancestry and observed identities;
+    // selecting a visible branch must never decide a native request's result.
+    const snapshot = {
+      ...observed,
+      native: false,
+      nativeTerminal: true,
+      fileIds: [...(observed.fileIds ?? [])],
+      messageIds: [...(observed.messageIds ?? [])],
+    }
+    const candidates = Object.entries(mapping)
+      .filter(
+        ([id, node]) =>
+          object(node) &&
+          node.id === id &&
+          object(node.message) &&
+          isVisibleAssistantOutput(node.message) &&
+          node.message.end_turn === true,
+      )
+      .map(([id]) =>
+        conversationFinalOutput(
+          { ...value, current_node: id },
+          conversationId,
+          messageId,
+          snapshot,
+        ),
+      )
+      .filter((output) => output !== null)
+    return candidates.length === 1 ? candidates[0]! : null
+  }
+  if (typeof value.current_node !== 'string' || !Object.hasOwn(mapping, value.current_node))
+    return null
   const final = mapping[value.current_node]
   if (!object(final) || final.id !== value.current_node || !object(final.message)) return null
   const message = final.message
@@ -81,7 +138,10 @@ export function conversationFinalOutput(
   for (const m of segment.reverse()) {
     const task = classifyGeneratedImageMessage(m)
     if (task) {
-      if (task.error === 'image_generation_failed') return { error: task.error }
+      if (task.error === 'image_generation_failed') {
+        if (observed.nativeTerminal) continue
+        return { error: task.error }
+      }
       if (m.status !== 'finished_successfully') {
         pending = true
         continue

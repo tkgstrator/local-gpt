@@ -20,7 +20,9 @@ for (const userOnlyConversation of [false, true, 'empty-route', 'extension']) te
   page.window.WebSocket = class { constructor() { throw new Error('CSP blocked WebSocket'); } };
   page.window.GM_xmlhttpRequest = options => {
     const target = new URL(options.url);
-    void fetch(`${base}${target.pathname}`, { method: options.method, headers: options.headers, body: options.data }).then(async response => options.onload({ status: response.status, responseText: await response.text() }), options.onerror);
+    // An old server ignores opt-in native negotiation and sends legacy requests.
+    const body=target.pathname==='/bridge/poll'?'{}':options.data;
+    void fetch(`${base}${target.pathname}`, { method: options.method, headers: options.headers, body }).then(async response => options.onload({ status: response.status, responseText: await response.text() }), options.onerror);
   };
   installNativeEditing(page.window);
   const editor = page.window.document.querySelector('[role="textbox"]');
@@ -49,7 +51,7 @@ for (const userOnlyConversation of [false, true, 'empty-route', 'extension']) te
       tabs: { update: async id => ({ id, windowId: 1 }) },
       windows: { update: async () => ({ id: 1 }) },
     };
-    const localFetch = (url, options) => fetch(`${base}${new URL(url).pathname}`, options);
+    const localFetch = (url, options) => fetch(`${base}${new URL(url).pathname}`, {...options,...(new URL(url).pathname==='/bridge/poll'?{body:'{}'}:{})});
     new Function('chrome', 'fetch', 'importScripts', 'LOCALGPT_PAIRING_TOKEN', await readFile('dist/extension/background.js', 'utf8'))(workerChrome, localFetch, () => {}, token);
     page.window.chrome = { runtime: { sendMessage: message => new Promise(resolve => listener(message, { id: 'test-extension', url: 'https://chatgpt.com/', tab: { id: 1 }, frameId: 0 }, resolve)) } };
   }

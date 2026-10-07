@@ -18,3 +18,7 @@ workspaces
 # Generated image artifacts (not source code).
 generated-images/
 .localgpt-images/
+
+# Temporary worker test runtime and private response records.
+.bun-test-runtime/
+.localgpt-response-jobs/

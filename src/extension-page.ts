@@ -1,2 +1,4 @@
 import { installPageObserver } from './page-observer'
-installPageObserver(window)
+import { installNativeChat } from './native-chat'
+const native = installNativeChat(window)
+installPageObserver(window, native)

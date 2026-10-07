@@ -59,6 +59,8 @@ export const BrowserRequestSchema = z.discriminatedUnion('type', [
   }),
   z.object({
     type: z.literal('request'),
+    native: z.boolean().optional(),
+    nativeUserMessageId: z.string().uuid().optional(),
     timeoutMs: z.number().int().positive().max(7200000).optional(),
     backgroundJob: z.boolean().optional(),
     projectName: z.string().min(1).max(200).optional(),
@@ -71,6 +73,7 @@ export const BrowserRequestSchema = z.discriminatedUnion('type', [
     reasoning: z.object({ effort: z.string().min(1).max(200) }).optional(),
     conversationId: z.string().uuid().optional(),
   }),
+  z.object({ type: z.literal('native_readiness'), requestId: z.string().min(1) }),
   z.object({ type: z.literal('models'), requestId: z.string().min(1) }),
   z.object({ type: z.literal('capabilities'), requestId: z.string().min(1) }),
   z.object({ type: z.literal('navigation_ready'), requestId: z.string().min(1) }),
@@ -78,6 +81,31 @@ export const BrowserRequestSchema = z.discriminatedUnion('type', [
 ])
 export const BrowserEventSchema = z
   .discriminatedUnion('type', [
+    z.object({
+      type: z.literal('native_ready'),
+      requestId: z.string().min(1),
+      protocol: z.literal(1),
+      ready: z.boolean(),
+    }),
+    z.object({
+      type: z.literal('native_intent'),
+      requestId: z.string().min(1),
+      nativeUserMessageId: z.string().uuid(),
+    }),
+    z.object({
+      type: z.literal('native_dispatch_refused'),
+      requestId: z.string().min(1),
+      nativeUserMessageId: z.string().uuid(),
+      code: z.string().min(1),
+      message: z.string(),
+    }),
+    z.object({
+      type: z.literal('native_identity'),
+      requestId: z.string().min(1),
+      nativeUserMessageId: z.string().uuid(),
+      clientThreadId: z.string().min(1).max(200).optional(),
+      conversationId: z.string().uuid().optional(),
+    }),
     z.object({
       type: z.literal('progress'),
       requestId: z.string().min(1),
@@ -130,7 +158,14 @@ export const BrowserEventSchema = z
     CapabilitiesSchema.extend({ type: z.literal('capabilities'), requestId: z.string().min(1) }),
     ModelObservationSchema.extend({ type: z.literal('models'), requestId: z.string().min(1) }),
   ])
-  .and(z.object({ eventId: z.string().max(100).optional() }))
+  .and(
+    z.object({
+      eventId: z.string().max(100).optional(),
+      nativeUserMessageId: z.string().uuid().optional(),
+      terminalEvidence: z.boolean().optional(),
+      preDispatch: z.boolean().optional(),
+    }),
+  )
 export type BrowserRequest = z.infer<typeof BrowserRequestSchema>
 export type BrowserEvent = z.infer<typeof BrowserEventSchema>
 export type ChatRequest = z.infer<typeof ChatRequestSchema>

@@ -17,8 +17,14 @@ export const StreamArmSchema = z
     newChat: z.boolean().optional(),
     timeoutMs: z.number().int().positive().max(7200000).optional(),
     backgroundJob: z.boolean().optional(),
+    native: z.literal(true).optional(),
+    nativeUserMessageId: z.string().uuid().optional(),
+    conversationId: z.string().uuid().optional(),
+    serverConversationId: z.string().uuid().optional(),
+    clientThreadId: z.string().min(1).max(200).optional(),
   })
   .strict()
+  .refine((v) => !v.native || !!v.nativeUserMessageId)
 export const StreamEventSchema = z
   .object({
     requestId: z.string().min(1).max(200),
@@ -32,12 +38,21 @@ export const StreamEventSchema = z
     fileId: ImageFileIdSchema.optional(),
     downloadUrl: ImageDownloadUrlSchema.optional(),
     imageData: ImageDataSchema.optional(),
+    nativeUserMessageId: z.string().uuid().optional(),
+    terminalEvidence: z.literal(true).optional(),
   })
   .strict()
+  .refine(
+    (v) =>
+      !v.terminalEvidence ||
+      (!!v.nativeUserMessageId &&
+        v.nativeUserMessageId === v.messageId &&
+        (v.kind === 'stop' || v.kind === 'error')),
+  )
 export type StreamEvent = z.infer<typeof StreamEventSchema>
 export type StreamIdentity = Pick<
   StreamEvent,
-  'requestId' | 'messageId' | 'conversationId' | 'projectId'
+  'requestId' | 'messageId' | 'conversationId' | 'projectId' | 'nativeUserMessageId'
 >
 type ObjectValue = Record<string, unknown>
 const object = (v: unknown): v is ObjectValue =>
@@ -118,6 +133,8 @@ export async function observeConversationResponse(
     timeoutMs?: number
     idleTimeoutMs?: number
     backgroundJob?: boolean
+    // Observer-only cancellation: stops decoding this clone, never the native request.
+    signal?: AbortSignal
     onConversationId?: (conversationId: string) => void
     onOutputNode?: (messageId: string) => void
   } = {},
@@ -139,14 +156,21 @@ export async function observeConversationResponse(
   let previous = { c: 0, p: '', o: 'add' }
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
+  let stopListener: () => void = () => {}
   const publish = (kind: StreamEvent['kind'], extra: Partial<StreamEvent> = {}) => {
     const value = StreamEventSchema.parse({ ...identity, conversationId, kind, ...extra })
     emit(value)
   }
+  let terminalFailure = false
   const fail = (code: string) => {
     if (!ended) {
       ended = true
-      publish('error', { code })
+      publish('error', {
+        code,
+        ...(identity.nativeUserMessageId && terminalFailure
+          ? { terminalEvidence: true as const }
+          : {}),
+      })
     }
   }
   const activity = (next = phase) => {
@@ -178,7 +202,15 @@ export async function observeConversationResponse(
     const imageTask = classifyGeneratedImageMessage(m)
     if (imageTask) {
       if (imageTask.id) options.onOutputNode?.(imageTask.id)
-      if (imageTask.error) throw new StreamError(imageTask.error)
+      if (imageTask.error) {
+        // A failed internal image tool can be followed by a visible assistant
+        // explanation or another tool attempt. It cannot release native ownership.
+        if (identity.nativeUserMessageId && imageTask.error === 'image_generation_failed') {
+          imageTasks.delete(imageTask.id)
+          return
+        }
+        throw new StreamError(imageTask.error)
+      }
       imageTasks.set(imageTask.id, imageTask.complete)
       for (const fileId of imageTask.fileIds) {
         if (!generated.has(fileId)) {
@@ -193,10 +225,12 @@ export async function observeConversationResponse(
     if (!isVisibleAssistantOutput(m)) return
     if (typeof m.id === 'string') options.onOutputNode?.(m.id)
     // A failed internal tool/reasoning step does not establish that the final response failed.
-    if (m.status === 'failed' || m.status === 'cancelled')
+    if ((m.status === 'failed' || m.status === 'cancelled') && typeof m.id === 'string') {
+      terminalFailure = !identity.nativeUserMessageId || m.end_turn === true
       throw new StreamError(
         m.status === 'cancelled' ? 'chatgpt_generation_cancelled' : 'chatgpt_generation_failed',
       )
+    }
     if (typeof m.id !== 'string' || !object(m.content)) return
     if (
       m.content.content_type !== 'text' ||
@@ -278,7 +312,7 @@ export async function observeConversationResponse(
       )
         throw new StreamError('response_incomplete')
       ended = true
-      publish('stop')
+      publish('stop', identity.nativeUserMessageId ? { terminalEvidence: true } : {})
       return
     }
     let value: unknown
@@ -313,10 +347,29 @@ export async function observeConversationResponse(
     } else update(value)
   }
   try {
-    if (!response.ok) throw new StreamError('chatgpt_http_error')
+    if (!response.ok) {
+      // These client refusals reject the correlated POST. Timeouts and server
+      // faults can follow possible dispatch and remain unknown.
+      terminalFailure = [400, 401, 402, 403, 404, 405, 409, 413, 415, 422, 429].includes(
+        response.status,
+      )
+      throw new StreamError('chatgpt_http_error')
+    }
     if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body)
       throw new StreamError('unsupported_response_stream')
     reader = response.body.getReader()
+    stopListener = () => {
+      ended = true
+      if (timer) clearTimeout(timer)
+      if (idleTimer) clearTimeout(idleTimer)
+      timer = idleTimer = undefined
+      void reader?.cancel().catch(() => {})
+    }
+    if (options.signal?.aborted) {
+      stopListener()
+      return
+    }
+    options.signal?.addEventListener('abort', stopListener, { once: true })
     if (!options.backgroundJob)
       timer = setTimeout(() => {
         fail('response_stream_timeout')
@@ -371,11 +424,14 @@ export async function observeConversationResponse(
   } catch (error) {
     fail(error instanceof StreamError ? error.message : 'response_stream_interrupted')
   } finally {
+    options.signal?.removeEventListener('abort', stopListener)
     if (timer) clearTimeout(timer)
     if (idleTimer) clearTimeout(idleTimer)
     if (reader) {
       void reader.cancel().catch(() => {})
-      reader.releaseLock()
+      try {
+        reader.releaseLock()
+      } catch {}
     }
   }
 }

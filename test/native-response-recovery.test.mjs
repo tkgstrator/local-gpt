@@ -4,6 +4,91 @@ import { Window } from 'happy-dom';
 import { installPageObserver } from '../src/page-observer.ts';
 import { conversationFinalText, conversationFinalOutput, readConversationGraph } from '../src/conversation-recovery.ts';
 
+test('native exact branch recovery ignores selected current_node but refuses ambiguous descendants', () => {
+  const value = graph(); value.current_node = user;
+  assert.deepEqual(conversationFinalOutput(value, cid, user, { native: true }), { text: 'Recovered final', fileIds: [] });
+  value.mapping[secondAssistant] = { id: secondAssistant, parent: user, message: textMessage(secondAssistant, 'Other branch') };
+  assert.equal(conversationFinalOutput(value, cid, user, { native: true }), null);
+  assert.deepEqual(conversationFinalOutput(value, cid, user, { native: true, messageIds: [assistant] }), { text: 'Recovered final', fileIds: [] });
+});
+
+test('native arms match UUID rather than identical manual text and retain overlapping contexts', async t => {
+  const page = new Window({ url: `https://chatgpt.com/c/${cid}` }); t.after(() => page.close());
+  const events = []; const producers = new Map();
+  page.fetch = async (_input, init) => new Response(new ReadableStream({ start(c) { producers.set(JSON.parse(init.body).messages[0].id, c); } }), { headers: { 'content-type': 'text/event-stream' } });
+  installPageObserver(page); page.addEventListener('localgpt:response-stream', e => events.push(JSON.parse(e.detail)));
+  const arm = (requestId, nativeUserMessageId) => page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm', { detail: JSON.stringify({requestId,text:'same',native:true,nativeUserMessageId,backgroundJob:true}) }));
+  const post = id => page.fetch('/backend-api/f/conversation', {method:'POST',body:JSON.stringify({messages:[{id,author:{role:'user'},content:{parts:['same']}}]})});
+  arm('A',user); arm('B',secondAssistant); await post(cid); await pause(10);
+  assert.equal(events.length,0);
+  await post(user); await post(secondAssistant); await pause(10);
+  assert.deepEqual(events.filter(e=>e.kind==='started').map(e=>e.requestId),['A','B']);
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm',{detail:'A'}));
+  producers.get(secondAssistant).enqueue(new TextEncoder().encode(`data: ${JSON.stringify({conversation_id:cid,message:textMessage(assistant,'B answer')})}\n\ndata: [DONE]\n\n`)); producers.get(secondAssistant).close();
+  await pause(30); assert.equal(events.find(e=>e.kind==='stop')?.requestId,'B');
+  for (const [id,c] of producers) if(id!==secondAssistant)c.close();
+});
+
+test('native new request never borrows visible route for recovery', async t => {
+  const page = new Window({url:`https://chatgpt.com/c/${cid}`}); t.after(()=>page.close()); const calls=[],events=[];
+  page.fetch=async input=>{calls.push(String(input));return brokenSse();}; installPageObserver(page);
+  page.addEventListener('localgpt:response-stream',e=>events.push(JSON.parse(e.detail)));
+  await armRecovery(page,'native-no-route',{native:true,nativeUserMessageId:user,clientThreadId:`local-chatgpt:${cid}`}); await pause(30);
+  assert.ok(events.some(e=>e.kind==='started')); assert.equal(calls.length,1);
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm',{detail:'native-no-route'}));
+});
+
+test('native recovery never replays captured completion authorization headers', async t => {
+  const page = new Window({ url: `https://chatgpt.com/c/${user}` }); t.after(() => page.close());
+  const calls = [], events = [];
+  page.fetch = async (input, init) => { calls.push({ input: String(input), init }); return init?.method === 'POST' ? brokenSse() : jsonResponse(graph()); };
+  const reads = [];
+  installPageObserver(page, { readConversationSnapshot: async (...args) => { reads.push(args); return graph(); } }); page.addEventListener('localgpt:response-stream', e => events.push(JSON.parse(e.detail)));
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm', { detail: JSON.stringify({ requestId: 'no-token-replay', text: 'question', native: true, nativeUserMessageId: user, conversationId: cid, backgroundJob: true }) }));
+  await page.fetch('/backend-api/f/conversation', { method: 'POST', headers: { authorization: 'Bearer captured-test-token', 'chatgpt-account-id': 'captured-account' }, body: JSON.stringify({ conversation_id: cid, messages: [{ id: user, author: { role: 'user' }, content: { parts: ['question'] } }] }) });
+  await pause(50);
+  assert.equal(calls.some(c => c.init?.method === 'GET'), false);
+  assert.deepEqual(reads, [['no-token-replay', user, cid]]);
+  assert.equal(JSON.stringify(events).includes('never-export'), false);
+  assert.equal(events.at(-1)?.kind, 'stop');
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm', { detail: 'no-token-replay' }));
+});
+
+test('native existing CID recovery is independent of the route and validates outgoing CID', async t => {
+  for (const outgoingCid of [cid, user]) {
+    const page = new Window({url:`https://chatgpt.com/c/${user}`}); t.after(()=>page.close());
+    const calls=[],events=[]; page.fetch=async(input,init)=>{calls.push(String(input));return init?.method==='POST'?brokenSse():jsonResponse(graph());};
+    installPageObserver(page, { readConversationSnapshot: async (requestId, messageId, conversationId) => { assert.equal(messageId, user); assert.equal(conversationId, cid); return graph(); } }); page.addEventListener('localgpt:response-stream',e=>events.push(JSON.parse(e.detail)));
+    page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm',{detail:JSON.stringify({requestId:'native-existing',text:'question',native:true,nativeUserMessageId:user,serverConversationId:cid,backgroundJob:true})}));
+    await page.fetch('/backend-api/f/conversation',{method:'POST',body:JSON.stringify({conversation_id:outgoingCid,messages:[{id:user,author:{role:'user'},content:{parts:['question']}}]})}); await pause(30);
+    if(outgoingCid===cid){assert.equal(events.at(-1)?.kind,'stop');assert.equal(calls.length,1);}
+    else {assert.equal(events.at(-1)?.code,'conversation_changed');assert.equal(calls.length,1);}
+    page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm',{detail:'native-existing'}));
+  }
+});
+
+test('native held-open idle SSE uses SDK snapshot and latches final against late SSE', async t => {
+  const page = new Window({url: `https://chatgpt.com/c/${user}`}); t.after(() => page.close());
+  const events = []; let producer; let reads = 0;
+  page.fetch = async (_input, init) => {
+    assert.equal(init.method, 'POST');
+    return new Response(new ReadableStream({ start(c) { producer = c; } }), { headers: {'content-type': 'text/event-stream'} });
+  };
+  installPageObserver(page, {readConversationSnapshot: async (r, u, c) => { reads++; assert.equal(u, user); assert.equal(c, cid); return graph(); }});
+  page.addEventListener('localgpt:response-stream', e => events.push(JSON.parse(e.detail)));
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm', {detail: JSON.stringify({requestId:'idle', text:'question', native:true, nativeUserMessageId:user, serverConversationId:cid, backgroundJob:true})}));
+  await page.fetch('/backend-api/f/conversation', {method:'POST', body: JSON.stringify({conversation_id:cid, messages:[{id:user, author:{role:'user'},content:{parts:['question']}}]})});
+  await pause(20);
+  const now = Date.now; Date.now = () => now() + 660000;
+  try { await pause(1100); } finally { Date.now = now; }
+  assert.equal(reads, 1); assert.equal(events.at(-1)?.kind, 'stop');
+  const count = events.length;
+  producer.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({conversation_id:cid,message:textMessage(assistant,'late wrong answer')})}\n\ndata: [DONE]\n\n`)); producer.close();
+  await pause(30); assert.equal(events.length, count);
+  assert.equal(JSON.stringify(events).includes('never-export'), false);
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm', {detail:'idle'}));
+});
+
 const cid = '6ac07bb1-b2b4-43e8-8304-5424a5cf2ef3';
 const user = 'f5eadb59-b96e-4ef5-9342-2f49d62b3c6f';
 const assistant = '094c6dd5-45d0-4da3-bd50-a79ef778addb';
@@ -281,6 +366,26 @@ const brokenSse = () => new Response('event: delta_encoding\ndata: "v2"\n\n', { 
 async function untilRecovery(events, predicate = () => events.some(e => e.kind === 'stop'), ms = 500) {
   for (let i = 0; i < ms / 10 && !predicate(); i++) await pause(10);
 }
+
+test('native SDK image recovery remains pending when image metadata authentication fails', async t => {
+  const page = new Window({url:`https://chatgpt.com/c/${cid}`}); t.after(()=>page.close());
+  const events=[],calls=[];
+  page.fetch=async(input,init)=>{
+    calls.push(String(input));
+    if(init?.method==='POST')return brokenSse();
+    assert.ok(String(input).includes('/files/download/'));
+    return new Response('',{status:401});
+  };
+  installPageObserver(page,{readConversationSnapshot:async()=>imageGraph(undefined,'final with image')});
+  page.addEventListener('localgpt:response-stream',e=>events.push(JSON.parse(e.detail)));
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm',{detail:JSON.stringify({requestId:'native-image-auth',text:'question',native:true,nativeUserMessageId:user,serverConversationId:cid,backgroundJob:true})}));
+  await page.fetch('/backend-api/f/conversation',{method:'POST',body:JSON.stringify({conversation_id:cid,messages:[{id:user,author:{role:'user'},content:{parts:['question']}}]})});
+  await pause(50);
+  assert.ok(events.some(e=>e.kind==='image_ref'));
+  assert.equal(events.some(e=>e.kind==='stop'||e.kind==='answer'),false);
+  assert.equal(calls.some(c=>c.includes('/backend-api/conversation/')),false);
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm',{detail:'native-image-auth'}));
+});
 
 test('image-only recovery resolves generated refs through exact authenticated GET before one stop', async t => {
   const page = new Window({ url: `https://chatgpt.com/c/${cid}` }); t.after(() => page.close());
@@ -872,4 +977,127 @@ test('page observer recovery GET exports only the final of a native thoughts cha
   assert.equal(requests.filter(r => r.method === 'GET').length, 1);
   assert.equal(events.some(e => e.kind === 'error'), false);
   noPrivateThoughts(events);
+});
+
+
+test('native identity adoption wakes route-independent recovery and foreign receipts cannot adopt', async t => {
+  const page = new Window({url:'https://chatgpt.com/'}); t.after(()=>page.close());
+  const events=[],calls=[];
+  page.fetch=async(input,init)=>{calls.push(String(input));return init?.method==='POST'?brokenSse():jsonResponse(graph());};
+  installPageObserver(page, {readConversationSnapshot: async (_r,u,c) => { assert.equal(u,user); assert.equal(c,cid); return graph(); }}); page.addEventListener('localgpt:response-stream',e=>events.push(JSON.parse(e.detail)));
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm',{detail:JSON.stringify({requestId:'receipt',text:'question',native:true,nativeUserMessageId:user,backgroundJob:true})}));
+  page.dispatchEvent(new page.CustomEvent('localgpt:native-result',{detail:JSON.stringify({kind:'identity',requestId:'receipt',nativeUserMessageId:cid,conversationId:cid})}));
+  page.dispatchEvent(new page.CustomEvent('localgpt:native-result',{detail:JSON.stringify({kind:'identity',requestId:'receipt',nativeUserMessageId:user,clientThreadId:'local-chatgpt:'+user})}));
+  page.dispatchEvent(new page.CustomEvent('localgpt:native-result',{detail:JSON.stringify({kind:'identity',requestId:'receipt',nativeUserMessageId:user,conversationId:cid})}));
+  await page.fetch('/backend-api/f/conversation',{method:'POST',body:JSON.stringify({conversation_id:cid,messages:[{id:user,author:{role:'user'},content:{parts:['question']}}]})});
+  await untilRecovery(events);
+  assert.equal(events.at(-1)?.kind,'stop'); assert.equal(events.at(-1)?.terminalEvidence,true);
+  assert.equal(events.at(-1)?.nativeUserMessageId,user); assert.equal(calls.length,1);
+});
+
+test('native callback and generic stream errors never claim terminal evidence', async () => {
+  const {observeConversationResponse}=await import('../src/conversation-stream.ts');
+  for(const body of ['event: error\ndata: {"error":"failed"}\n\n','data: [DONE]\n\n','event: delta_encoding\ndata: "v2"\n\n']) {
+    const events=[];
+    await observeConversationResponse(new Response(body,{headers:{'content-type':'text/event-stream'}}),{requestId:'unknown',messageId:user,nativeUserMessageId:user,conversationId:cid},e=>events.push(e));
+    assert.ok(events.some(e=>e.kind==='error')); assert.equal(events.some(e=>e.terminalEvidence),false);
+  }
+  for(const status of ['failed','cancelled']) {
+    const events=[],message={...textMessage(assistant,'Failed final'),status};
+    await observeConversationResponse(new Response('data: '+JSON.stringify({conversation_id:cid,message})+'\n\n',{headers:{'content-type':'text/event-stream'}}),{requestId:'terminal',messageId:user,nativeUserMessageId:user,conversationId:cid},e=>events.push(e));
+    assert.equal(events.at(-1)?.kind,'error'); assert.equal(events.at(-1)?.terminalEvidence,true);
+  }
+});
+
+test('native interleaved generated image scopes keep identical file refs isolated by CID', async t => {
+  const page=new Window({url:'https://chatgpt.com/'}); t.after(()=>page.close());
+  const events=[],producers=new Map();
+  page.fetch=async(input,init)=> {
+    if(init?.method==='POST') return new Response(new ReadableStream({start(c){producers.set(JSON.parse(init.body).messages[0].id,c)}}),{headers:{'content-type':'text/event-stream'}});
+    return jsonResponse({download_url:'https://x.oaiusercontent.com/'+new URL(String(input),'https://chatgpt.com').searchParams.get('conversation_id')});
+  };
+  installPageObserver(page);page.addEventListener('localgpt:response-stream',e=>events.push(JSON.parse(e.detail)));
+  for(const [requestId,id,target] of [['image-A',user,cid],['image-B',secondAssistant,assistant]]) {
+    page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm',{detail:JSON.stringify({requestId,text:'question',native:true,nativeUserMessageId:id,conversationId:target,backgroundJob:true})}));
+    await page.fetch('/backend-api/f/conversation',{method:'POST',body:JSON.stringify({conversation_id:target,messages:[{id,author:{role:'user'},content:{parts:['question']}}]})});
+    producers.get(id).enqueue(new TextEncoder().encode('data: '+JSON.stringify({conversation_id:target,message:imageMessage()})+'\n\n'));
+  }
+  await pause(30);
+  await page.fetch('/backend-api/files/download/file_generated?conversation_id='+assistant); await pause(30);
+  assert.deepEqual(events.filter(e=>e.kind==='image').map(e=>e.requestId),['image-B']);
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm',{detail:'image-B'}));
+  await page.fetch('/backend-api/files/download/file_generated?conversation_id='+cid);await pause(30);
+  assert.deepEqual(events.filter(e=>e.kind==='image').map(e=>e.requestId),['image-B','image-A']);
+  for(const p of producers.values())p.close();
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm',{detail:'image-A'}));
+});
+
+
+test('native graph identity recovery does not require a selected current node', () => {
+  const value=graph();delete value.current_node;
+  assert.deepEqual(conversationFinalOutput(value,cid,user,{native:true}),{text:'Recovered final',fileIds:[]});
+  assert.equal(conversationFinalOutput(value,cid,user),null);
+});
+
+test('terminal stream schema requires exact native identity and terminal event kind', async () => {
+  const {StreamEventSchema,StreamArmSchema}=await import('../src/conversation-stream.ts');
+  const base={requestId:'identity',messageId:user,nativeUserMessageId:user,conversationId:cid,kind:'stop',terminalEvidence:true};
+  assert.equal(StreamEventSchema.safeParse(base).success,true);
+  for(const bad of [{...base,kind:'progress'},{...base,nativeUserMessageId:assistant},{...base,nativeUserMessageId:undefined}])assert.equal(StreamEventSchema.safeParse(bad).success,false);
+  assert.equal(StreamArmSchema.safeParse({requestId:'no-native-uuid',text:'question',native:true}).success,false);
+});
+
+test('disarm cancels only the observer clone while the native producer stays open', async t => {
+  const page = new Window({ url: `https://chatgpt.com/c/${cid}` }); t.after(() => page.close());
+  let producer, getCalls = 0, sourceCancelled = false;
+  const encoder = new TextEncoder();
+  page.fetch = async (_input, init) => {
+    if (init?.method !== 'POST') { getCalls++; return new Response('{}'); }
+    return new Response(new ReadableStream({ start(c) { producer = c; }, cancel() { sourceCancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } });
+  };
+  installPageObserver(page, { readConversationSnapshot: async () => graph() });
+  const events = []; page.addEventListener('localgpt:response-stream', e => events.push(JSON.parse(e.detail)));
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-arm', { detail: JSON.stringify({ requestId: 'leak', text: 'q', native: true, nativeUserMessageId: user, backgroundJob: true }) }));
+  const response = await page.fetch('/backend-api/f/conversation', { method: 'POST', body: JSON.stringify({ messages: [{ id: user, author: { role: 'user' }, content: { parts: ['q'] } }] }) });
+  await pause(20);
+  const reader = response.body.getReader();
+  const first = reader.read();
+  producer.enqueue(encoder.encode('event: delta_encoding\ndata: "v1"\n\n'));
+  assert.equal((await first).done, false);
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm', { detail: 'leak' }));
+  page.dispatchEvent(new page.CustomEvent('localgpt:stream-disarm', { detail: 'leak' }));
+  const count = events.length;
+  const realSetTimeout = globalThis.setTimeout; let idleTimers = 0;
+  globalThis.setTimeout = (fn, ms, ...args) => { if (ms === 1000) idleTimers++; return realSetTimeout(fn, ms, ...args); };
+  t.after(() => { globalThis.setTimeout = realSetTimeout; });
+  const next = reader.read();
+  producer.enqueue(encoder.encode(`data: ${JSON.stringify({ conversation_id: cid, message: textMessage(assistant, 'late') })}\n\n`));
+  const chunk = await next;
+  assert.equal(chunk.done, false);
+  assert.equal(sourceCancelled, false);
+  await pause(2300);
+  globalThis.setTimeout = realSetTimeout;
+  assert.equal(idleTimers, 0);
+  assert.equal(events.length, count);
+  producer.enqueue(encoder.encode('data: [DONE]\n\n')); producer.close();
+  await pause(20);
+  assert.equal(events.length, count);
+  assert.equal(sourceCancelled, false);
+});
+
+test('disarm while observer read is pending cancels the clone reader and tolerates repeats', async () => {
+  const { observeConversationResponse } = await import('../src/conversation-stream.ts');
+  let cancelled = false, producer;
+  const body = new ReadableStream({ start(c) { producer = c; }, cancel() { cancelled = true; } });
+  const controller = new AbortController(), events = [];
+  const done = observeConversationResponse(new Response(body, { headers: { 'content-type': 'text/event-stream' } }), { requestId: 'p', messageId: user, conversationId: null }, e => events.push(e), { backgroundJob: true, signal: controller.signal });
+  await pause(10);
+  controller.abort(); controller.abort();
+  await Promise.race([done, pause(500).then(() => { throw new Error('observer did not stop'); })]);
+  assert.equal(cancelled, true);
+  await pause(1100);
+  assert.deepEqual(events, []);
+  const pre = new AbortController(); pre.abort();
+  await observeConversationResponse(new Response(new ReadableStream(), { headers: { 'content-type': 'text/event-stream' } }), { requestId: 'q', messageId: user, conversationId: null }, e => events.push(e), { signal: pre.signal });
+  assert.deepEqual(events, []);
 });

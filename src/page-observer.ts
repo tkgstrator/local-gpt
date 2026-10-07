@@ -1,6 +1,11 @@
 import { installNativeModelSelection } from './model-selection'
-import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
-import { conversationFinalOutput, readConversationGraph } from './conversation-recovery'
+import { DEFAULT_GENERATION_TIMEOUT_MS, PROGRESS_IDLE_TIMEOUT_MS } from './timeouts'
+import {
+  boundedConversationSnapshot,
+  conversationFinalOutput,
+  readConversationGraph,
+} from './conversation-recovery'
+import type { NativeChatDispatcher } from './native-chat'
 import { ProjectIdSchema, parseChatRoute } from './projects'
 import {
   PROJECT_CHECK_EVENT,
@@ -53,9 +58,13 @@ type PageWindow = Pick<
 const submittedText = (text: string) =>
   text.replace(/\r\n?/g, '\n').replace(/^[ \t\n]+|[ \t\n]+$/g, '')
 
-export function installPageObserver(page: PageWindow) {
+export function installPageObserver(
+  page: PageWindow,
+  nativeRecovery?: Pick<NativeChatDispatcher, 'readConversationSnapshot'>,
+) {
   installNativeModelSelection(page)
   type ImageScope = {
+    observerAbort?: AbortController
     identity: StreamIdentity
     refs: Set<string>
     downloads: Map<string, { url: string; conversationId: string | null }>
@@ -71,10 +80,13 @@ export function installPageObserver(page: PageWindow) {
     failed: boolean
   }
   let imageScope: ImageScope | null = null
+  const nativeScopes = new Map<string, ImageScope>()
+  const scopeOwned = (scope: ImageScope) =>
+    scope === imageScope || nativeScopes.get(scope.identity.requestId) === scope
   const publishStream = (event: StreamEvent) =>
     page.dispatchEvent(new page.CustomEvent(STREAM_EVENT, { detail: JSON.stringify(event) }))
   const scopeActive = (scope: ImageScope, cid = scope.identity.conversationId) =>
-    scope === imageScope &&
+    scopeOwned(scope) &&
     !scope.failed &&
     page.location.origin === 'https://chatgpt.com' &&
     Date.now() < Math.min(scope.expires, scope.recoveryDeadline ?? Number.MAX_SAFE_INTEGER) &&
@@ -180,26 +192,65 @@ export function installPageObserver(page: PageWindow) {
     projectArm = null
     projectCheck = null
   })
-  let armed: {
-    requestId: string
-    text: string
-    projectId?: string
-    newChat?: boolean
-    timeoutMs?: number
-    backgroundJob?: boolean
-  } | null = null
+  type Arm = ReturnType<typeof StreamArmSchema.parse>
+  let armed: Arm | null = null
+  const nativeArms = new Map<string, Arm>()
   page.addEventListener(STREAM_ARM_EVENT, (event) => {
     try {
       const parsed = StreamArmSchema.safeParse(JSON.parse((event as CustomEvent<string>).detail))
-      if (parsed.success) {
+      if (!parsed.success) return
+      if (parsed.data.native) {
+        if (
+          nativeArms.has(parsed.data.requestId) ||
+          nativeScopes.has(parsed.data.requestId) ||
+          [...nativeArms.values()].some(
+            (a) => a.nativeUserMessageId === parsed.data.nativeUserMessageId,
+          ) ||
+          [...nativeScopes.values()].some(
+            (a) => a.identity.nativeUserMessageId === parsed.data.nativeUserMessageId,
+          )
+        )
+          return
+        nativeArms.set(parsed.data.requestId, parsed.data)
+      } else {
         armed = parsed.data
         imageScope = null
       }
     } catch {}
   })
   page.addEventListener('localgpt:stream-disarm', (event) => {
-    if ((event as CustomEvent<string>).detail === armed?.requestId) armed = null
-    if ((event as CustomEvent<string>).detail === imageScope?.identity.requestId) imageScope = null
+    const id = (event as CustomEvent<string>).detail
+    if (id === armed?.requestId) armed = null
+    if (id === imageScope?.identity.requestId) {
+      imageScope.observerAbort?.abort()
+      imageScope = null
+    }
+    nativeArms.delete(id)
+    nativeScopes.get(id)?.observerAbort?.abort()
+    nativeScopes.delete(id)
+  })
+  page.addEventListener('localgpt:native-result', (event) => {
+    try {
+      const receipt = JSON.parse((event as CustomEvent<string>).detail)
+      if (receipt.kind !== 'identity') return
+      const arm = nativeArms.get(receipt.requestId)
+      const scope = nativeScopes.get(receipt.requestId)
+      if (
+        receipt.nativeUserMessageId !==
+        (arm?.nativeUserMessageId ?? scope?.identity.nativeUserMessageId)
+      )
+        return
+      const parsed = SubmittedTurnSchema.safeParse({
+        messageId: receipt.nativeUserMessageId,
+        conversationId: receipt.conversationId,
+      })
+      if (!parsed.success || !parsed.data.conversationId) return
+      const expected =
+        arm?.conversationId ?? arm?.serverConversationId ?? scope?.identity.conversationId
+      if (expected && expected !== parsed.data.conversationId) return
+      if (arm) arm.conversationId = parsed.data.conversationId
+      if (scope) scope.identity.conversationId = parsed.data.conversationId
+    } catch {}
   })
   let snapshot = emptyCapabilities()
   let dots: ReturnType<typeof normalizeDots> = null
@@ -498,20 +549,38 @@ export function installPageObserver(page: PageWindow) {
             page.dispatchEvent(
               new page.CustomEvent(TURN_EVENT, { detail: JSON.stringify(parsed.data) }),
             )
+            const selectedArm =
+              [...nativeArms.values()].find(
+                (a) => a.nativeUserMessageId === parsed.data.messageId,
+              ) ?? armed
             if (
-              armed &&
-              Array.isArray(message?.content?.parts) &&
-              submittedText(
-                message.content.parts.filter((part) => typeof part === 'string').join(''),
-              ) === submittedText(armed.text)
+              selectedArm &&
+              (selectedArm.native ||
+                (Array.isArray(message?.content?.parts) &&
+                  submittedText(
+                    message.content.parts.filter((part) => typeof part === 'string').join(''),
+                  ) === submittedText(selectedArm.text)))
             ) {
-              const requestId = armed.requestId
-              const expectedProject = armed.projectId
-              const expectedNewChat = armed.newChat
-              const timeoutMs = armed.timeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS
-              const backgroundJob = armed.backgroundJob === true
+              const arm = selectedArm
+              const requestId = arm.requestId
+              const expectedProject = arm.projectId
+              const expectedNewChat = arm.newChat
+              const timeoutMs = arm.timeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS
+              const backgroundJob = arm.backgroundJob === true
               const observedProject = ProjectIdSchema.safeParse(value.gizmo_id)
-              armed = null
+              if (arm.native) nativeArms.delete(requestId)
+              else armed = null
+              const expectedCid = arm.conversationId ?? arm.serverConversationId
+              if (arm.native && expectedCid && expectedCid !== parsed.data.conversationId) {
+                publishStream({
+                  requestId,
+                  ...parsed.data,
+                  nativeUserMessageId: arm.nativeUserMessageId,
+                  kind: 'error',
+                  code: 'conversation_changed',
+                })
+                return
+              }
               if (expectedNewChat && value.conversation_id != null) {
                 publishStream({
                   requestId,
@@ -536,6 +605,7 @@ export function installPageObserver(page: PageWindow) {
               const identity: StreamIdentity = {
                 requestId,
                 ...parsed.data,
+                ...(arm.native ? { nativeUserMessageId: arm.nativeUserMessageId } : {}),
                 ...(observedProject.success ? { projectId: observedProject.data } : {}),
               }
               const scope: ImageScope = {
@@ -551,22 +621,28 @@ export function installPageObserver(page: PageWindow) {
                 expires: backgroundJob ? Number.MAX_SAFE_INTEGER : Date.now() + timeoutMs + 5000,
                 holdImages: false,
                 failed: false,
+                observerAbort: new AbortController(),
               }
-              imageScope = scope
+              if (arm.native) nativeScopes.set(requestId, scope)
+              else imageScope = scope
               let observedConversationId: string | null = null
               let observedText = ''
               const observedNodes = new Set<string>()
               let recovering = false
-              const nativeHeaders = new page.Headers(
-                init?.headers ?? (input instanceof page.Request ? input.headers : undefined),
-              )
-              const recoveryHeaders = privateHeaders(nativeHeaders)
+              let terminal = false
+              // Native graphs use the owned authenticated SDK loader; image reads
+              // never replay completion tokens. Legacy recovery keeps its headers.
+              const recoveryHeaders = arm.native
+                ? new page.Headers()
+                : privateHeaders(
+                    init?.headers ?? (input instanceof page.Request ? input.headers : undefined),
+                  )
               const recover = async () => {
                 const deadline = backgroundJob ? scope.expires : scope.expires - 5000
                 scope.recoveryDeadline = deadline
-                while (Date.now() < deadline) {
+                while (!terminal && Date.now() < deadline) {
                   if (
-                    scope !== imageScope ||
+                    !scopeOwned(scope) ||
                     Date.now() > scope.expires ||
                     page.location.origin !== 'https://chatgpt.com'
                   )
@@ -574,40 +650,59 @@ export function installPageObserver(page: PageWindow) {
                   const route = parseChatRoute(page.location.pathname)
                   const cid =
                     observedConversationId ??
-                    (!route?.provisionalId ? route?.conversationId : null) ??
+                    (arm.native
+                      ? identity.conversationId
+                      : !route?.provisionalId
+                        ? route?.conversationId
+                        : null) ??
                     null
                   if (cid && (!identity.conversationId || identity.conversationId === cid)) {
                     try {
-                      const response = await original.call(
-                        page,
-                        `https://chatgpt.com/backend-api/conversation/${cid}`,
-                        {
-                          method: 'GET',
-                          headers: recoveryHeaders,
-                          credentials: 'include',
-                          redirect: 'error',
-                          signal: AbortSignal.timeout(
-                            Math.min(15000, Math.max(1, deadline - Date.now())),
+                      let graph: unknown
+                      if (arm.native) {
+                        if (!nativeRecovery || !identity.nativeUserMessageId) return
+                        graph = boundedConversationSnapshot(
+                          await nativeRecovery.readConversationSnapshot(
+                            requestId,
+                            identity.nativeUserMessageId,
+                            cid,
                           ),
-                        },
-                      )
-                      if (!scopeActive(scope)) {
-                        await response.body?.cancel().catch(() => {})
-                        return
+                        )
+                      } else {
+                        const response = await original.call(
+                          page,
+                          `https://chatgpt.com/backend-api/conversation/${cid}`,
+                          {
+                            method: 'GET',
+                            headers: recoveryHeaders,
+                            credentials: 'include',
+                            redirect: 'error',
+                            signal: AbortSignal.timeout(
+                              Math.min(15000, Math.max(1, deadline - Date.now())),
+                            ),
+                          },
+                        )
+                        if (!scopeActive(scope)) {
+                          await response.body?.cancel().catch(() => {})
+                          return
+                        }
+                        graph = await readConversationGraph(response)
                       }
-                      const output = conversationFinalOutput(
-                        await readConversationGraph(response),
-                        cid,
-                        identity.messageId,
-                        { text: observedText, fileIds: scope.refs, messageIds: observedNodes },
-                      )
-                      if (!scopeActive(scope)) return
+                      if (terminal || !scopeActive(scope)) return
+                      const output = conversationFinalOutput(graph, cid, identity.messageId, {
+                        native: arm.native,
+                        text: observedText,
+                        fileIds: scope.refs,
+                        messageIds: observedNodes,
+                      })
+                      if (terminal || !scopeActive(scope)) return
                       if (output && 'error' in output) {
                         publish({
                           ...identity,
                           conversationId: cid,
                           kind: 'error',
                           code: output.error,
+                          ...(arm.native ? { terminalEvidence: true as const } : {}),
                         })
                         return
                       }
@@ -639,7 +734,12 @@ export function installPageObserver(page: PageWindow) {
                         }
                         if (output.text.trim())
                           publish({ ...identity, kind: 'answer', text: output.text })
-                        publish({ ...identity, conversationId: cid, kind: 'stop' })
+                        publish({
+                          ...identity,
+                          conversationId: cid,
+                          kind: 'stop',
+                          ...(arm.native ? { terminalEvidence: true as const } : {}),
+                        })
                         return
                       }
                     } catch {}
@@ -649,21 +749,47 @@ export function installPageObserver(page: PageWindow) {
                   )
                 }
               }
+              let stopHeaderWatch = () => {}
               const publish = (event: StreamEvent) => {
-                if (scope !== imageScope) return
+                if (!scopeOwned(scope) || scope.failed || terminal) return
+                if (
+                  arm.native &&
+                  event.conversationId &&
+                  identity.conversationId &&
+                  event.conversationId !== identity.conversationId
+                ) {
+                  scope.failed = true
+                  stopHeaderWatch()
+                  publishStream({ ...identity, kind: 'error', code: 'conversation_changed' })
+                  return
+                }
+                if (
+                  arm.native &&
+                  event.kind === 'progress' &&
+                  event.phase === 'unresponsive' &&
+                  !recovering
+                ) {
+                  recovering = true
+                  void recover()
+                }
+                if (event.kind === 'stop' || (event.kind === 'error' && event.terminalEvidence)) {
+                  terminal = true
+                  stopHeaderWatch()
+                }
                 if (event.kind === 'answer') observedText = event.text ?? observedText
                 if (
                   event.kind === 'error' &&
-                  [
-                    'unsupported_response_stream',
-                    'unsupported_response_content',
-                    'response_incomplete',
-                    'response_stream_interrupted',
-                    'response_stream_timeout',
-                    'response_stream_too_large',
-                    'unsupported_image_asset',
-                    'too_many_generated_images',
-                  ].includes(event.code ?? '')
+                  ((arm.native && !event.terminalEvidence) ||
+                    [
+                      'unsupported_response_stream',
+                      'unsupported_response_content',
+                      'response_incomplete',
+                      'response_stream_interrupted',
+                      'response_stream_timeout',
+                      'response_stream_too_large',
+                      'unsupported_image_asset',
+                      'too_many_generated_images',
+                    ].includes(event.code ?? ''))
                 ) {
                   publishStream({
                     ...event,
@@ -686,20 +812,69 @@ export function installPageObserver(page: PageWindow) {
                 publishImages(scope)
               }
               publish({ ...identity, kind: 'started' })
+              // Native POSTs whose headers never arrive have no body idle monitor yet:
+              // publish unresponsive once so the guarded exact UID-CID recovery starts.
+              let headersSettled = false
+              let headerWatch: ReturnType<typeof page.setTimeout> | undefined
+              stopHeaderWatch = () => {
+                headersSettled = true
+                if (headerWatch !== undefined) page.clearTimeout(headerWatch)
+                headerWatch = undefined
+                scope.observerAbort?.signal.removeEventListener('abort', stopHeaderWatch)
+              }
+              if (arm.native) {
+                scope.observerAbort?.signal.addEventListener('abort', stopHeaderWatch, {
+                  once: true,
+                })
+                const headerStart = Date.now()
+                const tick = () => {
+                  headerWatch = undefined
+                  if (
+                    headersSettled ||
+                    terminal ||
+                    recovering ||
+                    scope.failed ||
+                    scope.observerAbort?.signal.aborted ||
+                    !scopeOwned(scope) ||
+                    Date.now() > scope.expires
+                  ) {
+                    stopHeaderWatch()
+                    return
+                  }
+                  if (Date.now() - headerStart >= PROGRESS_IDLE_TIMEOUT_MS) {
+                    publish({ ...identity, kind: 'progress', phase: 'unresponsive' })
+                    return
+                  }
+                  headerWatch = page.setTimeout(tick, 1000)
+                }
+                headerWatch = page.setTimeout(tick, 1000)
+              }
               void result
-                .then((response) =>
-                  observeConversationResponse(response.clone(), identity, publish, {
+                .then((response) => {
+                  stopHeaderWatch()
+                  if (
+                    arm.native &&
+                    (terminal ||
+                      scope.failed ||
+                      !scopeOwned(scope) ||
+                      scope.observerAbort?.signal.aborted ||
+                      Date.now() > scope.expires)
+                  )
+                    return
+                  return observeConversationResponse(response.clone(), identity, publish, {
                     timeoutMs,
                     backgroundJob,
+                    signal: scope.observerAbort?.signal,
                     onConversationId: (cid) => {
                       observedConversationId = cid
                     },
                     onOutputNode: (id) => {
                       observedNodes.add(id)
                     },
-                  }),
-                )
+                  })
+                })
                 .catch(() => {
+                  stopHeaderWatch()
                   publish({
                     ...identity,
                     kind: 'error',
@@ -721,14 +896,27 @@ export function installPageObserver(page: PageWindow) {
       url.origin === 'https://chatgpt.com'
         ? /^\/backend-api\/files\/download\/(file[_-][a-zA-Z0-9_-]+)$/.exec(url.pathname)
         : null
-    const scope = imageScope
+    const eligible = [...nativeScopes.values()].filter((s) => scopeActive(s))
+    const passiveFile =
+      fileDownload?.[1] ??
+      (url.pathname === '/backend-api/estuary/content' ? url.searchParams.get('id') : null)
+    const passiveCid = url.searchParams.get('conversation_id')
+    const matches = eligible.filter(
+      (s) =>
+        passiveFile &&
+        s.refs.has(passiveFile) &&
+        (!passiveCid || passiveCid === s.identity.conversationId),
+    )
+    const scope = matches.length === 1 ? matches[0] : matches.length ? null : imageScope
     if (fileDownload && scope && Date.now() < scope.expires) {
       const fileId = ImageFileIdSchema.safeParse(fileDownload[1])
       const conversationId = url.searchParams.get('conversation_id')
       if (fileId.success && !scope.metadataPending.has(fileId.data)) {
-        const headers = privateHeaders(
-          init?.headers ?? (input instanceof page.Request ? input.headers : undefined),
-        )
+        const headers = scope.identity.nativeUserMessageId
+          ? new page.Headers()
+          : privateHeaders(
+              init?.headers ?? (input instanceof page.Request ? input.headers : undefined),
+            )
         const task = observePassive(scope, async (signal) => {
           const response = await result
           if (signal.aborted || !scopeActive(scope)) return

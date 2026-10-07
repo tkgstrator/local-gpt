@@ -1,4 +1,4 @@
-import { createResponseJobStore, ResponseJobStorageError } from './response-jobs'
+import { createResponseJobStore, ResponseJobStorageError, type ResponseJob } from './response-jobs'
 import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
 import { createImageStore } from './generated-images'
 import { MAX_GENERATED_IMAGES, type GeneratedImage } from './generated-image-protocol'
@@ -11,7 +11,7 @@ import { createMcpServer } from './mcp'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ResponsesRequestSchema, toChatRequest, createResponsesWriter } from './responses'
 import { createServer } from 'node:http'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Server } from 'bun'
@@ -22,6 +22,7 @@ interface BrowserSocket {
 interface SocketData {
   client: BrowserSocket | null
   lane: BrowserLane
+  nativeProtocol?: boolean
 }
 interface BrowserLane {
   id: string
@@ -29,6 +30,12 @@ interface BrowserLane {
   pending: Pending | null
   polling: { id: string; seenAt: number } | null
   queued: BrowserRequest | null
+  nativeReady: boolean
+  nativeAdvertised: boolean
+  readinessRequestId?: string
+  readinessRetryAt?: number
+  readinessRetryTimer?: ReturnType<typeof setTimeout>
+  nativeQueue: BrowserRequest[]
 }
 import {
   BrowserEventSchema,
@@ -44,6 +51,7 @@ interface Options {
   timeoutMs: number
   bridgeToken?: string
   pollingLeaseMs?: number
+  nativeReadinessTimeoutMs?: number
   updateLeaseMs?: number
   responseJobsDir?: string
   sessionsFile?: string
@@ -69,6 +77,7 @@ interface GenerationSink {
   }): void
   progress?(phase: 'processing' | 'thinking' | 'answering' | 'unresponsive'): void
   backgroundJob?: boolean
+  jobId?: string
 }
 interface Pending {
   requestId: string
@@ -81,7 +90,9 @@ interface Pending {
 }
 export function createService(options: Options) {
   const jobs = createResponseJobStore({ dir: options.responseJobsDir })
-  const restoredUnknown = jobs.activeCount() > 0
+  const restoredUnknown = jobs
+    .list()
+    .some((job) => job.status === 'in_progress' && job.context?.mode !== 'native')
   const sessions = createSessionStore(options.sessionsFile)
   const imagesStore = createImageStore(
     options.imagesDir ?? resolve('.localgpt-images'),
@@ -92,9 +103,49 @@ export function createService(options: Options) {
   const http = createServer(app)
   let wsServer: Server<SocketData> | null = null
   const lanes = new Map<string, BrowserLane>()
-  const handledRequests = new Set<string>()
+  const handledRequests = new Map<string, Set<string>>()
+  type NativeContext = NonNullable<ResponseJob['context']>
+  interface NativeGeneration {
+    jobId: string
+    context: NativeContext
+    event?: (event: BrowserEvent) => Promise<boolean>
+    detached?: () => void
+    chain: Promise<unknown>
+    durableIntent?: boolean
+    durableIdentity?: boolean
+    localRefusal?: (code: string, message: string) => void
+  }
+  const nativeGenerations = new Map<string, NativeGeneration>()
+  const nativeSessionOwners = new Map<string, string>()
+  const nativeConversationOwners = new Map<string, string>()
+  const receiptKey = (event: BrowserEvent) => {
+    // eventId identifies one transport ACK attempt, not the durable receipt.
+    const { eventId: _eventId, ...receipt } = event
+    return createHash('sha256').update(JSON.stringify(receipt)).digest('hex')
+  }
+  for (const job of jobs.list()) {
+    const context = job.context
+    if (context?.mode !== 'native' || !context.nativeUserMessageId) continue
+    if (job.status === 'in_progress') {
+      nativeGenerations.set(context.requestId, {
+        jobId: job.id,
+        context,
+        chain: Promise.resolve(),
+        durableIntent:
+          context.lifecycle === 'possible_dispatch' || context.lifecycle === 'identified',
+        durableIdentity:
+          context.lifecycle === 'identified' && Boolean(context.serverConversationId),
+      })
+      if (context.sessionId) nativeSessionOwners.set(context.sessionId, context.requestId)
+      const cid = context.serverConversationId ?? context.conversationId
+      if (cid) nativeConversationOwners.set(cid, context.requestId)
+    } else if (context.receipts?.length) {
+      handledRequests.set(context.browserId + '/' + context.requestId, new Set(context.receipts))
+    }
+  }
   const dotOwners = new Map<string, string>()
-  let sharedBrowserId: string | null = null
+  let sharedBrowserId: string | null =
+    nativeGenerations.values().next().value?.context.browserId ?? null
   let updateLease: { browserId: string; expiresAt: number; known: Set<string> } | null = null
   const browserUpdating = () => {
     if (updateLease && updateLease.expiresAt <= Date.now()) updateLease = null
@@ -103,7 +154,16 @@ export function createService(options: Options) {
   const laneFor = (id: string) => {
     let lane = lanes.get(id)
     if (!lane) {
-      lane = { id, browser: null, pending: null, polling: null, queued: null }
+      lane = {
+        id,
+        browser: null,
+        pending: null,
+        polling: null,
+        queued: null,
+        nativeReady: false,
+        nativeAdvertised: false,
+        nativeQueue: [],
+      }
       lanes.set(id, lane)
     }
     return lane
@@ -112,13 +172,20 @@ export function createService(options: Options) {
   const browserBusy = () =>
     browserUpdating() ||
     restoredUnknown ||
+    nativeGenerations.size > 0 ||
     [...lanes.values()].some((lane) => lane.pending !== null || lane.queued !== null)
   const busyMessage =
     'LocalGPT is processing another browser operation. Wait for it to finish before retrying.'
   const availableLane = () => {
-    const shared = sharedBrowserId ? lanes.get(sharedBrowserId) : undefined
+    const shared = sharedBrowserId ? laneFor(sharedBrowserId) : undefined
     // Keep ownership during navigation/reconnection; never move an in-flight request.
-    if (shared && (connected(shared) || shared.pending)) return shared
+    if (
+      shared &&
+      (connected(shared) ||
+        shared.pending ||
+        [...nativeGenerations.values()].some((record) => record.context.browserId === shared.id))
+    )
+      return shared
     const replacement = [...lanes.values()].find((lane) => connected(lane))
     sharedBrowserId = replacement?.id ?? null
     return replacement ?? laneFor('disconnected')
@@ -127,12 +194,53 @@ export function createService(options: Options) {
   app.use(express.json({ limit: '1mb' }))
   const wsConnected = (lane: BrowserLane) => lane.browser?.readyState === 1
   const pollingLeaseMs = options.pollingLeaseMs ?? 5000
+  const clearReadinessProbe = (lane: BrowserLane) => {
+    clearTimeout(lane.readinessRetryTimer)
+    lane.readinessRetryTimer = undefined
+    lane.readinessRequestId = undefined
+    lane.readinessRetryAt = 0
+  }
+  const beginReadinessProbe = (lane: BrowserLane): BrowserRequest => {
+    clearReadinessProbe(lane)
+    const requestId = randomUUID()
+    lane.readinessRequestId = requestId
+    lane.readinessRetryTimer = setTimeout(() => {
+      if (lane.readinessRequestId !== requestId || lane.nativeReady) return
+      clearReadinessProbe(lane)
+      if (wsConnected(lane)) lane.browser!.send(JSON.stringify(beginReadinessProbe(lane)))
+    }, options.nativeReadinessTimeoutMs ?? 15000)
+    lane.readinessRetryTimer.unref()
+    return { type: 'native_readiness', requestId }
+  }
   const pollingConnected = (lane: BrowserLane) =>
     lane.polling !== null &&
     Date.now() - lane.polling.seenAt < (lane.pending?.navigating ? 20000 : pollingLeaseMs)
   const expireLane = (lane: BrowserLane) => {
     if (lane.polling && !pollingConnected(lane)) {
       lane.polling = null
+      lane.nativeReady = false
+      clearReadinessProbe(lane)
+      for (const request of [...lane.nativeQueue]) {
+        const record = nativeGenerations.get(request.requestId)
+        if (!record || record.context.lifecycle !== 'pre_dispatch' || record.durableIntent) continue
+        const error = {
+          code: 'native_dispatch_undelivered',
+          message:
+            'The polling connection expired before this request was delivered; the native SDK was not invoked.',
+        }
+        const context = { ...record.context, lifecycle: 'terminal' as const }
+        try {
+          jobs.terminalChecked(record.jobId, context, { error })
+        } catch {
+          jobs.progress(record.jobId, 'unresponsive')
+          continue
+        }
+        record.context = context
+        record.localRefusal?.(error.code, error.message)
+        releaseNative(record)
+      }
+      for (const record of nativeGenerations.values())
+        if (record.context.browserId === lane.id) jobs.progress(record.jobId, 'unresponsive')
       const undelivered = lane.pending && lane.queued?.requestId === lane.pending.requestId
       lane.queued = null
       if (undelivered)
@@ -149,7 +257,12 @@ export function createService(options: Options) {
   const expirePolling = () => {
     for (const lane of lanes.values()) {
       expireLane(lane)
-      if (!connected(lane) && !lane.pending) lanes.delete(lane.id)
+      if (
+        !connected(lane) &&
+        !lane.pending &&
+        ![...nativeGenerations.values()].some((record) => record.context.browserId === lane.id)
+      )
+        lanes.delete(lane.id)
     }
   }
   const leaseTimer = setInterval(expirePolling, Math.min(1000, Math.max(10, pollingLeaseMs / 2)))
@@ -292,6 +405,9 @@ export function createService(options: Options) {
       browserConnected: active.length > 0,
       transport: wsConnected(shared) ? 'websocket' : pollingConnected(shared) ? 'http' : null,
       busy: browserBusy(),
+      nativeReady: shared.nativeReady,
+      activeGenerations: nativeGenerations.size,
+      canStartIndependentGeneration: shared.nativeReady && !nativeBlocked() && connected(shared),
       updating: browserUpdating(),
       browsers: active.length,
       sharedBrowserId: connected(shared) || shared.pending ? shared.id : null,
@@ -412,7 +528,10 @@ export function createService(options: Options) {
       return
     }
     expirePolling()
-    if ([...lanes.values()].some((lane) => lane.pending?.sessionId === session.id)) {
+    if (
+      nativeSessionOwners.has(session.id) ||
+      [...lanes.values()].some((lane) => lane.pending?.sessionId === session.id)
+    ) {
       res.status(409).json({ error: { code: 'browser_busy', message: busyMessage } })
       return
     }
@@ -549,6 +668,7 @@ export function createService(options: Options) {
     }
     if (
       restoredUnknown ||
+      nativeGenerations.size > 0 ||
       [...lanes.values()].some((l) => l.pending !== null || l.queued !== null)
     ) {
       res.json({ ready: false, reason: 'browser_busy' })
@@ -561,14 +681,24 @@ export function createService(options: Options) {
     }
     res.json({ ready: true })
   })
-  app.post('/bridge/poll', (_req, res) => {
+  app.post('/bridge/poll', (req, res) => {
     const lane = res.locals.lane as BrowserLane
     if (
       browserUpdating() &&
       (updateLease!.browserId === lane.id || !updateLease!.known.has(lane.id))
     )
       updateLease = null
-    const request = lane.queued
+    if (
+      req.body?.nativeProtocol === 1 &&
+      !lane.nativeReady &&
+      !lane.readinessRequestId &&
+      Date.now() >= (lane.readinessRetryAt ?? 0)
+    ) {
+      lane.nativeAdvertised = true
+      res.json({ request: beginReadinessProbe(lane) })
+      return
+    }
+    const request = lane.queued ?? lane.nativeQueue.shift() ?? null
     lane.queued = null
     res.json({ request })
   })
@@ -580,16 +710,7 @@ export function createService(options: Options) {
       return
     }
     const event = parsed.data
-    if (event.type === 'heartbeat') {
-      res.json({ ok: true, accepted: false })
-      return
-    }
-    const matched = event.requestId === lane.pending?.requestId
-    if (matched) {
-      await lane.pending!.event(event)
-      remember(event.requestId)
-    }
-    res.json({ ok: true, accepted: matched || handledRequests.has(event.requestId) })
+    res.json({ ok: true, accepted: await handleBrowserEvent(event, lane) })
   })
   const extensionVersion = (
     JSON.parse(readFileSync(resolve('extension/manifest.json'), 'utf8')) as { version: string }
@@ -620,9 +741,57 @@ export function createService(options: Options) {
   app.get('/', info)
   app.get('/v1/chat/completions', info)
   app.get('/v1/responses', info)
-  const remember = (requestId: string) => {
-    handledRequests.add(requestId)
-    if (handledRequests.size > 1000) handledRequests.delete(handledRequests.values().next().value!)
+  const remember = (lane: BrowserLane, event: Exclude<BrowserEvent, { type: 'heartbeat' }>) => {
+    const key = lane.id + '/' + event.requestId
+    const receipts = handledRequests.get(key) ?? new Set<string>()
+    receipts.add(receiptKey(event))
+    if (receipts.size > 1000) receipts.delete(receipts.values().next().value!)
+    handledRequests.set(key, receipts)
+    if (handledRequests.size > 1000) handledRequests.delete(handledRequests.keys().next().value!)
+  }
+  const handleBrowserEvent = async (event: BrowserEvent, lane: BrowserLane): Promise<boolean> => {
+    if (event.type === 'heartbeat') return false
+    if (event.type === 'native_ready') {
+      if (event.requestId !== lane.readinessRequestId || !connected(lane)) return false
+      lane.nativeReady = event.ready
+      lane.nativeAdvertised = true
+      clearTimeout(lane.readinessRetryTimer)
+      if (!event.ready) {
+        clearReadinessProbe(lane)
+        lane.readinessRetryAt = Date.now() + 1000
+        if (wsConnected(lane))
+          lane.readinessRetryTimer = setTimeout(() => {
+            if (!wsConnected(lane) || lane.nativeReady || lane.readinessRequestId) return
+            lane.browser!.send(JSON.stringify(beginReadinessProbe(lane)))
+          }, 1000)
+        lane.readinessRetryTimer?.unref()
+      }
+      return true
+    }
+    const record = nativeGenerations.get(event.requestId)
+    if (record) {
+      if (
+        record.context.browserId !== lane.id ||
+        event.nativeUserMessageId !== record.context.nativeUserMessageId
+      )
+        return false
+      const handling = record.chain.then(() =>
+        record.event ? record.event(event) : reconcileNative(record, event),
+      )
+      record.chain = handling.catch(() => {})
+      try {
+        return await handling
+      } catch {
+        jobs.progress(record.jobId, 'unresponsive')
+        return false
+      }
+    }
+    if (event.requestId === lane.pending?.requestId) {
+      await lane.pending.event(event)
+      remember(lane, event)
+      return true
+    }
+    return handledRequests.get(lane.id + '/' + event.requestId)?.has(receiptKey(event)) ?? false
   }
   const receiveBrowserMessage = (raw: string | Buffer, lane: BrowserLane) => {
     let value: unknown
@@ -638,18 +807,16 @@ export function createService(options: Options) {
       return
     }
     const event = parsed.data
-    const matched = event.type !== 'heartbeat' && event.requestId === lane.pending?.requestId
-    const handling = matched ? lane.pending!.event(event) : undefined
-    if (matched) remember(event.requestId)
+    const handling = handleBrowserEvent(event, lane)
     if (event.type !== 'heartbeat' && event.eventId)
-      void Promise.resolve(handling)
-        .then(() =>
+      void handling
+        .then((accepted) =>
           lane.browser?.send(
             JSON.stringify({
               type: 'event_ack',
               requestId: event.requestId,
               eventId: event.eventId,
-              accepted: matched || handledRequests.has(event.requestId),
+              accepted,
             }),
           ),
         )
@@ -660,7 +827,7 @@ export function createService(options: Options) {
     expirePolling()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
-    if (browserBusy()) {
+    if (lane.nativeReady ? nativeBlocked() : browserBusy()) {
       error(409, 'browser_busy', busyMessage)
       return
     }
@@ -731,7 +898,7 @@ export function createService(options: Options) {
     expirePolling()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
-    if (browserBusy()) {
+    if (lane.nativeReady ? nativeBlocked() : browserBusy()) {
       error(409, 'browser_busy', busyMessage)
       return
     }
@@ -901,6 +1068,535 @@ export function createService(options: Options) {
       })
     else lane.queued = payload
   })
+  const nativeBlocked = () =>
+    browserUpdating() ||
+    restoredUnknown ||
+    [...lanes.values()].some((lane) => lane.pending !== null || lane.queued !== null)
+  const releaseNative = (record: NativeGeneration) => {
+    const context = record.context
+    nativeGenerations.delete(context.requestId)
+    if (context.sessionId && nativeSessionOwners.get(context.sessionId) === context.requestId)
+      nativeSessionOwners.delete(context.sessionId)
+    for (const [cid, owner] of nativeConversationOwners)
+      if (owner === context.requestId) nativeConversationOwners.delete(cid)
+    const lane = lanes.get(context.browserId)
+    if (lane)
+      lane.nativeQueue = lane.nativeQueue.filter(
+        (request) => request.requestId !== context.requestId,
+      )
+    if (context.receipts?.length)
+      handledRequests.set(context.browserId + '/' + context.requestId, new Set(context.receipts))
+    if (handledRequests.size > 1000) handledRequests.delete(handledRequests.keys().next().value!)
+  }
+  const checkedReceipt = (record: NativeGeneration, event: BrowserEvent) => {
+    const receipt = receiptKey(event)
+    const receipts = record.context.receipts ?? []
+    record.context.receipts = [...new Set([...receipts, receipt])].slice(-1000)
+    jobs.contextChecked(record.jobId, record.context)
+  }
+  const adoptNativeIdentity = (
+    record: NativeGeneration,
+    conversationId?: string,
+    clientThreadId?: string,
+  ) => {
+    if (
+      clientThreadId &&
+      record.context.clientThreadId &&
+      record.context.clientThreadId !== clientThreadId
+    )
+      throw new Error('Native client identity changed')
+    if (conversationId) {
+      const previous = record.context.serverConversationId ?? record.context.conversationId
+      if (previous && previous !== conversationId)
+        throw new Error('Native conversation identity changed')
+      const owner = nativeConversationOwners.get(conversationId)
+      if (owner && owner !== record.context.requestId)
+        throw new Error('Native conversation is reserved')
+      // Reserve before writing or binding: even a failed receipt write cannot permit a competitor.
+      nativeConversationOwners.set(conversationId, record.context.requestId)
+      record.context.serverConversationId = conversationId
+      record.context.conversationId = conversationId
+      record.context.lifecycle = 'identified'
+    }
+    if (clientThreadId) record.context.clientThreadId = clientThreadId
+  }
+  const bindNativeSession = (record: NativeGeneration, projectId?: string) => {
+    const context = record.context
+    if (!context.sessionId) return
+    const session = sessions.get(context.sessionId)
+    if (!session || !context.serverConversationId)
+      throw new Error('Native session identity is unavailable')
+    if (session.projectName && !projectId)
+      throw new Error('Native project membership is unconfirmed')
+    if (session.projectId && projectId !== session.projectId)
+      throw new Error('Native project changed')
+    if (session.projectName && projectId)
+      sessions.setProject(session.id, session.projectName, projectId)
+    sessions.bind(session.id, context.serverConversationId, context.model, context.effort)
+  }
+  const saveNativeImage = async (
+    record: NativeGeneration,
+    event: Extract<BrowserEvent, { type: 'image' }>,
+  ) => {
+    if (
+      !record.durableIdentity ||
+      !record.context.serverConversationId ||
+      record.context.serverConversationId !== event.conversationId
+    )
+      return false
+    let images = record.context.images ?? []
+    const existing = images.find((image) => image.fileId === event.fileId)
+    if (existing && imagesStore.read(existing.id)) {
+      checkedReceipt(record, event)
+      return true
+    }
+    if (existing) {
+      images = images.filter((image) => image.id !== existing.id)
+      record.context.images = images
+    }
+    const pending = record.context.pendingImageIds ?? []
+    if (!pending.includes(event.fileId) && images.length + pending.length >= MAX_GENERATED_IMAGES)
+      return false
+    record.context.pendingImageIds = [...new Set([...pending, event.fileId])]
+    jobs.contextChecked(record.jobId, record.context)
+    const image = event.imageData
+      ? await imagesStore.saveData(event.fileId, event.imageData)
+      : await imagesStore.save(event.fileId, event.downloadUrl!)
+    record.context.images = [...images, image]
+    record.context.pendingImageIds = (record.context.pendingImageIds ?? []).filter(
+      (id) => id !== event.fileId,
+    )
+    checkedReceipt(record, event)
+    return true
+  }
+  const nativeImagesAvailable = (record: NativeGeneration) => {
+    const missing = (record.context.images ?? []).filter((image) => !imagesStore.read(image.id))
+    if (!missing.length) return true
+    record.context.pendingImageIds = [
+      ...new Set([
+        ...(record.context.pendingImageIds ?? []),
+        ...missing.map((image) => image.fileId),
+      ]),
+    ]
+    jobs.contextChecked(record.jobId, record.context)
+    return false
+  }
+  // Restarted native work is recovered only from the owning browser's exact UUID-bound events.
+  const reconcileNative = async (
+    record: NativeGeneration,
+    event: BrowserEvent,
+  ): Promise<boolean> => {
+    if (jobs.get(record.jobId)?.status !== 'in_progress')
+      return record.context.receipts?.includes(receiptKey(event)) ?? false
+    if (event.type === 'native_intent') {
+      if (record.context.lifecycle === 'pre_dispatch')
+        record.context.lifecycle = 'possible_dispatch'
+      checkedReceipt(record, event)
+      record.durableIntent = true
+      return true
+    }
+    if (event.type === 'native_dispatch_refused') {
+      if (
+        !record.durableIntent ||
+        record.durableIdentity ||
+        record.context.lifecycle !== 'possible_dispatch' ||
+        record.context.clientThreadId
+      )
+        return false
+      checkedReceipt(record, event)
+      const context = { ...record.context, lifecycle: 'terminal' as const }
+      jobs.terminalChecked(record.jobId, context, {
+        error: { code: event.code, message: event.message },
+      })
+      record.context = context
+      releaseNative(record)
+      return true
+    }
+    if (event.type === 'native_identity') {
+      if (!record.durableIntent) return false
+      adoptNativeIdentity(record, event.conversationId, event.clientThreadId)
+      checkedReceipt(record, event)
+      if (event.conversationId) record.durableIdentity = true
+      if (record.context.sessionId && event.conversationId)
+        sessions.bind(
+          record.context.sessionId,
+          event.conversationId,
+          record.context.model,
+          record.context.effort,
+        )
+      return true
+    }
+    if (event.type === 'image') return saveNativeImage(record, event)
+    if (event.type === 'answer') {
+      if (!record.durableIdentity) return false
+      jobs.answer(record.jobId, event.text)
+      checkedReceipt(record, event)
+      return true
+    }
+    if (event.type === 'progress') {
+      jobs.progress(record.jobId, event.phase)
+      checkedReceipt(record, event)
+      return true
+    }
+    if (event.type === 'error' && !event.terminalEvidence && !event.preDispatch) {
+      jobs.progress(record.jobId, 'unresponsive')
+      checkedReceipt(record, event)
+      return true
+    }
+    if (event.type === 'stop' && event.terminalEvidence && event.conversationId) {
+      if (!record.durableIdentity || event.conversationId !== record.context.serverConversationId)
+        return false
+      if (record.context.pendingImageIds?.length || !nativeImagesAvailable(record)) return false
+      adoptNativeIdentity(record, event.conversationId)
+      checkedReceipt(record, event)
+      bindNativeSession(record, event.projectId)
+      const writer = createResponsesWriter(() => {}, record.context.requestId, {
+        input: 'Recovered native response',
+        stream: false,
+        store: false,
+        newChat: true,
+        ...(record.context.model ? { model: record.context.model } : {}),
+        ...(record.context.sessionId ? { session_id: record.context.sessionId } : {}),
+      })
+      const context = { ...record.context, lifecycle: 'terminal' as const }
+      jobs.terminalChecked(record.jobId, context, {
+        result: writer.response(
+          jobs.text(record.jobId),
+          'completed',
+          null,
+          record.context.images ?? [],
+        ),
+      })
+      record.context = context
+      releaseNative(record)
+      return true
+    }
+    if (
+      event.type === 'error' &&
+      ((event.terminalEvidence && record.durableIntent) ||
+        (event.preDispatch && record.context.lifecycle === 'pre_dispatch'))
+    ) {
+      checkedReceipt(record, event)
+      const context = { ...record.context, lifecycle: 'terminal' as const }
+      jobs.terminalChecked(record.jobId, context, {
+        error: { code: event.code, message: event.message },
+      })
+      record.context = context
+      releaseNative(record)
+      return true
+    }
+    return false
+  }
+  const generateNative = (
+    lane: BrowserLane,
+    body: ReturnType<typeof ChatRequestSchema.parse>,
+    responsesBody: ReturnType<typeof ResponsesRequestSchema.parse> | null,
+    res: GenerationSink,
+  ) => {
+    const reject = (status: number, code: string, message: string) =>
+      res.status(status).json({ error: { code, message, type: 'browser_api_error' } })
+    if (nativeBlocked()) {
+      reject(409, 'browser_busy', busyMessage)
+      return
+    }
+    if (!lane.nativeReady) {
+      reject(
+        503,
+        'native_unavailable',
+        'Native ChatGPT dispatch is not ready; no request was sent.',
+      )
+      return
+    }
+    if (!connected(lane)) {
+      reject(503, 'browser_disconnected', 'The owning ChatGPT browser is disconnected.')
+      return
+    }
+    const session = body.session_id ? sessions.get(body.session_id) : null
+    if (body.session_id && !session) {
+      reject(404, 'session_not_found', 'Unknown LocalGPT session ID.')
+      return
+    }
+    if (!session && !body.newChat) {
+      reject(
+        400,
+        'native_target_required',
+        'Native continuation requires a session with a validated conversation ID.',
+      )
+      return
+    }
+    const cid = session?.conversationId ?? undefined
+    if (
+      (body.session_id && nativeSessionOwners.has(body.session_id)) ||
+      (cid && nativeConversationOwners.has(cid))
+    ) {
+      reject(409, 'browser_busy', 'This session or conversation already has an owned generation.')
+      return
+    }
+    let files: ReturnType<typeof loadFiles>
+    try {
+      files = loadFiles(body.files)
+    } catch (error) {
+      reject(
+        400,
+        'invalid_attachment',
+        error instanceof Error ? error.message : 'Unable to read attachment.',
+      )
+      return
+    }
+    if (!jobs.durable) {
+      reject(
+        503,
+        'response_job_storage_unavailable',
+        'Native generation requires durable response job storage; no request was sent.',
+      )
+      return
+    }
+    const requestId = randomUUID()
+    const nativeUserMessageId = randomUUID()
+    body = {
+      ...body,
+      model: body.model ?? session?.model ?? undefined,
+      reasoning: body.reasoning ?? (session?.effort ? { effort: session.effort } : undefined),
+      newChat: session ? !session.conversationId : body.newChat,
+    }
+    let jobId: string
+    const context: NativeContext = {
+      requestId,
+      browserId: lane.id,
+      mode: 'native',
+      lifecycle: 'pre_dispatch',
+      nativeUserMessageId,
+      ...(body.session_id ? { sessionId: body.session_id } : {}),
+      ...(cid ? { conversationId: cid, serverConversationId: cid } : {}),
+      ...(body.model ? { model: body.model } : {}),
+      ...(body.reasoning ? { effort: body.reasoning.effort } : {}),
+      ...(session?.projectName ? { projectName: session.projectName } : {}),
+      ...(session?.projectId ? { projectId: session.projectId } : {}),
+      receipts: [],
+    }
+    try {
+      jobId = res.jobId ?? jobs.create(context).id
+      if (res.jobId) jobs.contextChecked(jobId, context)
+    } catch {
+      reject(
+        503,
+        'response_job_storage_unavailable',
+        'Native dispatch intent could not be saved; no request was sent.',
+      )
+      return
+    }
+    const record: NativeGeneration = { jobId, context, chain: Promise.resolve() }
+    nativeGenerations.set(requestId, record)
+    if (body.session_id) nativeSessionOwners.set(body.session_id, requestId)
+    if (cid) nativeConversationOwners.set(cid, requestId)
+    res.admitted?.({
+      requestId,
+      browserId: lane.id,
+      ...(body.session_id ? { sessionId: body.session_id } : {}),
+      ...(cid ? { conversationId: cid } : {}),
+    })
+    res.setHeader('X-Response-Job-Id', jobId)
+    let detached = false
+    let finished = false
+    let text = ''
+    let streamingStarted = false
+    const writer = responsesBody
+      ? createResponsesWriter(
+          (data) => {
+            if (!detached) res.write(data)
+          },
+          requestId,
+          { ...responsesBody, model: body.model, reasoning: body.reasoning },
+        )
+      : null
+    const startStream = () => {
+      if (streamingStarted || detached) return
+      streamingStarted = true
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.flushHeaders()
+      writer?.start()
+    }
+    const failConsumer = (status: number, code: string, message: string) => {
+      if (detached || res.backgroundJob) return
+      if (streamingStarted) {
+        if (writer) writer.fail(text, code, message)
+        else res.write(`data: ${JSON.stringify({ error: { code, message } })}\n\ndata: [DONE]\n\n`)
+        res.end()
+      } else reject(status, code, message)
+      detached = true
+    }
+    const timer = res.backgroundJob
+      ? undefined
+      : setTimeout(() => {
+          jobs.progress(jobId, 'unresponsive')
+          failConsumer(
+            504,
+            'browser_timeout',
+            'Native generation outcome is unknown. Poll the response job; do not resend.',
+          )
+        }, options.timeoutMs)
+    record.detached = () => {
+      detached = true
+      clearTimeout(timer)
+      jobs.progress(jobId, 'unresponsive')
+    }
+    record.localRefusal = (code, message) => {
+      finished = true
+      clearTimeout(timer)
+      failConsumer(503, code, message)
+    }
+    res.on('close', () => {
+      if (!finished) {
+        detached = true
+        clearTimeout(timer)
+      }
+    })
+    record.event = async (event) => {
+      if (finished) return record.context.receipts?.includes(receiptKey(event)) ?? false
+      if (event.type === 'native_dispatch_refused') {
+        const accepted = await reconcileNative(record, event)
+        if (accepted) {
+          finished = true
+          clearTimeout(timer)
+          failConsumer(502, event.code, event.message)
+        }
+        return accepted
+      }
+      if (
+        event.type === 'native_intent' ||
+        event.type === 'native_identity' ||
+        event.type === 'progress'
+      )
+        return reconcileNative(record, event)
+      if (event.type === 'answer') {
+        if (!record.durableIdentity) return false
+        jobs.answer(jobId, event.text)
+        jobs.progress(jobId, 'answering')
+        checkedReceipt(record, event)
+        const previousText = text
+        text = event.text
+        if (body.stream && !detached) {
+          if (!event.text.startsWith(previousText)) {
+            failConsumer(
+              502,
+              'answer_rewritten',
+              'The streamed answer changed; poll the response job.',
+            )
+            return true
+          }
+          startStream()
+          const delta = event.text.slice(previousText.length)
+          if (delta && writer) writer.delta(delta)
+          else if (delta)
+            res.write(
+              `data: ${JSON.stringify({ id: requestId, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`,
+            )
+        }
+        return true
+      }
+      if (event.type === 'image') return saveNativeImage(record, event)
+      if (event.type === 'error') {
+        const terminal =
+          (event.terminalEvidence && record.durableIntent) ||
+          (event.preDispatch && record.context.lifecycle === 'pre_dispatch')
+        if (!terminal) {
+          jobs.progress(jobId, 'unresponsive')
+          checkedReceipt(record, event)
+          failConsumer(502, event.code, event.message + ' Poll the response job; do not resend.')
+          return true
+        }
+        checkedReceipt(record, event)
+        const terminalContext = { ...record.context, lifecycle: 'terminal' as const }
+        jobs.terminalChecked(jobId, terminalContext, {
+          error: { code: event.code, message: event.message },
+        })
+        record.context = terminalContext
+        finished = true
+        clearTimeout(timer)
+        releaseNative(record)
+        failConsumer(502, event.code, event.message)
+        return true
+      }
+      if (
+        event.type !== 'stop' ||
+        !event.terminalEvidence ||
+        !event.conversationId ||
+        !record.durableIdentity ||
+        event.conversationId !== record.context.serverConversationId ||
+        record.context.pendingImageIds?.length ||
+        !nativeImagesAvailable(record)
+      )
+        return false
+      adoptNativeIdentity(record, event.conversationId)
+      checkedReceipt(record, event)
+      bindNativeSession(record, event.projectId)
+      const images = record.context.images ?? []
+      const result = writer
+        ? writer.response(text, 'completed', null, images)
+        : {
+            id: requestId,
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: body.model ?? 'browser-selected',
+            session_id: body.session_id ?? null,
+            images,
+            choices: [
+              { index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' },
+            ],
+          }
+      const terminalContext = { ...record.context, lifecycle: 'terminal' as const }
+      jobs.terminalChecked(jobId, terminalContext, { result })
+      record.context = terminalContext
+      finished = true
+      clearTimeout(timer)
+      releaseNative(record)
+      if (!detached && !res.backgroundJob) {
+        if (body.stream) {
+          startStream()
+          if (writer) writer.complete(text, images)
+          else
+            res.write(
+              `data: ${JSON.stringify({ id: requestId, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`,
+            )
+          res.end()
+        } else res.json(result)
+      }
+      return true
+    }
+    const payload: BrowserRequest = {
+      type: 'request',
+      requestId,
+      native: true,
+      nativeUserMessageId,
+      backgroundJob: true,
+      timeoutMs: options.timeoutMs,
+      text: [formatMessages(body.messages), filePrompt(files)].filter(Boolean).join('\n\n'),
+      newChat: body.newChat,
+      ...(files.some((file) => file.mode === 'upload')
+        ? { files: files.filter((file) => file.mode === 'upload') }
+        : {}),
+      ...(body.model ? { model: body.model } : {}),
+      ...(body.reasoning ? { reasoning: body.reasoning } : {}),
+      ...(cid ? { conversationId: cid } : {}),
+      ...(session?.projectName ? { projectName: session.projectName } : {}),
+      ...(session?.projectId ? { projectId: session.projectId } : {}),
+    }
+    // The page must acknowledge native_intent before invoking the completion core.
+    // This pre-dispatch record already reserves the identities; the intent ACK is the possible-send barrier.
+    if (wsConnected(lane))
+      lane.browser!.send(JSON.stringify(payload), (error) => {
+        if (error) {
+          jobs.progress(jobId, 'unresponsive')
+          failConsumer(
+            503,
+            'browser_disconnected',
+            'Native dispatch delivery is uncertain. Poll the job; do not resend.',
+          )
+        }
+      })
+    else lane.nativeQueue.push(payload)
+  }
   const generate = (
     req: Pick<express.Request, 'body' | 'path'>,
     res: GenerationSink,
@@ -929,6 +1625,10 @@ export function createService(options: Options) {
       return
     }
     const lane = availableLane()
+    if (lane.nativeAdvertised) {
+      generateNative(lane, parsed.data, responsesParsed?.success ? responsesParsed.data : null, res)
+      return
+    }
     if (browserBusy()) {
       error(409, 'browser_busy', busyMessage)
       return
@@ -1079,6 +1779,10 @@ export function createService(options: Options) {
         }
         if (lane.pending) lane.pending.navigating = false
         if (
+          event.type === 'native_ready' ||
+          event.type === 'native_intent' ||
+          event.type === 'native_dispatch_refused' ||
+          event.type === 'native_identity' ||
           event.type === 'models' ||
           event.type === 'capabilities' ||
           event.type === 'dots' ||
@@ -1252,9 +1956,29 @@ export function createService(options: Options) {
       return
     }
     expirePolling()
-    if (browserBusy()) {
+    const generationLane = availableLane()
+    if (generationLane.nativeAdvertised ? nativeBlocked() : browserBusy()) {
       res.status(409).json({ error: { code: 'browser_busy', message: busyMessage } })
       return
+    }
+    if (generationLane.nativeAdvertised) {
+      const session = parsed.data.session_id ? sessions.get(parsed.data.session_id) : null
+      if (
+        (parsed.data.session_id && nativeSessionOwners.has(parsed.data.session_id)) ||
+        (session?.conversationId && nativeConversationOwners.has(session.conversationId))
+      ) {
+        res.status(409).json({ error: { code: 'browser_busy', message: busyMessage } })
+        return
+      }
+      if (!generationLane.nativeReady) {
+        res.status(503).json({
+          error: {
+            code: 'native_unavailable',
+            message: 'Native dispatch is not ready; no request was sent.',
+          },
+        })
+        return
+      }
     }
     let job: ReturnType<typeof jobs.create>
     try {
@@ -1300,8 +2024,9 @@ export function createService(options: Options) {
       on() {},
       admitted(context) {
         admitted = true
-        jobs.context(job.id, context)
+        if (jobs.get(job.id)?.context?.mode !== 'native') jobs.context(job.id, context)
       },
+      jobId: job.id,
       backgroundJob: true,
       progress(phase) {
         jobs.progress(job.id, phase)
@@ -1435,7 +2160,16 @@ export function createService(options: Options) {
           const lane = laneFor(id)
           if (connected(lane))
             return new Response('A browser is already connected', { status: 409 })
-          if (server.upgrade(req, { data: { client: null, lane } })) return
+          if (
+            server.upgrade(req, {
+              data: {
+                client: null,
+                lane,
+                nativeProtocol: new URL(req.url).searchParams.get('nativeProtocol') === '1',
+              },
+            })
+          )
+            return
           return new Response('WebSocket upgrade required', { status: 400 })
         },
         websocket: {
@@ -1456,6 +2190,14 @@ export function createService(options: Options) {
             }
             socket.data.client = client
             lane.browser = client
+            lane.nativeReady = false
+            clearReadinessProbe(lane)
+            const nativeProtocol = (socket.data as SocketData & { nativeProtocol?: boolean })
+              .nativeProtocol
+            if (nativeProtocol) {
+              lane.nativeAdvertised = true
+              client.send(JSON.stringify(beginReadinessProbe(lane)))
+            }
             if (lane.queued) {
               const request = lane.queued
               lane.queued = null
@@ -1470,6 +2212,12 @@ export function createService(options: Options) {
             const lane = socket.data.lane
             if (socket.data.client === lane.browser) {
               lane.browser = null
+              lane.nativeReady = false
+              clearReadinessProbe(lane)
+              lane.nativeQueue = []
+              for (const record of nativeGenerations.values())
+                if (record.context.browserId === lane.id)
+                  jobs.progress(record.jobId, 'unresponsive')
               if (lane.pending?.background) lane.pending.suspend?.()
               else if (!lane.pending?.navigating)
                 lane.pending?.fail(503, 'browser_disconnected', 'ChatGPT browser disconnected.')
@@ -1488,6 +2236,8 @@ export function createService(options: Options) {
       return { httpPort: address.port, wsPort: wsServer.port }
     },
     async close() {
+      for (const lane of lanes.values()) clearTimeout(lane.readinessRetryTimer)
+      for (const record of nativeGenerations.values()) record.detached?.()
       jobs.close()
       sessions.close()
       clearInterval(leaseTimer)
@@ -1511,7 +2261,7 @@ if (require.main === module) {
     imagesDir: process.env.LOCALGPT_IMAGES_DIR || resolve('.localgpt-images'),
     imagesHostDir: process.env.LOCALGPT_IMAGES_HOST_DIR,
     localMcp: readLocalMcpConfig(),
-    responseJobsDir: process.env.LOCALGPT_RESPONSE_JOBS_DIR,
+    responseJobsDir: process.env.LOCALGPT_RESPONSE_JOBS_DIR || resolve('.localgpt-response-jobs'),
     sessionsFile: process.env.SESSIONS_FILE || resolve('.localgpt-sessions.sqlite'),
     host: process.env.HOST || '127.0.0.1',
     httpPort: Number(process.env.HTTP_PORT || 8766),
