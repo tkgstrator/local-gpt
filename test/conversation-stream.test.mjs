@@ -225,3 +225,44 @@ test('generation or dalle marked non-image parts forbid partial success beside a
   assert.equal(JSON.stringify(events).includes('Private marker payload'),false);
  }
 });
+
+const thoughtsId='7d0f4f0e-2a61-4a4e-9a52-0f6a3a9b1c11';
+const thoughts=(channel,over={})=>{const m={...message(null),id:thoughtsId,content:{content_type:'thoughts',thoughts:[{summary:'Private thoughts sentinel',content:'Private thoughts sentinel'}]},status:'finished_successfully',end_turn:false,...over};if(channel===undefined)delete m.channel;else m.channel=channel;return m;};
+const finalMessage=()=>({...message(),content:{content_type:'text',parts:['Final answer only']},status:'finished_successfully',end_turn:true});
+const noPrivate=events=>{const s=JSON.stringify(events);assert.equal(s.includes('Private thoughts sentinel'),false);assert.equal(s.includes('Private recap sentinel'),false);};
+test('native thoughts then reasoning recap then final exports only the final and its node',async()=>{
+ for(const channel of [null,undefined]){
+  const nodes=[];
+  const events=await observe(frame(root(thoughts(channel)))+frame(root(recap(channel)))+frame(root(finalMessage()))+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+  assert.equal(events.at(-1).kind,'stop');assert.equal(events.some(e=>e.kind==='error'),false);
+  assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Final answer only']);
+  assert.deepEqual(nodes,[assistant]);noPrivate(events);
+ }
+});
+test('thoughts in any status never fail or complete the stream before a successful final',async()=>{
+ for(const status of ['finished_successfully','in_progress','failed','cancelled']){
+  const nodes=[];
+  const events=await observe(frame(root(thoughts(null,{status})))+frame(root(recap(null)))+frame(root(finalMessage()))+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+  assert.equal(events.at(-1).kind,'stop',status);assert.equal(events.some(e=>e.kind==='error'),false,status);
+  assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Final answer only'],status);
+  assert.deepEqual(nodes,[assistant],status);noPrivate(events);
+ }
+});
+test('delta v1 thoughts patches that omit content type are never answers, output nodes or exports',async()=>{
+ for(const status of ['finished_successfully','failed','cancelled']){
+  const nodes=[];
+  const thoughtsFrames=frame(root({...thoughts(null),content:{content_type:'thoughts',thoughts:[]},status:'in_progress'}))+frame({p:'/message/content/thoughts',o:'append',v:[{summary:'Private thoughts ',content:'Private thoughts sentinel'}]})+frame({v:[{summary:'Private thoughts sentinel'}]})+frame({p:'',o:'patch',v:[{p:'/message/content/thoughts/0/content',o:'append',v:' tail'},{p:'/message/status',o:'replace',v:status}]});
+  const events=await observe(frame('v1','delta_encoding')+thoughtsFrames+deltaRecap()+realFinal()+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+  assert.equal(events.at(-1).kind,'stop',status);assert.equal(events.some(e=>e.kind==='error'),false,status);
+  assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Final answer only'],status);
+  assert.deepEqual(nodes,[assistant],status);noPrivate(events);assert.equal(JSON.stringify(events).includes('Private thoughts'),false);
+ }
+});
+test('a thoughts-only current node never completes the native stream',async()=>{
+ for(const channel of [null,undefined]) for(const end_turn of [false,true]){
+  const nodes=[];
+  const events=await observe(frame(root(thoughts(channel,{id:assistant,end_turn})))+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+  assert.equal(events.at(-1).kind,'error');assert.equal(events.some(e=>e.kind==='stop'||e.kind==='answer'),false);
+  assert.deepEqual(nodes,[]);noPrivate(events);
+ }
+});

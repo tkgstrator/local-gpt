@@ -133,3 +133,51 @@ test('project new-chat readiness waits for old history and refuses restored draf
  w.document.querySelector('[data-message-author-role]').remove();w.document.querySelector('[role="textbox"]').textContent='Restored draft';
  await assert.rejects(openProjectChat(w.document,'LocalGPT',pid,wait,Date.now()+100,()=>{}),e=>e.code==='composer_not_empty');
 });
+const deepRow=(own,extra='')=>`<div id="wrapper5"><div role="listitem" id="item6"><div role="list" id="list7"><div id="foreign-rows"><a href="/c/${foreign}">Other</a>${actionButton('foreign-action')}</div><div id="target-rows"><div role="group" id="group4"><div id="d3"><div id="d2"><div id="d1"><a id="target-link" href="/c/${cid}">Ours</a></div></div></div>${own}</div></div>${extra}</div></div></div>`;
+test('native depth-4 group row selects its own 20x20 actions button despite foreign rows above',async t=>{
+ const {conversationActions,conversationActionOwned}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,deepRow(actionButton('target-action')));
+ w.document.getElementById('target-action').getClientRects=()=>[{width:20,height:20}];
+ assert.equal(conversationActions(w.document,cid),w.document.getElementById('target-action'));
+ assert.equal(conversationActionOwned(w.document,cid,w.document.getElementById('target-action')),true);
+ assert.equal(conversationActionOwned(w.document,cid,w.document.getElementById('foreign-action')),false);
+});
+test('native depth-4 group row without its own action never borrows a button higher up',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,deepRow('',actionButton('higher-action')));
+ assert.equal(conversationActions(w.document,cid),null);
+});
+const chain=(k,extra='')=>{let html=`<a id="target-link" href="/c/${cid}">Ours</a>`;for(let j=1;j<=k;j++)html=`<div>${html}${j===k?extra:''}</div>`;return html;};
+test('a semantic group/listitem row without its own action never borrows a higher unknown Chat actions button',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,`<div role="list"><div role="listitem"><div role="group">${chain(3)}</div></div>${actionButton('higher-unknown')}</div>`);
+ assert.equal(conversationActions(w.document,cid),null);
+});
+test('the action search is capped at eight levels',async t=>{
+ const {conversationActions,conversationActionOwned}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,chain(8,actionButton('ninth-level')));
+ assert.equal(conversationActions(w.document,cid),null);
+ assert.equal(conversationActionOwned(w.document,cid,w.document.getElementById('ninth-level')),false);
+});
+test('deep depth-4 structural ownership remains when a modal hides the row',async t=>{
+ const {conversationActions,conversationActionOwned}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,`<div id="row">${chain(4,actionButton('target-action'))}</div>`);
+ const button=w.document.getElementById('target-action');
+ w.document.getElementById('row').setAttribute('aria-hidden','true');
+ assert.equal(conversationActions(w.document,cid),null);
+ assert.equal(conversationActionOwned(w.document,cid,button),true);
+});
+test('deep duplicate anchors dedupe the one action while distinct deep actions stay ambiguous',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const same=actionsFixture(t,chain(4,`<a href="/c/${cid}">Again</a>${actionButton('target-action')}`));
+ assert.equal(conversationActions(same.document,cid),same.document.getElementById('target-action'));
+ const distinct=actionsFixture(t,`<nav>${chain(4,actionButton('first-action'))}${chain(4,actionButton('second-action'))}</nav>`);
+ assert.throws(()=>conversationActions(distinct.document,cid),e=>e.code==='project_ambiguous');
+});
+test('foreign anchors at depth four through seven are boundaries, including hash and query links',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ for(let k=4;k<=7;k++)for(const href of [`/c/${foreign}`,`/c/${foreign}#main`,`/c/${foreign}?model=x`]){
+  const w=actionsFixture(t,chain(k,`<a href="${href}">Other</a>${actionButton('foreign-action')}`));
+  assert.equal(conversationActions(w.document,cid),null,`${k} ${href}`);
+ }
+});

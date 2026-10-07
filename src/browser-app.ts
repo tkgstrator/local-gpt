@@ -1190,6 +1190,9 @@ class App {
       if (parseChatRoute(location.pathname)?.conversationId !== request.conversationId)
         throw new DomError('conversation_changed', 'Refusing to delete a different conversation.')
     }
+    const headerRoots = ['main', '[data-testid="app-shell-header-context-menu-surface"]']
+    const HEADER_MORE_ROOTS = headerRoots.join(', ')
+    const HEADER_MORE_BUTTONS = headerRoots.map((root) => `${root} button`).join(', ')
     const action = (root: ParentNode, selector: string, name: RegExp) => {
       const matches = [...root.querySelectorAll<HTMLElement>(selector)].filter(
         (node) =>
@@ -1245,7 +1248,7 @@ class App {
       const picked = await this.until(() => {
         const row = conversationActions(document, request.conversationId)
         if (row) return { button: row, row: true }
-        const header = action(document, 'main button', /^(More|その他|その他の操作)$/)
+        const header = action(document, HEADER_MORE_BUTTONS, /^(More|その他|その他の操作)$/)
         return header ? { button: header, row: false } : null
       }, deadline)
       const more = picked.button
@@ -1253,7 +1256,7 @@ class App {
         assertTarget()
         const valid = picked.row
           ? conversationActionOwned(document, request.conversationId, more)
-          : more.isConnected && !!more.closest('main')
+          : more.isConnected && !!more.closest(HEADER_MORE_ROOTS)
         if (!valid)
           throw new DomError(
             'conversation_changed',

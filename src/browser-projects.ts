@@ -272,7 +272,7 @@ function discoverActions(doc: Document, cid: string, visibleOnly: boolean) {
   const found = new Set<HTMLButtonElement>()
   for (const link of links) {
     let level: HTMLElement | null = link
-    for (let i = 0; level && i < 4; i++, level = level.parentElement) {
+    for (let i = 0; level && i < 8; i++, level = level.parentElement) {
       if ([...level.querySelectorAll('a[href]')].some((a) => !owned.has(a))) break
       const buttons = [...level.querySelectorAll<HTMLButtonElement>('button')].filter(
         (el) =>
@@ -283,6 +283,7 @@ function discoverActions(doc: Document, cid: string, visibleOnly: boolean) {
         buttons.forEach((b) => found.add(b))
         break
       }
+      if (/^(group|listitem)$/.test(level.getAttribute('role') ?? '')) break
     }
   }
   return [...found]

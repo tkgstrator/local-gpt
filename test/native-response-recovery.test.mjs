@@ -796,3 +796,80 @@ test('failed native observation recovers the exact submitted turn through GET wi
   assert.equal(JSON.stringify(events).includes('never-export'), false);
   assert.equal(JSON.stringify(events).includes('private-account'), false);
 });
+
+const thoughtsId = '7d0f4f0e-2a61-4a4e-9a52-0f6a3a9b1c11';
+const thoughtsMessage = (channel, over = {}) => {
+  const m = { id: thoughtsId, author: { role: 'assistant' }, channel, recipient: 'all', status: 'finished_successfully', end_turn: false, content: { content_type: 'thoughts', thoughts: [{ summary: 'Private thoughts sentinel', content: 'Private thoughts sentinel' }] }, ...over };
+  if (channel === undefined) delete m.channel;
+  return m;
+};
+const noPrivateThoughts = value => { const s = JSON.stringify(value); assert.equal(s.includes('Private thoughts sentinel'), false); assert.equal(s.includes('Private recap sentinel'), false); };
+
+test('stream and recovery export only the final from a native thoughts, recap, final chain', async () => {
+  const { observeConversationResponse } = await import('../src/conversation-stream.ts');
+  for (const channel of [null, undefined]) for (const status of ['finished_successfully', 'in_progress', 'failed', 'cancelled']) {
+    const chain = [thoughtsMessage(channel, { status }), recapMessage(channel), textMessage(assistant, 'Public final')];
+    const events = [], nodes = [];
+    await observeConversationResponse(new Response(chain.map(message => `data: ${JSON.stringify({conversation_id:cid,message})}\n\n`).join('') + 'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}}), {requestId:'thoughts',messageId:user,conversationId:null}, e=>events.push(e), {onOutputNode:id=>nodes.push(id)});
+    assert.equal(events.at(-1)?.kind,'stop',status); assert.deepEqual(nodes,[assistant],status);
+    assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Public final'],status);
+    noPrivateThoughts(events);
+  }
+});
+
+test('graph recovery exports only the final from a native thoughts, recap, final chain', () => {
+  for (const channel of [null, undefined]) for (const status of ['finished_successfully', 'in_progress', 'failed', 'cancelled']) {
+    const chain = turnGraph([thoughtsMessage(channel, { status }), recapMessage(channel), textMessage(assistant, 'Public final')]);
+    const output = conversationFinalOutput(chain, cid, user);
+    assert.deepEqual(output, { text: 'Public final', fileIds: [] }, status);
+    assert.equal(conversationFinalText(chain, cid, user), 'Public final', status);
+    noPrivateThoughts(output);
+    assert.equal(conversationFinalOutput(chain, cid, user, { messageIds: [thoughtsId] }), null, status);
+  }
+});
+
+test('a thoughts-only current node is never recovered as a successful response', async () => {
+  const { observeConversationResponse } = await import('../src/conversation-stream.ts');
+  for (const channel of [null, undefined]) for (const end_turn of [false, true]) {
+    const only = thoughtsMessage(channel, { id: assistant, end_turn });
+    const events = [];
+    await observeConversationResponse(new Response(`data: ${JSON.stringify({conversation_id:cid,message:only})}\n\n` + 'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}}), {requestId:'thoughts-only',messageId:user,conversationId:null}, e=>events.push(e));
+    assert.equal(events.some(e=>e.kind==='stop'||e.kind==='answer'),false);
+    assert.equal(conversationFinalOutput(turnGraph([only]), cid, user), null);
+    assert.equal(conversationFinalText(turnGraph([only]), cid, user), null);
+  }
+});
+
+test('a malformed actual final after thoughts and recap remains a recovery failure', () => {
+  const final = { ...textMessage(assistant, ''), content: { content_type: 'code', parts: ['terminal output'] } };
+  assert.deepEqual(conversationFinalOutput(turnGraph([thoughtsMessage(null), recapMessage(null), final]), cid, user), { error: 'response_recovery_failed' });
+});
+
+test('an unknown intermediate content type after thoughts still blocks recovery of the final', () => {
+  const unknown = { ...textMessage(secondAssistant, '', false), channel: null, content: { content_type: 'unknown_native_type', parts: ['x'] } };
+  const result = conversationFinalOutput(turnGraph([thoughtsMessage(null), unknown, textMessage(assistant, 'Public final')]), cid, user);
+  assert.deepEqual(result, { error: 'response_recovery_failed' });
+});
+
+test('page observer recovery GET exports only the final of a native thoughts chain without resending', async t => {
+  const page = new Window({ url: `https://chatgpt.com/c/${cid}` });
+  t.after(() => page.close());
+  const requests = [];
+  const chain = turnGraph([thoughtsMessage(null), recapMessage(null), textMessage(assistant, 'Recovered final')]);
+  page.fetch = async (input, init) => {
+    requests.push({ url: String(input), method: init?.method });
+    if (init?.method === 'POST') return brokenSse();
+    return jsonResponse(chain);
+  };
+  installPageObserver(page);
+  const events = [];
+  page.addEventListener('localgpt:response-stream', e => events.push(JSON.parse(e.detail)));
+  await armRecovery(page, 'thoughts-recovery');
+  await untilRecovery(events);
+  assert.deepEqual(events.filter(e => e.kind === 'answer').map(e => e.text), ['Recovered final']);
+  assert.deepEqual(events.at(-1), { requestId: 'thoughts-recovery', messageId: user, conversationId: cid, kind: 'stop' });
+  assert.equal(requests.filter(r => r.method === 'POST').length, 1);
+  assert.equal(requests.filter(r => r.method === 'GET').length, 1);
+  assert.equal(events.some(e => e.kind === 'error'), false);
+  noPrivateThoughts(events);
+});
