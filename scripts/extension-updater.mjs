@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile, lstat, rename, symlink, chmod, unlink } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, lstat, rename, symlink, chmod, unlink, realpath } from 'node:fs/promises';
 import { resolve, dirname, join } from 'node:path';
 import { unzipSync } from 'fflate';
 import { compareVersions } from './extension-release.mjs';
@@ -62,16 +62,29 @@ export async function publishExtension({ extensionPath, stateRoot, release, pair
   if (JSON.stringify(comparableManifest(old)) !== JSON.stringify(comparableManifest(release.manifest)))
     throw new Error('Extension manifest/permission changes require manual approval');
   if (compareVersions(release.manifest.version, old.version) < 0) throw new Error('Refusing an extension downgrade');
+  const current = await lstat(extensionPath);
+  if (!current.isDirectory() || current.isSymbolicLink()) throw new Error('Chrome needs a stable real extension directory');
+  const canonicalRoot = await realpath(extensionPath);
+  // Chromium's content-script loader rejects symlinks resolving outside its root,
+  // even though the manifest and extension-URL resources may still load.
+  const releasesRoot = join(extensionPath, '.localgpt-releases');
+  try { await mkdir(releasesRoot, { mode: 0o700 }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  const releasesDirectory = await lstat(releasesRoot);
+  if (!releasesDirectory.isDirectory() || releasesDirectory.isSymbolicLink())
+    throw new Error('Extension release directory must remain within the Chrome root');
+  await chmod(releasesRoot, 0o700);
   await mkdir(stateRoot, { recursive: true, mode: 0o700 });
   await chmod(stateRoot, 0o700);
-  const releasesRoot = join(stateRoot, 'releases');
-  await mkdir(releasesRoot, { recursive: true, mode: 0o700 });
   const staged = join(releasesRoot, release.manifest.version + '-' + randomUUID());
   await mkdir(staged, { mode: 0o700 });
   for (const [name, bytes] of Object.entries(release.files))
     await writeFile(join(staged, name), name === 'pairing.js' ? pairing : bytes, { mode: 0o600, flag: 'wx' });
-  const current = await lstat(extensionPath);
-  if (!current.isDirectory() || current.isSymbolicLink()) throw new Error('Chrome needs a stable real extension directory');
+  // Validate the complete target before publishing; a rejected stage never replaces
+  // the old pointer, so rollback does not need another fallible pointer switch.
+  for (const name of Object.keys(release.files))
+    if (!(await realpath(join(staged, name))).startsWith(canonicalRoot + '/'))
+      throw new Error('Extension resource escapes the Chrome root');
   const pointer = join(extensionPath, '.localgpt-current');
   let backup = null;
   let installedPointer;

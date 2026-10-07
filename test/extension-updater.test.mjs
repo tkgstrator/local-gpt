@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, lstat, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, lstat, rm, realpath, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { zipSync, strToU8 } from 'fflate';
@@ -51,6 +51,11 @@ test('publishing retains pairing, replaces files together, and preserves the ori
     expect(await readFile(join(extensionPath, 'pairing.js'), 'utf8')).toBe(pairing);
     expect(await readFile(join(extensionPath, 'content.js'), 'utf8')).toBe('console.log("content");');
     expect(await readFile(join(result.backup, 'content.js'), 'utf8')).toBe('old');
+    // Chromium's content-script loader requires every symlink to resolve within its root.
+    const canonicalRoot = await realpath(extensionPath);
+    for (const name of Object.keys(checked(archive()).files))
+      expect((await realpath(join(extensionPath, name))).startsWith(canonicalRoot + '/')).toBe(true);
+    expect((await realpath(result.backup)).startsWith(canonicalRoot + '/')).toBe(true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 test('publishing refuses newly expanded permissions and leaves old files intact', async () => {
@@ -92,5 +97,43 @@ test('a second publication switches the existing link while retaining the local 
     expect(second.backup).toBeNull();
     expect(await readFile(join(extensionPath, 'content.js'), 'utf8')).toBe('second');
     expect(await readFile(join(extensionPath, 'pairing.js'), 'utf8')).toBe(pairing);
+    expect((await realpath(join(extensionPath, 'content.js'))).startsWith((await realpath(extensionPath)) + '/')).toBe(true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('migration repairs an external update pointer without changing pairing or the rollback source', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'localgpt-update-'));
+  try {
+    const extensionPath = join(root, 'installed');
+    const external = join(root, 'state', 'releases', 'legacy');
+    await mkdir(extensionPath);
+    await mkdir(external, { recursive: true });
+    const files = checked(archive()).files;
+    for (const [name, bytes] of Object.entries(files))
+      await writeFile(join(external, name), name === 'pairing.js' ? pairing : bytes);
+    await symlink(external, join(extensionPath, '.localgpt-current'), 'dir');
+    for (const name of Object.keys(files))
+      await symlink('.localgpt-current/' + name, join(extensionPath, name));
+    await publishExtension({ extensionPath, stateRoot: join(root, 'state'), release: checked(archive({ 'content.js': 'repaired' })), pairing });
+    const canonicalRoot = await realpath(extensionPath);
+    for (const name of Object.keys(files))
+      expect((await realpath(join(extensionPath, name))).startsWith(canonicalRoot + '/')).toBe(true);
+    expect(await readFile(join(extensionPath, 'pairing.js'), 'utf8')).toBe(pairing);
+    expect(await readFile(join(extensionPath, 'content.js'), 'utf8')).toBe('repaired');
+    expect(await readFile(join(external, 'content.js'), 'utf8')).toBe('console.log("content");');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('publication refuses a releases directory symlink that would escape the Chrome root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'localgpt-update-'));
+  try {
+    const extensionPath = join(root, 'installed');
+    const external = join(root, 'external');
+    await mkdir(extensionPath);
+    await mkdir(external);
+    await writeFile(join(extensionPath, 'manifest.json'), JSON.stringify({ ...manifest, version: '2.4.13' }));
+    await symlink(external, join(extensionPath, '.localgpt-releases'), 'dir');
+    await expect(publishExtension({ extensionPath, stateRoot: join(root, 'state'), release: checked(archive()), pairing })).rejects.toThrow('Extension release directory must remain within the Chrome root');
+    expect(JSON.parse(await readFile(join(extensionPath, 'manifest.json'), 'utf8')).version).toBe('2.4.13');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
