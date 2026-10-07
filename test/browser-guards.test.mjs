@@ -95,6 +95,73 @@ test('new session follows its submitted message ID when React replaces the user 
  assert.equal(f.events.find(e => e.type === 'answer')?.text, 'Our new answer');
 });
 
+const neighborId='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef4';
+async function sidebarDeleteFixture(t,{receipt=true}={}){
+ const f=await fixture(t,`https://chatgpt.com/c/${target}`);const clicks={target:0,neighbor:0,confirm:0};
+ f.page.document.body.insertAdjacentHTML('beforeend',`<nav id="sidebar"><a id="skip" href="/c/${target}#main">Skip to content</a><div id="neighbor-row"><a href="/c/${neighborId}">Neighbor</a><button id="neighbor-action" aria-label="Chat actions"></button></div><div id="target-row"><a href="/c/${target}">Ours</a><button id="target-action" aria-label="Chat actions"></button></div></nav>`);
+ const doc=f.page.document;
+ doc.getElementById('neighbor-action').addEventListener('click',()=>clicks.neighbor++);
+ doc.getElementById('target-action').addEventListener('click',()=>{
+  clicks.target++;const menu=doc.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';doc.body.append(menu);
+  menu.querySelector('button').addEventListener('click',()=>{menu.remove();const dialog=doc.createElement('div');dialog.setAttribute('role','dialog');dialog.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';doc.body.append(dialog);
+   doc.getElementById('sidebar').setAttribute('aria-hidden','true');
+   dialog.querySelector('button').addEventListener('click',()=>{clicks.confirm++;dialog.remove();doc.getElementById('sidebar').removeAttribute('aria-hidden');doc.getElementById('target-row').remove();f.page.history.pushState({},'','/');if(receipt)f.page.dispatchEvent(new f.page.CustomEvent('localgpt:conversation-deleted',{detail:JSON.stringify({conversationId:target})}));});
+  });
+ });
+ const terminal=async id=>{for(let i=0;i<150;i++){const e=f.events.find(e=>e.requestId===id&&['error','conversation_deleted'].includes(e.type));if(e)return e;await new Promise(r=>setTimeout(r,20));}return undefined;};
+ return {f,clicks,doc,terminal};
+}
+test('built cleanup ignores a skip link and neighbor row, requires the native receipt and removes only the exact target',async t=>{
+ const {f,clicks,doc,terminal}=await sidebarDeleteFixture(t);
+ f.queue({type:'delete_conversation',requestId:'sidebar-delete',conversationId:target});
+ const done=await terminal('sidebar-delete');
+ assert.equal(done?.type,'conversation_deleted',JSON.stringify(done));assert.equal(done.conversationId,target);
+ assert.deepEqual(clicks,{target:1,neighbor:0,confirm:1});
+ assert.ok(doc.getElementById('skip'),'A non-row hash link must not prevent receipt-confirmed deletion');
+ assert.equal(doc.getElementById('target-row'),null);assert.ok(doc.getElementById('neighbor-row'));assert.equal(doc.querySelector(`a[href="/c/${neighborId}"]`)?.textContent,'Neighbor');
+});
+test('built cleanup without the native deletion receipt never reports success or touches the neighbor',async t=>{
+ const {f,clicks,doc}=await sidebarDeleteFixture(t,{receipt:false});
+ f.queue({type:'delete_conversation',requestId:'sidebar-no-receipt',conversationId:target});
+ await new Promise(r=>setTimeout(r,1300));
+ assert.equal(f.events.some(e=>e.type==='conversation_deleted'),false);assert.deepEqual(clicks,{target:1,neighbor:0,confirm:1});assert.ok(doc.getElementById('neighbor-row'));
+});
+test('built cleanup with skip link and neighbor still refuses while a generation is active',async t=>{
+ const {f,clicks,doc}=await sidebarDeleteFixture(t);
+ doc.body.insertAdjacentHTML('beforeend','<button data-testid="stop-button">Stop</button>');
+ f.queue({type:'delete_conversation',requestId:'sidebar-busy',conversationId:target});
+ assert.equal((await f.event('sidebar-busy')).code,'browser_busy');
+ assert.deepEqual(clicks,{target:0,neighbor:0,confirm:0});assert.ok(doc.getElementById('target-row'));assert.ok(doc.getElementById('neighbor-row'));assert.equal(f.events.some(e=>e.type==='conversation_deleted'),false);
+});
+async function rowReuseFixture(t,phase){
+ const f=await fixture(t,`https://chatgpt.com/c/${target}`);const clicks={menu:0,confirm:0};const doc=f.page.document;
+ doc.body.insertAdjacentHTML('beforeend',`<nav id="sidebar"><div id="target-row"><a id="target-link" href="/c/${target}">Ours</a><button id="target-action" aria-label="Chat actions"></button></div></nav>`);
+ const reuse=()=>doc.getElementById('target-link').setAttribute('href',`/c/${neighborId}`);
+ doc.getElementById('target-action').addEventListener('click',()=>{
+  const menu=doc.createElement('div');menu.setAttribute('role','menu');menu.innerHTML='<button role="menuitem">Delete</button>';doc.body.append(menu);
+  if(phase==='action')reuse();
+  menu.querySelector('button').addEventListener('click',()=>{clicks.menu++;menu.remove();
+   const dialog=doc.createElement('div');dialog.setAttribute('role','dialog');dialog.innerHTML='<h2>Delete chat?</h2><button>Delete</button>';doc.body.append(dialog);
+   dialog.querySelector('button').addEventListener('click',()=>clicks.confirm++);
+   if(phase==='menu')reuse();
+  });
+ });
+ return {f,clicks};
+}
+test('built cleanup refuses when the target row is reused for another chat right after its action opens the menu',async t=>{
+ const {f,clicks}=await rowReuseFixture(t,'action');
+ f.queue({type:'delete_conversation',requestId:'row-reuse-action',conversationId:target});
+ const done=await f.event('row-reuse-action');
+ assert.equal(done.code,'conversation_changed');assert.equal(f.page.location.pathname,`/c/${target}`);
+ assert.deepEqual(clicks,{menu:0,confirm:0});assert.equal(f.events.some(e=>e.type==='conversation_deleted'),false);
+});
+test('built cleanup refuses the final confirm when the target row is reused after the Delete menu opens the dialog',async t=>{
+ const {f,clicks}=await rowReuseFixture(t,'menu');
+ f.queue({type:'delete_conversation',requestId:'row-reuse-menu',conversationId:target});
+ const done=await f.event('row-reuse-menu');
+ assert.equal(done.code,'conversation_changed');assert.equal(f.page.location.pathname,`/c/${target}`);
+ assert.equal(clicks.confirm,0);assert.equal(f.events.some(e=>e.type==='conversation_deleted'),false);
+});
 test('cleanup never treats navigation after a failed deletion as success',async t=>{
  const f=await fixture(t,`https://chatgpt.com/c/${target}`);
  f.page.document.body.insertAdjacentHTML('beforeend','<main><button aria-label="More">More</button></main>');

@@ -431,6 +431,45 @@ test('stream and recovery both ignore private context and missing-content assist
   }
 });
 
+const recapMessage = (channel, over = {}) => {
+  const m = { id: secondAssistant, author: { role: 'assistant' }, channel, recipient: 'all', status: 'finished_successfully', end_turn: false, content: { content_type: 'reasoning_recap', content: 'Private recap sentinel' }, ...over };
+  if (channel === undefined) delete m.channel;
+  return m;
+};
+
+test('stream and recovery exclude successful reasoning recap intermediates and export only the final', async () => {
+  const { observeConversationResponse } = await import('../src/conversation-stream.ts');
+  for (const channel of [null, undefined]) {
+    const recap = recapMessage(channel);
+    const final = textMessage(assistant, 'Public final');
+    const events = [], nodes = [];
+    await observeConversationResponse(new Response([recap, final].map(message => `data: ${JSON.stringify({conversation_id:cid,message})}\n\n`).join('') + 'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}}), {requestId:'recap',messageId:user,conversationId:null}, e=>events.push(e), {onOutputNode:id=>nodes.push(id)});
+    assert.equal(events.at(-1)?.kind,'stop'); assert.deepEqual(nodes,[assistant]);
+    assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Public final']);
+    assert.deepEqual(conversationFinalOutput(turnGraph([recap,final]), cid, user), {text:'Public final',fileIds:[]});
+    assert.equal(conversationFinalOutput(turnGraph([recap,final]), cid, user, {messageIds:[secondAssistant]}), null);
+    assert.equal(JSON.stringify(events).includes('Private recap sentinel'),false);
+    assert.equal(JSON.stringify(conversationFinalOutput(turnGraph([recap,final]), cid, user)).includes('Private recap sentinel'),false);
+  }
+});
+
+test('a reasoning recap alone is never recovered as a successful response', async () => {
+  const { observeConversationResponse } = await import('../src/conversation-stream.ts');
+  for (const channel of [null, undefined]) for (const end_turn of [false, true]) {
+    const recap = recapMessage(channel, { id: assistant, end_turn });
+    const events = [];
+    await observeConversationResponse(new Response(`data: ${JSON.stringify({conversation_id:cid,message:recap})}\n\n` + 'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}}), {requestId:'recap-only',messageId:user,conversationId:null}, e=>events.push(e));
+    assert.equal(events.some(e=>e.kind==='stop'||e.kind==='answer'),false);
+    assert.equal(conversationFinalOutput(turnGraph([recap]), cid, user), null);
+    assert.equal(conversationFinalText(turnGraph([recap]), cid, user), null);
+  }
+});
+
+test('a malformed actual final after a reasoning recap remains a recovery failure', () => {
+  const final = { ...textMessage(assistant, ''), content: { content_type: 'code', parts: ['terminal output'] } };
+  assert.deepEqual(conversationFinalOutput(turnGraph([recapMessage(null), final]), cid, user), { error: 'response_recovery_failed' });
+});
+
 test('four file-service images stay within the graph recovery cap', () => {
   const value = imageGraph(['file_first','file_second','file_third','file_fourth']);
   for (const part of value.mapping[toolId].message.content.parts) part.asset_pointer = part.asset_pointer.replace('sediment://', 'file-service://');

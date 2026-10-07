@@ -246,23 +246,54 @@ export async function moveConversationToProject(
     page.dispatchEvent(new page.CustomEvent('localgpt:project-disarm'))
   }
 }
-export function conversationActions(doc: Document, cid: string) {
-  const links = [...doc.querySelectorAll<HTMLAnchorElement>('a[href]')].filter((a) => {
+const ACTIONS_LABEL = /^(Chat actions|チャットの操作|会話の操作)$/
+export function conversationRowLinks(doc: Document, cid: string) {
+  const page = doc.defaultView!
+  return [...doc.querySelectorAll<HTMLAnchorElement>('a[href]')].filter((a) => {
     try {
+      const raw = a.getAttribute('href') ?? ''
+      if (!raw.trim() || raw.includes('#') || raw.includes('?') || a.closest('main, header'))
+        return false
+      const url = new URL(raw, page.location.href)
       return (
-        parseChatRoute(new URL(a.href, doc.defaultView!.location.href).pathname)?.conversationId ===
-        cid
+        url.origin === page.location.origin &&
+        !url.hash &&
+        !url.search &&
+        parseChatRoute(url.pathname)?.conversationId === cid
       )
     } catch {
       return false
     }
   })
+}
+function discoverActions(doc: Document, cid: string, visibleOnly: boolean) {
+  const links = conversationRowLinks(doc, cid)
+  const owned = new Set<Element>(links)
+  const found = new Set<HTMLButtonElement>()
   for (const link of links) {
-    let row: HTMLElement | null = link.parentElement
-    for (let i = 0; row && i < 3; i++, row = row.parentElement) {
-      const button = exact(row, 'button', /^(Chat actions|チャットの操作|会話の操作)$/)
-      if (button) return button
+    let level: HTMLElement | null = link
+    for (let i = 0; level && i < 4; i++, level = level.parentElement) {
+      if ([...level.querySelectorAll('a[href]')].some((a) => !owned.has(a))) break
+      const buttons = [...level.querySelectorAll<HTMLButtonElement>('button')].filter(
+        (el) =>
+          (!visibleOnly || isVisible(el)) &&
+          ACTIONS_LABEL.test((el.getAttribute('aria-label') ?? el.textContent ?? '').trim()),
+      )
+      if (buttons.length) {
+        buttons.forEach((b) => found.add(b))
+        break
+      }
     }
   }
-  return null
+  return [...found]
+}
+export function conversationActions(doc: Document, cid: string) {
+  const found = discoverActions(doc, cid, true)
+  if (found.length > 1)
+    throw new DomError('project_ambiguous', 'Multiple matching conversation actions were found.')
+  return found[0] ?? null
+}
+// Structural ownership only: a modal may hide the sidebar, but the row must not be reused or detached.
+export function conversationActionOwned(doc: Document, cid: string, button: HTMLElement) {
+  return button.isConnected && (discoverActions(doc, cid, false) as HTMLElement[]).includes(button)
 }

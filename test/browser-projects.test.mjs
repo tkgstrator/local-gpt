@@ -50,6 +50,81 @@ test('already grouped URL still requires native membership confirmation',async t
  w.addEventListener('localgpt:project-check',()=>w.dispatchEvent(new w.CustomEvent('localgpt:conversation-project',{detail:JSON.stringify({conversationId:cid,projectId:pid})})));
  await moveConversationToProject(w.document,cid,'LocalGPT',pid,()=>{},wait,Date.now()+100);
 });
+const foreign='6ac1f341-b4b4-83ee-afa2-6726f7913e61';
+const actionsFixture=(t,body)=>{const w=fixture(t);w.document.body.innerHTML=body;return w;};
+const actionButton=id=>`<button id="${id}" aria-label="Chat actions"></button>`;
+test('conversation actions select the exact target row button inside a shared wrapper',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,`<nav id="shared"><div id="foreign-row"><a href="/c/${foreign}">Other</a>${actionButton('foreign-action')}</div><div id="target-row"><a href="/c/${cid}">Ours</a>${actionButton('target-action')}</div></nav>`);
+ assert.equal(conversationActions(w.document,cid),w.document.getElementById('target-action'));
+ assert.equal(conversationActions(w.document,foreign),w.document.getElementById('foreign-action'));
+});
+test('a target row without an action never selects a neighboring conversation action',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,`<nav id="shared"><div id="target-row"><a href="/c/${cid}">Ours</a></div><div id="foreign-row"><a href="/c/${foreign}">Other</a>${actionButton('foreign-action')}</div></nav>`);
+ assert.equal(conversationActions(w.document,cid),null);
+ const nested=actionsFixture(t,`<nav><div><div><span><a href="/c/${cid}">Ours</a></span></div></div><div><a href="/c/${foreign}">Other</a>${actionButton('foreign-action')}</div></nav>`);
+ assert.equal(conversationActions(nested.document,cid),null);
+});
+test('skip, hash, query, external, content and header links to the target never borrow a neighbor action',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const neighbor=`<div id="foreign-row"><a href="/c/${foreign}">Other</a>${actionButton('foreign-action')}</div>`;
+ for(const link of [
+  `<a href="#main">Skip to content</a>`,
+  `<a href="/c/${cid}#main">Skip to target</a>`,
+  `<a href="/c/${cid}?model=x">Query link</a>`,
+  `<a href="https://example.com/c/${cid}">External</a>`,
+  `<a href="https://chatgpt.com.evil.example/c/${cid}">Lookalike</a>`,
+ ]){
+  const w=actionsFixture(t,`<div id="shared">${link}${neighbor}</div>`);
+  assert.equal(conversationActions(w.document,cid),null,link);
+ }
+ const content=actionsFixture(t,`<div id="shared"><main><p>See <a href="/c/${cid}">this chat</a></p></main>${neighbor}</div>`);
+ assert.equal(conversationActions(content.document,cid),null);
+ const header=actionsFixture(t,`<div id="shared"><header><a href="/c/${cid}">Current chat</a></header>${neighbor}</div>`);
+ assert.equal(conversationActions(header.document,cid),null);
+});
+test('an ineligible hash or query link to a neighbor conversation still blocks borrowing that neighbor action',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ for(const href of [`/c/${foreign}#main`,`/c/${foreign}?model=x`]){
+  const w=actionsFixture(t,`<nav id="shared"><div id="target-row"><a href="/c/${cid}">Ours</a></div><div id="foreign-row"><a href="${href}">Other</a>${actionButton('foreign-action')}</div></nav>`);
+  assert.equal(conversationActions(w.document,cid),null,href);
+ }
+});
+test('a non-conversation new chat or project anchor with a foreign action stops the unsafe climb',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ for(const other of [`<a href="/">New chat</a>`,`<a href="/g/${pid}/project">LocalGPT project</a>`]){
+  const w=actionsFixture(t,`<nav id="shared"><div id="target-row"><a href="/c/${cid}">Ours</a></div><div id="other-row">${other}${actionButton('foreign-action')}</div></nav>`);
+  assert.equal(conversationActions(w.document,cid),null,other);
+  const flat=actionsFixture(t,`<nav id="shared"><div><a href="/c/${cid}">Ours</a></div>${other}${actionButton('foreign-action')}</nav>`);
+  assert.equal(conversationActions(flat.document,cid),null,other);
+ }
+});
+test('a skip link beside the real target row still selects only the real row action',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,`<div id="shared"><a href="/c/${cid}#main">Skip</a><div id="foreign-row"><a href="/c/${foreign}">Other</a>${actionButton('foreign-action')}</div><div id="target-row"><a href="/c/${cid}">Ours</a>${actionButton('target-action')}</div></div>`);
+ assert.equal(conversationActions(w.document,cid),w.document.getElementById('target-action'));
+});
+test('duplicate anchors for one action dedupe while distinct target actions remain ambiguous',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const same=actionsFixture(t,`<div id="target-row"><a href="/c/${cid}">Ours</a><a href="/c/${cid}">Ours again</a>${actionButton('target-action')}</div>`);
+ assert.equal(conversationActions(same.document,cid),same.document.getElementById('target-action'));
+ const distinct=actionsFixture(t,`<nav><div><a href="/c/${cid}">Ours</a>${actionButton('first-action')}</div><div><a href="/c/${cid}">Ours</a>${actionButton('second-action')}</div></nav>`);
+ assert.throws(()=>conversationActions(distinct.document,cid),e=>e.code==='project_ambiguous');
+});
+test('project conversation links support an action nested inside the link',async t=>{
+ const {conversationActions}=await import('../src/browser-projects.ts');
+ const w=actionsFixture(t,`<nav><a href="/g/${pid}-localgpt/c/${foreign}">Other${actionButton('foreign-action')}</a><a href="/g/${pid}-localgpt/c/${cid}">Ours${actionButton('target-action')}</a></nav>`);
+ assert.equal(conversationActions(w.document,cid),w.document.getElementById('target-action'));
+});
+test('empty and whitespace hrefs never establish conversation action ownership',async t=>{
+ const {conversationActions,conversationActionOwned}=await import('../src/browser-projects.ts');
+ for(const href of ['', '   ']){
+  const w=actionsFixture(t,`<div><a href="${href}">Not a conversation row</a>${actionButton('unknown-action')}</div>`);
+  assert.equal(conversationActions(w.document,cid),null);
+  assert.equal(conversationActionOwned(w.document,cid,w.document.getElementById('unknown-action')),false);
+ }
+});
 test('project new-chat readiness waits for old history and refuses restored drafts',async t=>{
  const {openProjectChat}=await import('../src/browser-projects.ts');const w=fixture(t);
  w.document.body.insertAdjacentHTML('beforeend','<div data-message-author-role="user">Old</div><div role="textbox" contenteditable="true"></div>');

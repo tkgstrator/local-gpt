@@ -5,7 +5,9 @@ import {
   ensureProjectTarget,
   openProjectChat,
   moveConversationToProject,
+  conversationActionOwned,
   conversationActions,
+  conversationRowLinks,
 } from './browser-projects'
 import { type ImageData } from './generated-image-protocol'
 import { MAX_GENERATED_IMAGES } from './generated-image-protocol'
@@ -1240,13 +1242,25 @@ class App {
         location.assign(targetPath)
         return
       }
-      const more = await this.until(
-        () =>
-          conversationActions(document, request.conversationId) ??
-          action(document, 'main button', /^(More|その他|その他の操作)$/),
-        deadline,
-      )
-      assertTarget()
+      const picked = await this.until(() => {
+        const row = conversationActions(document, request.conversationId)
+        if (row) return { button: row, row: true }
+        const header = action(document, 'main button', /^(More|その他|その他の操作)$/)
+        return header ? { button: header, row: false } : null
+      }, deadline)
+      const more = picked.button
+      const assertAction = () => {
+        assertTarget()
+        const valid = picked.row
+          ? conversationActionOwned(document, request.conversationId, more)
+          : more.isConnected && !!more.closest('main')
+        if (!valid)
+          throw new DomError(
+            'conversation_changed',
+            'The conversation action no longer belongs to the target conversation.',
+          )
+      }
+      assertAction()
       assertReady()
       more.click()
       const remove = await this.until(
@@ -1258,7 +1272,7 @@ class App {
           ),
         deadline,
       )
-      assertTarget()
+      assertAction()
       assertReady()
       remove.click()
       const dialog = await this.until(() => {
@@ -1275,7 +1289,7 @@ class App {
           'delete_confirmation_unavailable',
           'The chat deletion confirmation could not be identified.',
         )
-      assertTarget()
+      assertAction()
       assertReady(true)
       this.deletedReceipt = null
       confirm.click()
@@ -1284,11 +1298,7 @@ class App {
           this.deletedReceipt === request.conversationId &&
           parseChatRoute(location.pathname)?.conversationId !== request.conversationId &&
           !dialog.isConnected &&
-          ![...document.querySelectorAll<HTMLAnchorElement>('a[href]')].some(
-            (a) =>
-              parseChatRoute(new URL(a.href, location.href).pathname)?.conversationId ===
-              request.conversationId,
-          ),
+          !conversationRowLinks(document, request.conversationId).length,
         deadline,
       )
       this.send({
