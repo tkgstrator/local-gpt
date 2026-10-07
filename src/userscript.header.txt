@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LocalGPT
 // @namespace    https://github.com/tkgstrator/local-gpt
-// @version      2.4.14
+// @version      2.4.15
 // @description  TypeScript + Zod browser bridge to your local API
 // @match        https://chatgpt.com/*
 // @run-at       document-start
