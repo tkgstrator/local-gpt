@@ -9,12 +9,14 @@ const frame=(v,event='delta')=>`event: ${event}\r\ndata: ${JSON.stringify(v)}\r\
 const message=(channel='final',role='assistant',recipient='all')=>({id:assistant,author:{role},channel,recipient,content:{content_type:'text',parts:['']},status:'in_progress',end_turn:false});
 const root=m=>({p:'',o:'add',v:{message:m,conversation_id:id,error:null},c:0});
 const finish={p:'',o:'patch',v:[{p:'/message/status',o:'replace',v:'finished_successfully'},{p:'/message/end_turn',o:'replace',v:true}]};
-async function observe(body,status=200){
+const recapId='26fe0c08-9cf6-4b52-985e-36d368c27144';
+async function observe(body,status=200,options){
  const {observeConversationResponse}=require('../dist/conversation-stream.cjs');const events=[];
  const bytes=new TextEncoder().encode(body);let n=0;
  const response=new Response(new ReadableStream({pull(c){if(n===bytes.length)c.close();else c.enqueue(bytes.slice(n,n+=Math.min(3,bytes.length-n)));}}),{status,headers:{'content-type':'text/event-stream'}});
- await observeConversationResponse(response,{requestId:'job',messageId:user,conversationId:null},e=>events.push(e));return events;
+ await observeConversationResponse(response,{requestId:'job',messageId:user,conversationId:null},e=>events.push(e),options);return events;
 }
+const recap=(channel,over={})=>{const m={...message(null),id:recapId,content:{content_type:'reasoning_recap',content:'Private recap sentinel'},status:'finished_successfully',end_turn:false,...over};if(channel===undefined)delete m.channel;else m.channel=channel;return m;};
 test('SSE v1 reconstructs split UTF8, inherited deltas and batch patches with explicit completion',async()=>{
  const e=await observe(frame('v1','delta_encoding')+frame(root(message()))+frame({p:'/message/content/parts/0',o:'append',v:'日本'})+frame({v:'語'})+frame(finish)+'data: [DONE]\r\n\r\n');
  assert.deepEqual(e.filter(x=>x.kind==='answer').map(x=>x.text),['日本','日本語']);assert.equal(e.at(-1).kind,'stop');assert.equal(e.at(-1).conversationId,id);assert.equal(e.at(-1).messageId,user);assert.equal(JSON.stringify(e).includes('metadata'),false);
@@ -91,6 +93,56 @@ test('failed hidden reasoning and tool steps do not fail a later successful fina
   const events=await observe(frame(root(intermediate))+frame(root(final))+'data: [DONE]\n\n');
   assert.equal(events.at(-1).kind,'stop');assert.equal(events.some(e=>e.kind==='error'),false);assert.equal(JSON.stringify(events).includes('Private intermediate'),false);
  }
+});
+
+test('successful reasoning recap intermediates are neither output nodes nor exported before the real final',async()=>{
+ for(const channel of [null,undefined]){
+  const final={...message(),content:{content_type:'text',parts:['Final answer only']},status:'finished_successfully',end_turn:true};
+  const nodes=[];
+  const events=await observe(frame(root(recap(channel)))+frame(root(final))+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+  assert.equal(events.at(-1).kind,'stop');assert.equal(events.some(e=>e.kind==='error'),false);
+  assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Final answer only']);
+  assert.deepEqual(nodes,[assistant]);assert.equal(JSON.stringify(events).includes('Private recap sentinel'),false);
+ }
+});
+
+test('a reasoning recap alone never completes the native stream',async()=>{
+ for(const channel of [null,undefined]) for(const end_turn of [false,true]){
+  const nodes=[];
+  const events=await observe(frame(root(recap(channel,{end_turn})))+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+  assert.equal(events.at(-1).kind,'error');assert.equal(events.some(e=>e.kind==='stop'||e.kind==='answer'),false);
+  assert.deepEqual(nodes,[]);assert.equal(JSON.stringify(events).includes('Private recap sentinel'),false);
+ }
+});
+
+const deltaRecap=(status='finished_successfully')=>frame(root({...message(null),id:recapId,content:{content_type:'reasoning_recap',content:''},status:'in_progress',end_turn:false}))+frame({p:'/message/content/content',o:'append',v:'Private recap '})+frame({v:'sentinel'})+frame({p:'',o:'patch',v:[{p:'/message/content/content',o:'append',v:' tail'},{p:'/message/status',o:'replace',v:status}]});
+const realFinal=()=>frame(root({...message(),content:{content_type:'text',parts:['Final answer only']},status:'finished_successfully',end_turn:true}));
+test('delta v1 reasoning recap patches that omit content type are never answers, output nodes or exports',async()=>{
+ const nodes=[];
+ const events=await observe(frame('v1','delta_encoding')+deltaRecap()+realFinal()+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+ assert.equal(events.at(-1).kind,'stop');assert.equal(events.some(e=>e.kind==='error'),false);
+ assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Final answer only']);
+ assert.deepEqual(nodes,[assistant]);assert.equal(JSON.stringify(events).includes('Private recap'),false);
+});
+test('failed or cancelled reasoning recap does not fail a later successful final',async()=>{
+ for(const status of ['failed','cancelled']){
+  const events=await observe(frame('v1','delta_encoding')+deltaRecap(status)+realFinal()+'data: [DONE]\n\n');
+  assert.equal(events.at(-1).kind,'stop',status);assert.equal(events.some(e=>e.kind==='error'),false,status);
+  assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Final answer only']);assert.equal(JSON.stringify(events).includes('Private recap'),false);
+ }
+});
+test('a reasoning recap after a successful final cannot reset stream completion',async()=>{
+ for(const status of ['in_progress','finished_successfully','failed','cancelled']){
+  const nodes=[];
+  const events=await observe(frame('v1','delta_encoding')+realFinal()+deltaRecap(status)+'data: [DONE]\n\n',200,{onOutputNode:id=>nodes.push(id)});
+  assert.equal(events.at(-1).kind,'stop',status);assert.equal(events.some(e=>e.kind==='error'),false,status);
+  assert.deepEqual(events.filter(e=>e.kind==='answer').map(e=>e.text),['Final answer only']);assert.deepEqual(nodes,[assistant]);assert.equal(JSON.stringify(events).includes('Private recap'),false);
+ }
+});
+test('a malformed actual final after a reasoning recap is still a failure',async()=>{
+ const final={...message(),content:{content_type:'code',parts:['terminal output']},status:'finished_successfully',end_turn:true};
+ const events=await observe(frame(root(recap(null)))+frame(root(final))+'data: [DONE]\n\n');
+ assert.equal(events.at(-1).kind,'error');assert.equal(events.some(e=>e.kind==='stop'),false);assert.equal(JSON.stringify(events).includes('Private recap sentinel'),false);
 });
 
 test('background observation has no wall deadline; synchronous observation does',async()=>{
