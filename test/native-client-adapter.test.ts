@@ -431,6 +431,87 @@ test('existing preparation refuses undefined, mismatched, malformed, hidden and 
   }
 })
 
+test('completed unread async conversations retain the exact terminal parent without marking read', async () => {
+  const f = fixture()
+  f.snapshot.async_status = 4
+  f.snapshot.is_read_only = null
+  f.snapshot.is_archived = false
+  const c = await discoverVerifiedNativeContract(f.page, f.deps)
+  expect(await c.prepareExistingConversation!(id, project)).toEqual({
+    conversationId: id,
+    parentMessageId: id,
+    projectId: project,
+  })
+  expect(f.snapshot.async_status).toBe(4)
+  expect(f.calls.map((call) => call[0])).toEqual(['refetch'])
+})
+
+test('unverified numeric, string and absent async states still refuse continuation', async () => {
+  for (const status of [0, 1, 2, 3, 5, 6, 7, 8, '4', 'unknown', undefined]) {
+    const f = fixture()
+    f.snapshot.async_status = status
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    await expect(c.prepareExistingConversation!(id, project)).rejects.toThrow(
+      'native_existing_not_admissible',
+    )
+    expect(f.calls.map((call) => call[0])).toEqual(['refetch'])
+  }
+})
+
+test('unread state does not admit unfinished, hidden, non-text or foreign parents', async () => {
+  for (const defect of [
+    'status',
+    'end',
+    'hidden',
+    'analysis',
+    'thoughts',
+    'recap',
+    'nonText',
+    'oldFinal',
+    'emptyText',
+    'blankText',
+    'cid',
+    'project',
+    'readOnly',
+    'archived',
+  ]) {
+    const f = fixture(),
+      s = f.snapshot,
+      m = s.mapping[id].message
+    s.async_status = 4
+    if (defect === 'status') m.status = 'in_progress'
+    if (defect === 'end') m.end_turn = false
+    if (defect === 'hidden') m.metadata.is_visually_hidden_from_conversation = true
+    if (defect === 'analysis') m.channel = 'analysis'
+    if (defect === 'thoughts') m.content.content_type = 'thoughts'
+    if (defect === 'recap') m.content.content_type = 'reasoning_recap'
+    if (defect === 'nonText') m.content.content_type = 'multimodal_text'
+    if (defect === 'oldFinal') {
+      const old = '0c80500c-f930-4fca-a571-a68fc25d5a63'
+      s.mapping[old] = { ...s.mapping[id], id: old, message: { ...structuredClone(m), id: old } }
+      m.author.role = 'user'
+      expect(s.mapping[old].message.author.role).toBe('assistant')
+    }
+    if (defect === 'emptyText') m.content.parts = []
+    if (defect === 'blankText') m.content.parts = ['  ']
+    if (defect === 'cid') s.conversation_id = '0c80500c-f930-4fca-a571-a68fc25d5a63'
+    if (defect === 'project') s.gizmo_id = 'g-p-ffffffffffffffffffffffffffffffff'
+    if (defect === 'readOnly') s.read_only = true
+    if (defect === 'archived') s.is_archived = true
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    const code =
+      defect === 'cid'
+        ? 'native_existing_snapshot_invalid'
+        : defect === 'project'
+          ? 'native_existing_project_mismatch'
+          : ['readOnly', 'archived'].includes(defect)
+            ? 'native_existing_not_admissible'
+            : 'native_existing_parent_invalid'
+    await expect(c.prepareExistingConversation!(id, project)).rejects.toThrow(code)
+    expect(f.calls.map((call) => call[0])).toEqual(['refetch'])
+  }
+})
+
 test('persisted project does not require sidebar visibility but visible conflicts are rejected', async () => {
   const f = fixture(),
     original = f.page.document.querySelectorAll

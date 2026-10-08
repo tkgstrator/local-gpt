@@ -343,11 +343,11 @@ function existingSnapshot(value: unknown, conversationId: string, projectId?: st
     fail('native_existing_project_invalid')
   if (projectId !== undefined && value.gizmo_id !== projectId)
     fail('native_existing_project_mismatch')
-  // Only the verified idle/terminal text branch is admitted. Unknown async
-  // states and other native branch types need separate contract verification.
+  // The observed SDK uses 4 for UNREAD after an async reply. That flag alone
+  // proves no completion; the visible terminal text parent is validated below.
   if (
     !own(value, 'async_status') ||
-    value.async_status !== null ||
+    (value.async_status !== null && value.async_status !== 4) ||
     (value.read_only != null && value.read_only !== false) ||
     (value.is_read_only != null && value.is_read_only !== false) ||
     (value.is_archived !== undefined && value.is_archived !== false) ||
