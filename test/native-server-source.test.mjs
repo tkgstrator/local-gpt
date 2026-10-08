@@ -2,6 +2,7 @@ import { test } from './test-support.mjs';
 import assert from 'node:assert/strict';
 import { createService } from '../src/server.ts';
 import { createResponseJobStore } from '../src/response-jobs.ts';
+import { createSessionStore } from '../src/sessions.ts';
 import { mkdtempSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -316,14 +317,122 @@ test('failed native image retrieval cannot produce a terminal result missing tha
  assert.equal((await f.bridge('event',stop)).accepted,true);
 });
 
-test('restored native ownership pins the shared browser before another browser connects',async t=>{
- const dir=mkdtempSync(join(tmpdir(),'native-owner-'));const store=createResponseJobStore({dir});
- store.create({requestId:'owned',browserId:'original-owner',mode:'native',lifecycle:'possible_dispatch',nativeUserMessageId:'00000000-0000-4000-8000-000000000001'});store.close();
- const f=await fixture(t,{responseJobsDir:dir,noInitialPoll:true});
- const probe=(await f.bridge('poll',{nativeProtocol:1},'foreign')).request;
- await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:true},'foreign');
- assert.equal((await f.job(await f.session())).status,409);
- assert.equal((await f.bridge('poll',{},'foreign')).request,null);
+async function restoredOwner(t,options={}) {
+ const dir=mkdtempSync(join(tmpdir(),'native-owner-'));const sessionsFile=join(dir,'sessions.sqlite');
+ const sessions=createSessionStore(sessionsFile);const sidA=sessions.create({projectName:null}).id,sidSameCid=sessions.create({projectName:null}).id;
+ sessions.bind(sidA,cidA);sessions.bind(sidSameCid,cidA);sessions.close();
+ const store=createResponseJobStore({dir});
+ const context={requestId:'owned',browserId:'original-owner',mode:'native',lifecycle:'identified',nativeUserMessageId:'00000000-0000-4000-8000-000000000001',sessionId:sidA,serverConversationId:cidA,conversationId:cidA};
+ const saved=store.create(context);store.close();
+ const f=await fixture(t,{responseJobsDir:dir,sessionsFile,noInitialPoll:true,...options});
+ const status=async id=>(await (await fetch(f.base+'/v1/response-jobs/'+id)).json());
+ const readyAs=async owner=>{const probe=(await f.bridge('poll',{nativeProtocol:1},owner)).request;assert.equal(probe.type,'native_readiness');
+  assert.equal((await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:true},owner)).accepted,true);};
+ return {f,context,saved,sidA,sidSameCid,status,readyAs};
+}
+
+test('restored native owner reserves its SID/CID but current browser B completes new independent work',async t=>{
+ const {f,context,saved,sidA,sidSameCid,status,readyAs}=await restoredOwner(t);
+ await readyAs('B');
+ assert.equal((await f.job(sidA)).status,409);
+ assert.equal((await f.job(sidSameCid)).status,409);
+ const b=await f.session();const created=await f.job(b);assert.equal(created.status,202);const job=await created.json();
+ assert.equal((await f.bridge('poll',{},'original-owner')).request,null);
+ const request=(await f.bridge('poll',{},'B')).request;assert.ok(request.nativeUserMessageId);assert.notEqual(request.requestId,context.requestId);
+ const ev=value=>({...value,requestId:request.requestId,nativeUserMessageId:request.nativeUserMessageId});
+ await f.bridge('event',ev({type:'native_intent'}),'B');await f.bridge('event',ev({type:'native_identity',conversationId:cidB}),'B');
+ await f.bridge('event',ev({type:'answer',text:'B done'}),'B');
+ assert.equal((await f.bridge('event',ev({type:'stop',conversationId:cidB,terminalEvidence:true}),'B')).accepted,true);
+ assert.equal((await status(job.id)).status,'completed');
+ assert.equal((await status(saved.id)).status,'in_progress');
+ // B cannot forge A receipts; A keeps ownership, can reconnect without taking selection.
+ const forged={type:'answer',requestId:context.requestId,nativeUserMessageId:context.nativeUserMessageId,text:'forged',eventId:'forged'};
+ assert.equal((await f.bridge('event',forged,'B')).accepted,false);
+ assert.equal((await f.bridge('poll',{},'original-owner')).request,null);
+ assert.equal((await f.job(await f.session())).status,202);
+ assert.equal((await f.bridge('poll',{},'original-owner')).request,null);
+ assert.ok((await f.bridge('poll',{},'B')).request);
+ const stop={type:'stop',requestId:context.requestId,nativeUserMessageId:context.nativeUserMessageId,conversationId:cidA,terminalEvidence:true,eventId:'owner-stop'};
+ assert.equal((await f.bridge('event',{...forged,eventId:'own-answer',text:'A exact'},'original-owner')).accepted,true);
+ assert.equal((await f.bridge('event',stop,'original-owner')).accepted,true);
+ assert.equal((await f.bridge('event',stop,'B')).accepted,false);
+ assert.equal((await status(saved.id)).status,'completed');
+ assert.equal((await f.job(await f.session())).status,202);
+ assert.ok((await f.bridge('poll',{},'B')).request);
+});
+
+test('replacement browser needs its own correlated readiness probe before accepting work',async t=>{
+ const {f,readyAs}=await restoredOwner(t);
+ const probe=(await f.bridge('poll',{nativeProtocol:1},'B')).request;
+ assert.equal((await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:true},'foreign')).accepted,false);
+ assert.notEqual((await f.job(await f.session())).status,202);
+ assert.equal((await f.bridge('poll',{},'B')).request,null);
+ assert.equal((await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:true},'B')).accepted,true);
+ assert.equal((await f.job(await f.session())).status,202);
+});
+
+test('polling lease expiry of live owner A hands new work to ready B while A stays unresolved',async t=>{
+ const f=await fixture(t,{pollingLeaseMs:300});await f.ready();const A=await startNative(f,await f.session());
+ await f.bridge('event',A.event({type:'native_intent'}));await f.bridge('event',A.event({type:'native_identity',conversationId:cidA}));
+ const probe=(await f.bridge('poll',{nativeProtocol:1},'B')).request;
+ await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:true},'B');
+ for(let i=0;i<10;i++){await new Promise(r=>setTimeout(r,60));assert.equal((await f.bridge('poll',{},'B')).request,null)}
+ const b=await f.session();const created=await f.job(b);assert.equal(created.status,202);const job=await created.json();
+ const request=(await f.bridge('poll',{},'B')).request;assert.ok(request.nativeUserMessageId);
+ assert.equal((await (await fetch(f.base+'/v1/response-jobs/'+A.job.id)).json()).status,'in_progress');
+ const forged=A.event({type:'answer',text:'forged',eventId:'f'});
+ assert.equal((await f.bridge('event',forged,'B')).accepted,false);
+ assert.equal((await f.bridge('event',A.event({type:'answer',text:'A late',eventId:'a'}))).accepted,true);
+ assert.equal((await f.bridge('poll',{})).request,null);
+ assert.equal((await f.job(await f.session())).status,202);
+ assert.equal((await f.bridge('poll',{})).request,null);
+ assert.ok((await f.bridge('poll',{},'B')).request);
+ assert.equal((await (await fetch(f.base+'/v1/response-jobs/'+job.id)).json()).status,'in_progress');
+});
+
+test('real WebSocket disconnect of owner A hands new work to ready B and retains A',async t=>{
+ const f=await fixture(t,{noInitialPoll:true,pollingLeaseMs:5000});
+ const ws=new WebSocket(`ws://127.0.0.1:${f.ports.wsPort}/?token=test&browserId=owner&nativeProtocol=1`);
+ t.after(()=>ws.close());const messages=[];
+ ws.on('message',raw=>{const m=JSON.parse(String(raw));messages.push(m);if(m.type==='native_readiness')ws.send(JSON.stringify({type:'native_ready',requestId:m.requestId,protocol:1,ready:true,eventId:'r'+messages.length}))});
+ const until=async check=>{for(let i=0;i<1000;i++){const v=check();if(v)return v;await new Promise(r=>setTimeout(r,5))}throw Error('timeout')};
+ await once(ws,'open');await until(()=>messages.find(m=>m.eventId?.startsWith('r')&&m.accepted));
+ const sid=await f.session();const created=await f.job(sid);assert.equal(created.status,202);const jobA=await created.json();
+ const request=await until(()=>messages.find(m=>m.type==='request'));
+ ws.send(JSON.stringify({type:'native_intent',requestId:request.requestId,nativeUserMessageId:request.nativeUserMessageId,eventId:'i'}));
+ await until(()=>messages.find(m=>m.eventId==='i'&&m.accepted));
+ const closed=once(ws,'close');ws.close();await closed;
+ const probe=(await f.bridge('poll',{nativeProtocol:1},'B')).request;
+ await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:true},'B');
+ assert.equal((await f.job(sid)).status,409);
+ assert.equal((await f.job(await f.session())).status,202);
+ assert.ok((await f.bridge('poll',{},'B')).request);
+ assert.equal((await (await fetch(f.base+'/v1/response-jobs/'+jobA.id)).json()).status,'in_progress');
+});
+
+test('replacement prefers a native-ready standby over earlier legacy lanes; connected A stays selected',async t=>{
+ const {f,readyAs}=await restoredOwner(t);
+ await f.bridge('poll',{},'legacy');await readyAs('native');
+ assert.equal((await f.job(await f.session())).status,202);
+ assert.equal((await f.bridge('poll',{},'legacy')).request,null);
+ assert.ok((await f.bridge('poll',{},'native')).request);
+ // A later ready standby never takes selection from the connected selected lane.
+ await readyAs('standby');
+ assert.equal((await f.job(await f.session())).status,202);
+ assert.equal((await f.bridge('poll',{},'standby')).request,null);
+ assert.ok((await f.bridge('poll',{},'native')).request);
+});
+
+test('second WebSocket for a connected lane is refused and leaves the live lane selected',async t=>{
+ const f=await fixture(t,{noInitialPoll:true,pollingLeaseMs:5000});
+ const live=new WebSocket(`ws://127.0.0.1:${f.ports.wsPort}/?token=test&browserId=owner&nativeProtocol=1`);t.after(()=>live.close());
+ live.on('message',raw=>{const m=JSON.parse(String(raw));if(m.type==='native_readiness')live.send(JSON.stringify({type:'native_ready',requestId:m.requestId,protocol:1,ready:true}))});
+ await once(live,'open');
+ const stale=new WebSocket(`ws://127.0.0.1:${f.ports.wsPort}/?token=test&browserId=owner&nativeProtocol=1`);await new Promise(r=>{stale.on('error',()=>{});stale.on('close',r)});
+ const messages=[];live.on('message',raw=>messages.push(JSON.parse(String(raw))));
+ for(let i=0;i<100&&(await f.job(await f.session())).status!==202;i++)await new Promise(r=>setTimeout(r,10));
+ for(let i=0;i<200&&!messages.some(m=>m.type==='request');i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(messages.some(m=>m.type==='request'));
 });
 
 test('checked durable context reports write failure instead of dispatch permission', t=>{

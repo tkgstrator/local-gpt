@@ -178,15 +178,11 @@ export function createService(options: Options) {
     'LocalGPT is processing another browser operation. Wait for it to finish before retrying.'
   const availableLane = () => {
     const shared = sharedBrowserId ? laneFor(sharedBrowserId) : undefined
-    // Keep ownership during navigation/reconnection; never move an in-flight request.
-    if (
-      shared &&
-      (connected(shared) ||
-        shared.pending ||
-        [...nativeGenerations.values()].some((record) => record.context.browserId === shared.id))
-    )
-      return shared
-    const replacement = [...lanes.values()].find((lane) => connected(lane))
+    // Keep a connected or in-flight shared lane. Native records alone never pin new requests;
+    // they keep their own browserId, so old receipts still route to the original owner.
+    if (shared && (connected(shared) || shared.pending || shared.queued)) return shared
+    const candidates = [...lanes.values()].filter((lane) => connected(lane))
+    const replacement = candidates.find((lane) => lane.nativeReady) ?? candidates[0]
     sharedBrowserId = replacement?.id ?? null
     return replacement ?? laneFor('disconnected')
   }

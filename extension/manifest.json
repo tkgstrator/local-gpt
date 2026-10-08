@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LocalGPT",
-  "version": "2.6.5",
+  "version": "2.6.6",
   "description": "Connect your ChatGPT browser tab to a local API.",
   "minimum_chrome_version": "110",
   "host_permissions": ["http://127.0.0.1/*"],

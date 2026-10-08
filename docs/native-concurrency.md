@@ -11,6 +11,10 @@ The native lifecycle distinguishes preparation from possible remote dispatch:
 
 Independent native sessions/CIDs may overlap. Session/CID conflicts remain excluded, including unknown outcomes. Mutating browser UI/setup and extension reload remain excluded while native generations may be affected. Legacy unknown work remains conservatively reserved.
 
+Selection of the shared tab applies to new requests. A connected selected tab remains selected. If it disconnects, another existing connected tab may handle new independent native requests after its own readiness handshake, even while the original tab owns unknown native jobs. Prefer a native-ready replacement when available. Legacy/UI pending or queued work still pins its original tab through navigation and reconnection.
+
+Each native job keeps its original browser ID, user-message ID, session/CID reservations and receipt ownership. Selection changes never move or replay its dispatch. Its original browser may reconnect and deliver correlated receipts without displacing the selected connected tab. Unknown jobs continue to reserve their own session/CID and block browser mutations and extension reload; they do not block unrelated native sessions on the replacement.
+
 ## Native contract and verification
 
 The production resolver discovers the cached ChatGPT completion, uploader, pure builder and conversation refetch functions from observed same-origin assets. It selects the current React composer store by raw-scope and query-client identity. Ambiguous, stale or missing contracts refuse before dispatch. Runtime asset hashes and module IDs are not pinned.
