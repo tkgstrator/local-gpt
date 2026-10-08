@@ -1,4 +1,9 @@
 import { PROGRESS_IDLE_TIMEOUT_MS } from './timeouts'
+import {
+  GeneratedImageSchema,
+  ImageFileIdSchema,
+  MAX_GENERATED_IMAGES,
+} from './generated-image-protocol'
 import { randomUUID } from 'node:crypto'
 import {
   mkdirSync,
@@ -9,6 +14,9 @@ import {
   unlinkSync,
   chmodSync,
   statSync,
+  openSync,
+  closeSync,
+  fsyncSync,
 } from 'node:fs'
 import { join } from 'node:path'
 import { z } from 'zod'
@@ -41,6 +49,18 @@ export const ResponseJobSchema = z.object({
       browserId: z.string(),
       sessionId: z.string().optional(),
       conversationId: z.string().optional(),
+      mode: z.literal('native').optional(),
+      lifecycle: z.enum(['pre_dispatch', 'possible_dispatch', 'identified', 'terminal']).optional(),
+      nativeUserMessageId: z.string().uuid().optional(),
+      clientThreadId: z.string().min(1).max(200).optional(),
+      serverConversationId: z.string().uuid().optional(),
+      receipts: z.array(z.string().max(64)).max(1000).optional(),
+      images: z.array(GeneratedImageSchema).max(MAX_GENERATED_IMAGES).optional(),
+      pendingImageIds: z.array(ImageFileIdSchema).max(MAX_GENERATED_IMAGES).optional(),
+      model: z.string().optional(),
+      effort: z.string().optional(),
+      projectName: z.string().optional(),
+      projectId: z.string().optional(),
     })
     .optional(),
   result: z.record(z.string(), z.unknown()).optional(),
@@ -83,7 +103,19 @@ export function createResponseJobStore(
     try {
       writeFileSync(temporary, data, { mode: 0o600 })
       chmodSync(temporary, 0o600)
+      const fd = openSync(temporary, 'r')
+      try {
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
       renameSync(temporary, target)
+      const directory = openSync(dir, 'r')
+      try {
+        fsyncSync(directory)
+      } finally {
+        closeSync(directory)
+      }
     } catch (error) {
       try {
         unlinkSync(temporary)
@@ -169,7 +201,9 @@ export function createResponseJobStore(
       if (stored.job.status === 'in_progress') {
         stored.job.phase = 'unresponsive'
         stored.job.message =
-          'Server restarted. Remote generation outcome is unknown; browser slot remains reserved. Do not resend. Manual recovery is required.'
+          stored.job.context?.mode === 'native'
+            ? 'Server restarted. Native generation outcome is unknown; its session and conversation remain reserved. Do not resend. Exact owner-bound recovery is required.'
+            : 'Server restarted. Remote generation outcome is unknown; browser slot remains reserved. Do not resend. Manual recovery is required.'
       }
       jobs.set(stored.job.id, stored.job)
       delete stored.job.persistenceError
@@ -212,6 +246,47 @@ export function createResponseJobStore(
   return {
     get,
     flush,
+    durable: Boolean(dir),
+    list: () => [...jobs.values()].map((job) => structuredClone(job)),
+    // Admission and identity acknowledgements must never use the best-effort writer.
+    contextChecked(id: string, context: NonNullable<ResponseJob['context']>) {
+      const job = jobs.get(id)
+      if (!job) throw new ResponseJobStorageError()
+      job.context = structuredClone(context)
+      tryPersist(job)
+      if (!dir || job.persistenceError) throw new ResponseJobStorageError()
+    },
+    terminalChecked(
+      id: string,
+      context: NonNullable<ResponseJob['context']>,
+      value: {
+        result?: Record<string, unknown>
+        error?: { code: string; message: string }
+      },
+    ) {
+      const job = jobs.get(id)
+      if (!job) throw new ResponseJobStorageError()
+      // A failed terminal barrier remains in progress and retains its reservations.
+      const next = structuredClone(job)
+      next.context = structuredClone(context)
+      next.status = value.error ? 'failed' : 'completed'
+      next.phase = value.error ? 'failed' : 'completed'
+      next.updatedAt = stamp()
+      next.lastActivityAt = next.updatedAt
+      next.result = value.result
+      next.error = value.error
+      delete next.message
+      try {
+        if (!dir) throw new Error('not durable')
+        persist(next)
+      } catch {
+        throw new ResponseJobStorageError()
+      }
+      jobs.set(id, next)
+      dirty.delete(id)
+      delete next.persistenceError
+      emit(id, { type: 'response_job.updated', job: structuredClone(next) })
+    },
     close() {
       closed = true
       flush()
@@ -250,7 +325,7 @@ export function createResponseJobStore(
         emit(id, { type: 'response.output_text.delta', delta: text.slice(previous.length) })
       else emit(id, { type: 'response.output_text.snapshot', text })
     },
-    create() {
+    create(context?: NonNullable<ResponseJob['context']>) {
       expire()
       if (jobs.size >= maxJobs)
         throw new Error('Response job capacity reached; wait for completed results to expire.')
@@ -263,6 +338,7 @@ export function createResponseJobStore(
         createdAt: at,
         updatedAt: at,
         lastActivityAt: at,
+        ...(context ? { context: structuredClone(context) } : {}),
       }
       try {
         persist(job)

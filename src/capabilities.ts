@@ -171,6 +171,9 @@ export function normalizePlan(value: unknown, accountId?: string | null): string
 export const CAPABILITY_EVENT = 'localgpt:capabilities'
 export const CAPABILITY_REQUEST = 'localgpt:capabilities-request'
 
+export const CONVERSATION_DELETED_EVENT = 'localgpt:conversation-deleted'
+export const ConversationDeletedSchema = z.object({ conversationId: z.string().uuid() }).strict()
+
 export const TURN_EVENT = 'localgpt:submitted-turn'
 export const SubmittedTurnSchema = z.object({
   messageId: z.string().uuid(),

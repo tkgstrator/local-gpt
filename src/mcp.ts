@@ -1,6 +1,13 @@
 import { waitForResponseJob } from './job-stream'
 import { ResponseJobSchema } from './response-jobs'
-import { SessionSchema, CreateSessionSchema } from './sessions'
+import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
+import { GeneratedImageSchema, MAX_IMAGE_BYTES } from './generated-image-protocol'
+import {
+  SessionSchema,
+  CreateSessionSchema,
+  DeleteSessionSchema,
+  DeleteSessionResultSchema,
+} from './sessions'
 import { DotResultSchema } from './dots'
 import { CapabilitiesSchema } from './capabilities'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -11,6 +18,9 @@ const HealthSchema = z.object({
   status: z.literal('ok'),
   browserConnected: z.boolean(),
   busy: z.boolean(),
+  nativeReady: z.boolean().optional(),
+  activeGenerations: z.number().int().min(0).optional(),
+  canStartIndependentGeneration: z.boolean().optional(),
   transport: z.enum(['http', 'websocket']).nullable(),
   browsers: z.number().int().optional(),
   availableBrowsers: z.number().int().optional(),
@@ -32,6 +42,7 @@ const ResponseSchema = z.object({
   id: z.string(),
   session_id: z.string().nullable().optional(),
   model: z.string(),
+  images: z.array(GeneratedImageSchema).max(4).default([]),
   output: z.array(
     z.object({
       type: z.literal('message'),
@@ -56,10 +67,10 @@ export function localApiBase(value: string) {
 export function createMcpServer(baseUrl: string) {
   const base = localApiBase(baseUrl)
   const server = new McpServer(
-    { name: 'LocalGPT', version: '2.5.0' },
+    { name: 'LocalGPT', version: '2.6.7' },
     {
       instructions:
-        'LocalGPT controls the signed-in ChatGPT browser. First call localgpt_status and localgpt_capabilities. For each topic create a localgpt_session_create, then pass its id as session_id to every localgpt_respond continuation. All browser operations run one at a time service-wide through one shared existing ChatGPT tab; additional tabs stay on standby and receive no operations unless the shared tab disconnects with nothing in flight. Do not open ChatGPT tabs per caller or session. sharedBrowserId in localgpt_status identifies the shared tab. A 409 browser_busy rejects an operation before dispatch; wait and retry only that operation. Only choose model/effort combinations from capabilities.choices. For dots: list observed dots, select dotId, wait for selected/reconnection, send, then read messages after the returned outgoing messageId. A dot send receipt is not a completed answer and complete:false does not guarantee background completion. Pro models default to asynchronous response jobs: localgpt_response_start, or localgpt_respond with background:true or a Pro model, returns a job receipt, not an answer. Call localgpt_response_get by job_id until completed or failed; each call waits on SSE for up to 25 seconds and returns immediately on completion, so call again at once while in_progress without sleeping. thinking is observed activity; unresponsive means no recent native activity and an UNKNOWN outcome, not proof that work stopped. Keep polling and never resend. Async generation has no elapsed-time cutoff, polling never cancels it, and there is no remote cancel tool. Disconnects, restarts and incomplete native streams keep a job in_progress/unresponsive, preserve partial text and keep the browser slot reserved. Completed results expire after one hour. Do not automatically resend timed-out sends. Preserve manual drafts. If localmcp_ tools are listed, the caller can use them directly for workspace files. To let the ChatGPT worker read or edit files itself without attachments, connect the LocalMCP-only endpoint as a ChatGPT plugin and enable it for that conversation; gateway status does not prove ChatGPT plugin access. Never connect this LocalGPT endpoint back to its own ChatGPT worker: localgpt_respond would recurse. File attachments are transmitted to ChatGPT only when the user authorizes those specific files.',
+        "LocalGPT controls the signed-in ChatGPT browser. First call localgpt_status, then localgpt_capabilities and localgpt_models sequentially. For each topic create a localgpt_session_create, then pass its id as session_id to every localgpt_respond continuation. A verified nativeReady browser can run generations concurrently in independent sessions and conversation IDs on the same tab. Model/capability reads remain sequential and work during native generation. Project placement, deletion, dots and extension updates require exclusive browser access. Legacy clients remain serial. All Codex callers and LocalGPT sessions share one existing ChatGPT tab selected by the server. Additional tabs stay on standby and receive no operations while the shared tab is connected. A disconnected shared tab may be replaced for new independent native requests after the replacement verifies its own readiness, even while old native jobs remain unknown. Old native dispatches are never moved or resent: their original browser IDs, receipts and session/conversation reservations stay bound. Pending or queued legacy/UI work still pins its original tab. Do not open ChatGPT tabs or windows per caller, session or subagent. sharedBrowserId in status identifies the shared connection. Check localgpt_status: when canStartIndependentGeneration is true, another independent session may send even while activeGenerations is nonzero and busy is true. Otherwise wait when busy. A 409 browser_busy rejects the operation before dispatch; same-session or same-conversation overlap is always refused. Sessions default to the LocalGPT project. Generation confirms native project membership before completion; use localgpt_session_project to explicitly move an existing LocalGPT session into its configured project. Never autonomously use Computer Use, browser automation or direct ChatGPT tab manipulation to bypass or diagnose a routine LocalGPT failure; report structured errors or required manual extension/login actions. Computer Use requires explicit user authorization. Only choose model/effort combinations from capabilities.choices. A saved reasoning effort applies only to its saved model; changing model without reasoning does not inherit the previous model's effort. If the new model has multiple observed efforts, specify a supported choice explicitly. For dots: list observed dots, select dotId, wait for selected/reconnection, send, then read messages after the returned outgoing messageId. A dot send receipt is not a completed answer and complete:false does not guarantee background completion. Pro models default to asynchronous response jobs; localgpt_response_start or localgpt_respond background:true returns a job receipt, not a completed answer. Await localgpt_response_get by job_id until completed or failed; it waits for SSE events for up to 25 seconds and returns immediately on completion. Call again immediately while in_progress, without polling sleeps. A thinking phase means observed thinking activity; unresponsive means no recent native API activity and an unknown outcome, not proof that work stopped. Keep polling without resending. lastActivityAt reports the last observed activity; no hidden reasoning is returned. Async generation has no elapsed-time cutoff. Polling stays bounded at 25 seconds and never cancels generation. Completed results expire after one hour; at most 100 jobs are retained. When LOCALGPT_RESPONSE_JOBS_DIR is configured, private job records survive server restart; pending work becomes unknown: native jobs retain their original receipt owner and session/conversation reservations while independent native sessions may continue on the selected ready tab; legacy unknown jobs reserve the whole browser. Transport disconnects and incomplete native streams keep jobs in_progress/unresponsive, preserve partial text and retain their session/conversation reservations; they never prove remote generation stopped. No automatic resend or remote cancellation is performed. Do not automatically resend timed-out sends. Preserve manual drafts. Use LocalMCP for all workspace file operations by default; if it cannot access the files, report the setup/access issue instead of silently using Codex file tools or shell reads. Delegate file summaries and reviews by sending short requests with LocalMCP-visible paths, optional line ranges or revision references, questions and output criteria. Never paste full file contents, large code blocks, diffs or logs into LocalGPT messages or instructions. The ChatGPT worker must read files through its own enabled LocalMCP-only plugin in the target conversation; caller LocalMCP availability or healthy gateway status does not prove worker access. If worker LocalMCP access is missing, report the setup issue and stop the dependent delegation. Never automatically fall back to inline file text or attachments. Never connect this LocalGPT endpoint back to its own ChatGPT worker: localgpt_respond would recurse. Attachment support is reserved for an explicit user request to upload specific files, never as a fallback for missing LocalMCP access.",
     },
   )
   async function invoke(path: string, schema: z.ZodType, body?: unknown, signal?: AbortSignal) {
@@ -69,8 +80,8 @@ export function createMcpServer(baseUrl: string) {
         headers: { 'Content-Type': 'application/json' },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(190000)])
-          : AbortSignal.timeout(190000),
+          ? AbortSignal.any([signal, AbortSignal.timeout(DEFAULT_GENERATION_TIMEOUT_MS + 10000)])
+          : AbortSignal.timeout(DEFAULT_GENERATION_TIMEOUT_MS + 10000),
       })
       const value: unknown = await response.json()
       if (!response.ok) {
@@ -97,6 +108,50 @@ export function createMcpServer(baseUrl: string) {
             text: err instanceof Error ? err.message : 'LocalGPT request failed',
           },
         ],
+      }
+    }
+  }
+  async function withSavedImages(
+    result: Awaited<ReturnType<typeof invoke>>,
+    metadata: z.infer<typeof ResponseSchema>,
+    signal?: AbortSignal,
+  ) {
+    if ('isError' in result) return result
+    try {
+      const pixels = await Promise.all(
+        metadata.images.map(async (image) => {
+          const response = await fetch(`${base}${image.url}`, {
+            redirect: 'error',
+            signal: signal
+              ? AbortSignal.any([signal, AbortSignal.timeout(30000)])
+              : AbortSignal.timeout(30000),
+          })
+          if (
+            !response.ok ||
+            response.headers.get('content-type')?.split(';')[0] !== image.mimeType
+          )
+            throw new Error('Saved image could not be read.')
+          const bytes = Buffer.from(await response.arrayBuffer())
+          if (bytes.length !== image.bytes || bytes.length > MAX_IMAGE_BYTES)
+            throw new Error('Saved image size changed.')
+          return {
+            type: 'image' as const,
+            mimeType: image.mimeType,
+            data: bytes.toString('base64'),
+          }
+        }),
+      )
+      return { ...result, content: [...result.content, ...pixels] }
+    } catch {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Images were saved, but could not be returned. Use the saved file metadata to recover them; do not automatically resend generation.',
+          },
+        ],
+        structuredContent: result.structuredContent,
       }
     }
   }
@@ -130,11 +185,42 @@ export function createMcpServer(baseUrl: string) {
     'localgpt_session_create',
     {
       description:
-        'Create a LocalGPT session for a topic. Pass its id as session_id to localgpt_respond to start and continue the same ChatGPT conversation. Does not send a message.',
+        'Create a LocalGPT session for a topic. Pass its id as session_id to localgpt_respond to start and continue the same ChatGPT conversation. Defaults to the LocalGPT project; projectName:null opts out. Project placement occurs on the first response. Does not send a message.',
       inputSchema: CreateSessionSchema.shape,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async (args, extra) => invoke('/v1/sessions', SessionSchema, args, extra.signal),
+  )
+  server.registerTool(
+    'localgpt_session_project',
+    {
+      description:
+        "Explicitly move a LocalGPT session's bound ChatGPT conversation into its configured project (LocalGPT by default). Returns metadata only for unbound sessions. Rejects concurrent browser operations and sessions with projectName:null. Confirms native project membership before returning. Do not automatically retry a timed-out movement.",
+      inputSchema: DeleteSessionSchema.shape,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (args, extra) => invoke('/v1/sessions/project', SessionSchema, args, extra.signal),
+  )
+  server.registerTool(
+    'localgpt_session_delete',
+    {
+      description:
+        'Delete an explicitly selected, no-longer-needed LocalGPT session and its bound ChatGPT chat. Use only for disposable LocalGPT work; retain conversations needed for follow-up. Rejects active sessions and preserves manual drafts. Chat deletion is permanent. An unbound session only removes local metadata. On timeout, inspect the browser before retrying; deletion may already have happened.',
+      inputSchema: DeleteSessionSchema.shape,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async (args, extra) =>
+      invoke('/v1/sessions/delete', DeleteSessionResultSchema, args, extra.signal),
   )
   server.registerTool(
     'localgpt_dots',
@@ -200,7 +286,7 @@ export function createMcpServer(baseUrl: string) {
     'localgpt_capabilities',
     {
       description:
-        'Read the connected browser’s ChatGPT API data: available Chat models, reasoning types and thinking effort choices, and account plan. Null means not observed; reload ChatGPT after installing version 2.4. Reports observed model selection choices; does not expose personal account information.',
+        'Read the connected browser’s ChatGPT API data: available Chat models, reasoning types and thinking effort choices, and account plan. Null means not observed; reload ChatGPT after installing version 2.4.14. Reports observed model selection choices; does not expose personal account information.',
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -216,44 +302,21 @@ export function createMcpServer(baseUrl: string) {
     },
     async (_args, extra) => invoke('/v1/models', ModelsSchema, undefined, extra.signal),
   )
-  const SessionList = z.object({ object: z.literal('list'), data: z.array(SessionSchema) })
-  const progressSender = (extra: {
-    _meta?: { progressToken?: string | number }
-    sendNotification: (notification: never) => Promise<void>
-  }) => {
-    let progress = 0
-    return (event: Parameters<NonNullable<Parameters<typeof waitForResponseJob>[4]>>[0]) => {
-      const progressToken = extra._meta?.progressToken
-      if (progressToken === undefined) return
-      const message =
-        event.type === 'response_job.updated'
-          ? event.job.phase
-          : event.type === 'response.output_text.delta'
-            ? event.delta
-            : event.text
-      void extra
-        .sendNotification({
-          method: 'notifications/progress',
-          params: { progressToken, progress: ++progress, message: message.slice(-2000) },
-        } as never)
-        .catch(() => {})
-    }
-  }
-  const respondSchema = {
-    input: ResponsesRequestSchema.shape.input,
-    model: ResponsesRequestSchema.shape.model,
-    files: ResponsesRequestSchema.shape.files,
-    reasoning: ResponsesRequestSchema.shape.reasoning,
-    session_id: ResponsesRequestSchema.shape.session_id,
-    instructions: ResponsesRequestSchema.shape.instructions,
-    newChat: ResponsesRequestSchema.shape.newChat,
-  }
   server.registerTool(
     'localgpt_respond',
     {
       description:
-        'Send text to the signed-in ChatGPT browser tab. Pro models (by the model argument or the session model) and background:true return an asynchronous response_job receipt immediately; await it with localgpt_response_get and never resend. Other requests return the completed text directly. Text goes to ChatGPT. Actual model is selected in the browser. newChat defaults to true; does not overwrite unsent drafts. Supports local files by absolute path: UTF-8 source code/logs/text, PDF, PNG/JPEG/WebP/GIF; max 10 files, 8 MiB each, 16 MiB total. Auto mode sends UTF-8 source/log/text files up to 256 KiB as prompt context; images/PDF/larger files use browser attachment upload. mode:text or mode:upload can be specified. Files are transmitted to ChatGPT. LocalMCP file tools can independently read/write files; LocalGPT itself does not edit the files. Obtain user authorization for the specific files first. Prompts are never stored in job records or the session database.',
-      inputSchema: { ...respondSchema, background: z.boolean().optional() },
+        'Send text to the signed-in ChatGPT browser. Pro models automatically return an asynchronous response_job receipt; await localgpt_response_get by job_id until completion (SSE wait, no polling sleeps). background:true forces an async job for any model; false or omission keeps automatic Pro routing. Other requests wait on SSE for up to 25 seconds and return completed text/images, or a response_job receipt if still running; this also applies when no model is specified. Await localgpt_response_get immediately for any receipt, never resend the generation. Generated images are saved locally; the reply includes image pixels and persistent file paths in images. Saved images remain after session deletion. At most four PNG/JPEG/WebP/GIF images of 8 MiB each. Text goes to ChatGPT. Actual model is selected in the browser. newChat defaults to true; does not overwrite unsent drafts. For file analysis, send only LocalMCP-visible paths, relevant line ranges or revision references, questions and criteria. The worker must read files using its own enabled LocalMCP-only plugin; caller LocalMCP access is not proof of worker access. Never paste full files, large code blocks, diffs or logs, and never automatically substitute inline text or attachments when LocalMCP is unavailable. Report the setup/access issue instead. The files argument supports explicit user-requested uploads only (max 10 files, 8 MiB each, 16 MiB total), not routine file-reference delegation. LocalGPT itself does not edit workspace files; use LocalMCP for actual file operations. Response jobs have no generation time limit. Private configured job storage retains results and partial answer text; prompts are never persisted in job records or the session database.',
+      inputSchema: {
+        input: ResponsesRequestSchema.shape.input,
+        background: z.boolean().optional(),
+        model: ResponsesRequestSchema.shape.model,
+        files: ResponsesRequestSchema.shape.files,
+        reasoning: ResponsesRequestSchema.shape.reasoning,
+        session_id: ResponsesRequestSchema.shape.session_id,
+        instructions: ResponsesRequestSchema.shape.instructions,
+        newChat: ResponsesRequestSchema.shape.newChat,
+      },
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -265,34 +328,104 @@ export function createMcpServer(baseUrl: string) {
       const { background, ...body } = args
       let model = args.model
       if (!model && args.session_id) {
-        const listed = await invoke('/v1/sessions', SessionList, undefined, extra.signal)
-        if ('isError' in listed) return listed
-        const session = SessionList.parse(listed.structuredContent).data.find(
-          (value) => value.id === args.session_id,
+        const listed = await invoke(
+          '/v1/sessions',
+          z.object({ object: z.literal('list'), data: z.array(SessionSchema) }),
+          undefined,
+          extra.signal,
         )
+        if ('isError' in listed) return listed
+        const session = z
+          .array(SessionSchema)
+          .parse(listed.structuredContent.data)
+          .find((value) => value.id === args.session_id)
         model = session?.model ?? undefined
       }
-      if (background === true || (model && /\bpro\b/i.test(model)))
+      if (background === true || (model && /\bpro\b/i.test(model))) {
         return invoke(
           '/v1/response-jobs',
           ResponseJobSchema,
           { ...body, stream: false, store: false },
           extra.signal,
         )
-      return invoke(
-        '/v1/responses',
-        ResponseSchema,
+      }
+      const started = await invoke(
+        '/v1/response-jobs',
+        ResponseJobSchema,
         { ...body, stream: false, store: false },
         extra.signal,
       )
+      if ('isError' in started) return started
+      const receipt = ResponseJobSchema.parse(started.structuredContent)
+      try {
+        let progress = 0
+        const job = await waitForResponseJob(base, receipt.id, 25000, extra.signal, (event) => {
+          const progressToken = extra._meta?.progressToken
+          if (progressToken === undefined) return
+          const message =
+            event.type === 'response_job.updated'
+              ? event.job.phase
+              : event.type === 'response.output_text.delta'
+                ? event.delta
+                : event.text
+          void extra
+            .sendNotification({
+              method: 'notifications/progress',
+              params: { progressToken, progress: ++progress, message: message.slice(-2000) },
+            })
+            .catch(() => {})
+        })
+        if (job.status === 'failed')
+          return {
+            isError: true,
+            content: [{ type: 'text' as const, text: `${job.error?.code}: ${job.error?.message}` }],
+          }
+        if (job.status !== 'completed' || !job.result)
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify(job) }],
+            structuredContent: job,
+          }
+        const answer = ResponseSchema.parse(job.result)
+        return withSavedImages(
+          {
+            content: [{ type: 'text' as const, text: JSON.stringify(answer) }],
+            structuredContent: answer,
+          },
+          answer,
+          extra.signal,
+        )
+      } catch (error) {
+        // The send was accepted. Keep the job ID even if its SSE subscription failed.
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                ...receipt,
+                retrieval_error: error instanceof Error ? error.message : 'SSE retrieval failed',
+                message: 'The job was accepted; resume with localgpt_response_get. Do not resend.',
+              }),
+            },
+          ],
+          structuredContent: receipt,
+        }
+      }
     },
   )
   server.registerTool(
     'localgpt_response_start',
     {
       description:
-        'Start an asynchronous LocalGPT response and return a response_job receipt immediately; it is not the answer. Await localgpt_response_get by job_id. The job survives start/poll client disconnects but holds the service-wide browser slot until it completes or fails. Do not resend a job that is thinking or unresponsive. No elapsed-time cutoff applies once sent. Results expire one hour after completion and survive restart when LOCALGPT_RESPONSE_JOBS_DIR is configured; a restarted pending job stays unknown and reserves the browser slot for manual recovery. Reference LocalMCP-visible paths rather than pasting large content.',
-      inputSchema: respondSchema,
+        'Start an asynchronous LocalGPT response and return a response_job receipt immediately. Does not mean the answer is complete. Await localgpt_response_get by job_id (SSE wait, no polling sleeps). The job survives start/poll client disconnects. Verified native jobs reserve their session/conversation while independent native sessions may send on the same tab; legacy jobs hold the browser slot. Do not resend a job when thinking or unresponsive. Async generation has no elapsed-time cutoff. Results expire one hour after completion and survive restart when LOCALGPT_RESPONSE_JOBS_DIR is configured. Unknown disconnected work remains pending and retains its native session/conversation reservations or legacy browser slot. For file tasks reference LocalMCP-visible paths and let the worker read through its enabled LocalMCP plugin; never paste full files or large code/diffs/logs or automatically attach files.',
+      inputSchema: {
+        input: ResponsesRequestSchema.shape.input,
+        model: ResponsesRequestSchema.shape.model,
+        files: ResponsesRequestSchema.shape.files,
+        reasoning: ResponsesRequestSchema.shape.reasoning,
+        session_id: ResponsesRequestSchema.shape.session_id,
+        instructions: ResponsesRequestSchema.shape.instructions,
+        newChat: ResponsesRequestSchema.shape.newChat,
+      },
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -312,7 +445,7 @@ export function createMcpServer(baseUrl: string) {
     'localgpt_response_get',
     {
       description:
-        'Wait for response_job events over SSE. wait_ms defaults to and is capped at 25000; it returns immediately on completion or failure, and an unfinished job returns in_progress after the bounded wait, so call again immediately without sleeping. wait_ms:0 reads an immediate snapshot. Only completed contains the final answer. thinking is observed activity; unresponsive is an unknown outcome, not confirmed stopping. A disconnect or stream ambiguity stays in_progress/unresponsive with partial text preserved. Never resend or assume cancellation. Jobs expire one hour after completion.',
+        'Wait for response_job events over SSE without navigating or claiming the browser slot. wait_ms defaults to 25000 (maximum), returns immediately on completion/failure; an unfinished job returns after that bounded wait. Call again immediately while in_progress, without sleeps. wait_ms:0 reads an immediate snapshot. in_progress is a pending receipt; only completed contains the final answer and saved images. thinking is observed activity; unresponsive means unknown activity, not confirmed stopping. disconnect or stream ambiguity remains in_progress/unresponsive, preserving partial text and original job receipt ownership. A disconnected native owner does not prevent a ready replacement tab from accepting a different session/conversation. Do not automatically resend. Completed results include original saved image pixels. Jobs expire one hour after completion; configured private LOCALGPT_RESPONSE_JOBS_DIR storage survives restart. Restarted pending jobs stay unknown and require exact owner-bound recovery; native jobs retain session/conversation reservations and legacy jobs retain the browser slot.',
       inputSchema: {
         job_id: z.string().uuid(),
         wait_ms: z.number().int().min(0).max(25000).default(25000),
@@ -320,37 +453,64 @@ export function createMcpServer(baseUrl: string) {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async (args, extra) => {
+      let result: Awaited<ReturnType<typeof invoke>>
       if (args.wait_ms === 0)
-        return invoke(
+        result = await invoke(
           `/v1/response-jobs/${args.job_id}`,
           ResponseJobSchema,
           undefined,
           extra.signal,
         )
-      try {
-        const job = await waitForResponseJob(
-          base,
-          args.job_id,
-          args.wait_ms,
-          extra.signal,
-          progressSender(extra as never),
-        )
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(job) }],
-          structuredContent: job,
-        }
-      } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: 'text' as const,
-              text: error instanceof Error ? error.message : 'Job stream failed; do not resend.',
+      else {
+        try {
+          let progress = 0
+          const job = await waitForResponseJob(
+            base,
+            args.job_id,
+            args.wait_ms,
+            extra.signal,
+            (event) => {
+              const progressToken = extra._meta?.progressToken
+              if (progressToken === undefined) return
+              const message =
+                event.type === 'response_job.updated'
+                  ? event.job.phase
+                  : event.type === 'response.output_text.delta'
+                    ? event.delta.slice(-2000)
+                    : event.text.slice(-2000)
+              void extra
+                .sendNotification({
+                  method: 'notifications/progress',
+                  params: { progressToken, progress: ++progress, message },
+                })
+                .catch(() => {})
             },
-          ],
+          )
+          result = {
+            content: [{ type: 'text' as const, text: JSON.stringify(job) }],
+            structuredContent: job,
+          }
+        } catch (error) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  error instanceof Error
+                    ? error.message
+                    : 'Job stream failed; do not resend generation.',
+              },
+            ],
+          }
         }
       }
+      if ('isError' in result) return result
+      const job = ResponseJobSchema.parse(result.structuredContent)
+      if (job.status !== 'completed' || !job.result) return result
+      return withSavedImages(result, ResponseSchema.parse(job.result), extra.signal)
     },
   )
+
   return server
 }

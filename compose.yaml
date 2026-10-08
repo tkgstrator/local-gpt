@@ -18,6 +18,7 @@ services:
       WS_PORT: 8875
       SESSIONS_FILE: /var/lib/localgpt/sessions.sqlite
       LOCALGPT_RESPONSE_JOBS_DIR: /var/lib/localgpt/response-jobs
+      LOCALGPT_IMAGES_DIR: /workspace/localgpt-images
       LOCALMCP_URL: http://local-mcp:8080/local
     ports:
       - '127.0.0.1:8766:8766'

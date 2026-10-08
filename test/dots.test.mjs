@@ -1,4 +1,4 @@
-import { test } from './test-support.mjs';
+import { test, installNativeEditing } from './test-support.mjs';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { Window } from 'happy-dom';
@@ -28,9 +28,19 @@ test('dots REST carries list/select/send/read operations and rejects malformed m
  assert.equal((await (await fetch(base+'/v1/dots/messages?dotId='+dot.id+'&afterMessageId=outgoing1')).json()).messages[0].text,'Dot reply');
  assert.equal((await fetch(base+'/v1/dots/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dotId:dot.id,text:' '})})).status,400);
 });
+test('listing dots on a replacement shared tab refreshes ownership of unselected dots',async t=>{
+ const service=require('../dist/server.cjs').createService({host:'127.0.0.1',httpPort:0,wsPort:0,timeoutMs:1000});const ports=await service.start();t.after(()=>service.close());const {WebSocket}=require('ws');
+ const connect=async id=>{const ws=new WebSocket(`ws://127.0.0.1:${ports.wsPort}/?browserId=${id}`);await once(ws,'open');ws.on('message',raw=>{const r=JSON.parse(raw);const result=r.operation.action==='list'?{action:'list',dots:[dot],cursor:null,source:'chatgpt_api',selected:null}:{action:'select',dot,status:'selected'};ws.send(JSON.stringify({type:'dots',requestId:r.requestId,result}));});return ws;};
+ const base=`http://127.0.0.1:${ports.httpPort}`,first=await connect('first');assert.equal((await fetch(base+'/v1/dots')).status,200);
+ const closed=once(first,'close');first.close();await closed;await connect('replacement');
+ const select=()=>fetch(base+'/v1/dots/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dotId:dot.id})});
+ const stale=await select();assert.equal(stale.status,409);assert.equal((await stale.json()).error.code,'dot_browser_changed');
+ assert.equal((await fetch(base+'/v1/dots')).status,200);assert.equal((await select()).status,200);
+});
 test('built extension sends only to selected dot, preserves drafts and reads replies after outgoing cursor',async t=>{
  const page=new Window({url:`https://chatgpt.com/dots/${dot.threadId}`});t.after(async()=>{page.dispatchEvent(new page.Event('pagehide'));await page.happyDOM.abort();page.close();});
  page.document.body.innerHTML='<textarea id="unrelated">unrelated manual draft</textarea><main class="thread-pane"><article class="message-row" data-message-id="old"><div class="message-text">Old private message</div></article><div contenteditable="true" role="textbox" aria-label="Message"></div><button aria-label="Send">Send</button></main>';
+ installNativeEditing(page);
  await page.happyDOM.waitUntilComplete();let queued=null;const events=[];page.chrome={runtime:{sendMessage:async r=>{if(r.path==='poll'){const request=queued;queued=null;return {ok:true,data:{request}};}events.push(r.data);return {ok:true,data:{ok:true}};}}};
  const globals=['chrome','window','document','location','HTMLTextAreaElement','WebSocket','CustomEvent','crypto','setTimeout','clearTimeout'];
  new Function(...globals,await readFile('dist/extension/content.js','utf8'))(...globals.map(k=>k==='window'?page:['setTimeout','clearTimeout'].includes(k)?page[k].bind(page):page[k]));

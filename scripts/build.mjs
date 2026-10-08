@@ -10,7 +10,7 @@ else try { token = (await readFile(tokenPath, 'utf8')).trim(); } catch (err) { i
 if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('Invalid local pairing token');
 const metadata = await readFile(new URL('../src/userscript.header.txt', import.meta.url), 'utf8');
 await build({ entryPoints: ['src/userscript.ts'], outfile: 'dist/chatgpt-api.user.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', define: { __BRIDGE_TOKEN__: JSON.stringify(token) }, banner: { js: metadata }, legalComments: 'inline' });
-await build({ entryPoints: ['src/server.ts', 'src/protocol.ts', 'src/chatgpt-dom.ts', 'src/extension-handler.ts', 'src/mcp.ts', 'src/capabilities.ts', 'src/page-observer.ts', 'src/dots.ts', 'src/model-selection.ts', 'src/sessions.ts', 'src/attachments.ts', 'src/browser-files.ts', 'src/localmcp.ts', 'src/conversation-stream.ts'], outdir: 'dist', outExtension: { '.js': '.cjs' }, bundle: true, platform: 'node', target: 'node22', format: 'cjs', packages: 'external' });
+await build({ entryPoints: ['src/server.ts', 'src/protocol.ts', 'src/chatgpt-dom.ts', 'src/extension-handler.ts', 'src/mcp.ts', 'src/capabilities.ts', 'src/page-observer.ts', 'src/conversation-stream.ts', 'src/generated-images.ts', 'src/dots.ts', 'src/model-selection.ts', 'src/sessions.ts', 'src/attachments.ts', 'src/browser-files.ts', 'src/localmcp.ts'], outdir: 'dist', outExtension: { '.js': '.cjs' }, bundle: true, platform: 'node', target: 'node22', format: 'cjs', packages: 'external' });
 
 await build({ entryPoints: ['src/dashboard.ts'], outfile: 'dist/dashboard.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', minify: true });
 await copyFile('public/dashboard.html', 'dist/dashboard.html');
@@ -18,7 +18,8 @@ await copyFile('public/dashboard.html', 'dist/dashboard.html');
 await mkdir('dist/extension', { recursive: true });
 await build({ entryPoints: ['src/extension-page.ts'], outfile: 'dist/extension/page.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110' });
 await build({ entryPoints: ['src/extension-content.ts'], outfile: 'dist/extension/content.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', define: { __BRIDGE_TOKEN__: '""' } });
-await build({ entryPoints: ['src/extension-background.ts'], outfile: 'dist/extension/background.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', define: { __BRIDGE_TOKEN__: JSON.stringify(token) } });
+await build({ entryPoints: ['src/extension-background.ts'], outfile: 'dist/extension/background.js', bundle: true, format: 'iife', platform: 'browser', target: 'chrome110', define: { __BRIDGE_TOKEN__: 'LOCALGPT_PAIRING_TOKEN' }, banner: { js: "importScripts('pairing.js');" } });
+await writeFile('dist/extension/pairing.js', 'const LOCALGPT_PAIRING_TOKEN = ' + JSON.stringify(process.env.LOCALGPT_PUBLIC_EXTENSION === '1' ? '' : token) + ';\n', { mode: 0o600 });
 await copyFile('extension/manifest.json', 'dist/extension/manifest.json');
 await copyFile('extension/popup.html', 'dist/extension/popup.html');
 await writeFile('dist/extension/README.txt', 'Chrome: chrome://extensions → デベロッパーモード → パッケージ化されていない拡張機能を読み込む → このフォルダーを選択。Tampermonkey版は無効にし、ChatGPTを再読み込みしてください。\n');
@@ -27,7 +28,10 @@ const extensionFiles = {};
 for (const name of await readdir('dist/extension')) extensionFiles[name] = new Uint8Array(await readFile(`dist/extension/${name}`));
 const extensionVersion = JSON.parse(await readFile('extension/manifest.json', 'utf8')).version;
 if (!/^\d+\.\d+\.\d+$/.test(extensionVersion)) throw new Error('Invalid extension version');
+await writeFile('dist/extension/build-info.json', JSON.stringify({ version: extensionVersion }) + '\n');
+extensionFiles['build-info.json'] = new Uint8Array(await readFile('dist/extension/build-info.json'));
 await writeFile(`dist/localgpt-extension-${extensionVersion}.zip`, zipSync(extensionFiles));
 
 await build({ entryPoints: ['src/mcp-stdio.ts'], outfile: 'dist/mcp-stdio.mjs', bundle: true, platform: 'node', target: 'node22', format: 'esm', packages: 'external' });
+await build({ entryPoints: ['scripts/update-extension.mjs'], outfile: 'dist/update-extension.mjs', bundle: true, platform: 'node', target: 'node22', format: 'esm' });
 await writeFile('dist/mcp-config.json', JSON.stringify({ mcpServers: { localgpt: { command: process.execPath, args: [resolve('dist/mcp-stdio.mjs')], env: { LOCALGPT_URL: 'http://127.0.0.1:8766' } } } }, null, 2) + '\n');
