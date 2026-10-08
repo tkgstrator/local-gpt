@@ -1,6 +1,6 @@
 {
   "name": "localgpt",
-  "version": "2.6.6",
+  "version": "2.6.7",
   "description": "LocalGPT: a local Responses API bridge for your ChatGPT browser tab",
   "main": "index.js",
   "scripts": {

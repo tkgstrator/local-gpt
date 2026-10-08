@@ -32,3 +32,5 @@ Health reports `nativeReady`, `activeGenerations` and `canStartIndependentGenera
 Source tests include the connected dispatcher → observer → browser → server A/B path, identity/persistence/ACK faults, uploads and legacy clients. They use mocked native functions and do not prove live concurrency. Live validation and actual-diff review must be recorded before this change is called complete.
 
 Image completion still requires every correlated image to be saved before terminal ACK. If native download metadata is unavailable, recovery remains pending rather than omitting an image. Unplanned page loss can discard page-local recovery ownership; persisted unknown server jobs remain reserved and must not be resent.
+
+Model and reasoning effort are resolved as a pair. Explicit request settings take precedence. A session's saved effort is inherited only for the same saved model; switching models without an explicit effort lets the native selector use its observed choice and still refuses ambiguous choices. On successful binding, a model change clears the previous model's effort from session metadata. Pre-dispatch refusals preserve the previous session settings.

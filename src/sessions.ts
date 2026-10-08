@@ -14,6 +14,19 @@ export const SessionSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
 })
+// Saved effort belongs to the saved model: an explicit request wins, otherwise inherit only for the same known model.
+export function resolveSessionSettings(
+  session: { model: string | null; effort: string | null } | null | undefined,
+  model?: string,
+  reasoning?: { effort: string },
+) {
+  const resolvedModel = model ?? session?.model ?? undefined
+  const inherited =
+    session?.model && session.effort && resolvedModel === session.model
+      ? { effort: session.effort }
+      : undefined
+  return { model: resolvedModel, reasoning: reasoning ?? inherited }
+}
 export const CreateSessionSchema = z
   .object({
     title: z.string().min(1).max(200).default('新しいセッション'),
@@ -93,7 +106,7 @@ export function createSessionStore(path = ':memory:') {
       ).run(
         conversationId,
         model ?? session.model,
-        effort ?? session.effort,
+        effort ?? (model && model !== session.model ? null : session.effort),
         new Date().toISOString(),
         id,
       )

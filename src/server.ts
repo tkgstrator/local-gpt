@@ -4,7 +4,12 @@ import { createImageStore } from './generated-images'
 import { MAX_GENERATED_IMAGES, type GeneratedImage } from './generated-image-protocol'
 import { attachLocalMcpTools, readLocalMcpConfig, type LocalMcpConfig } from './localmcp'
 import { filePrompt, loadFiles } from './attachments'
-import { createSessionStore, CreateSessionSchema, DeleteSessionSchema } from './sessions'
+import {
+  createSessionStore,
+  CreateSessionSchema,
+  DeleteSessionSchema,
+  resolveSessionSettings,
+} from './sessions'
 import { DotActionSchema } from './dots'
 import express from 'express'
 import { createMcpServer } from './mcp'
@@ -1351,8 +1356,7 @@ export function createService(options: Options) {
     const nativeUserMessageId = randomUUID()
     body = {
       ...body,
-      model: body.model ?? session?.model ?? undefined,
-      reasoning: body.reasoning ?? (session?.effort ? { effort: session.effort } : undefined),
+      ...resolveSessionSettings(session, body.model, body.reasoning),
       newChat: session ? !session.conversationId : body.newChat,
     }
     let jobId: string
@@ -1652,9 +1656,7 @@ export function createService(options: Options) {
     }
     const body = {
       ...parsed.data,
-      model: parsed.data.model ?? session?.model ?? undefined,
-      reasoning:
-        parsed.data.reasoning ?? (session?.effort ? { effort: session.effort } : undefined),
+      ...resolveSessionSettings(session, parsed.data.model, parsed.data.reasoning),
       newChat: session ? !session.conversationId : parsed.data.newChat,
     }
     const responsesBody = responsesParsed?.success
