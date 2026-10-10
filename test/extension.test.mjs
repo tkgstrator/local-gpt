@@ -31,22 +31,18 @@ test('extension archive filename follows the manifest version',async()=>{
  const manifest=JSON.parse(await readFile('dist/extension/manifest.json','utf8'));const archive=await readFile(`dist/localgpt-extension-${manifest.version}.zip`);assert.equal(archive.subarray(0,2).toString(),'PK');
 });
 
-test('background activates only the requesting ChatGPT tab when a job arrives', async () => {
+test('background delivers native and legacy requests without activating Chrome', async () => {
   let listener;
-  let activeTab = 99;
-  let focusedWindow = 9;
+  const activationCalls = [];
   let fetched = false;
   const chrome = {
     runtime: { id: 'our-id', onMessage: { addListener: fn => { listener = fn; } } },
     tabs: { update: async (id, options) => {
-      assert.equal(fetched, true);
-      assert.deepEqual(options, { active: true });
-      activeTab = id;
+      activationCalls.push({ api: 'tabs.update', id, options });
       return { id, windowId: 2 };
     } },
     windows: { update: async (id, options) => {
-      assert.deepEqual(options, { focused: true });
-      focusedWindow = id;
+      activationCalls.push({ api: 'windows.update', id, options });
     } },
   };
   let job = null;
@@ -56,14 +52,24 @@ test('background activates only the requesting ChatGPT tab when a job arrives', 
   const sender = { id: 'our-id', url: 'https://chatgpt.com/', tab: { id: 7 }, frameId: 0 };
   const invoke = sender => new Promise(resolve => listener(request, sender, resolve));
   assert.equal((await invoke(sender)).ok, true);
-  assert.equal(activeTab, 99);
-  job = { type: 'request', requestId: 'job1', text: 'Hello', newChat: true };
-  const response = await invoke(sender);
-  assert.equal(response.ok, true);
-  assert.equal(response.data.request.requestId, 'job1');
-  assert.equal(activeTab, 7);
-  assert.equal(focusedWindow, 2);
-  activeTab = 99;
+  assert.deepEqual(activationCalls, []);
+  const jobs = [
+    { type: 'request', requestId: 'legacy1', text: 'Hello', newChat: true },
+    { type: 'native_readiness', requestId: 'readiness1' },
+    { type: 'request', requestId: 'native1', text: 'Hello', newChat: true,
+      native: true, model: 'gpt-6-instant',
+      nativeUserMessageId: '00000000-0000-4000-8000-000000000001' },
+    { type: 'models', requestId: 'models1' },
+    { type: 'capabilities', requestId: 'capabilities1' },
+  ];
+  for (job of jobs) {
+    const response = await invoke(sender);
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.data.request, job);
+    assert.deepEqual(activationCalls, [], job.type);
+  }
+  fetched = false;
   assert.equal((await invoke({ ...sender, url: 'https://example.com/' })).ok, false);
-  assert.equal(activeTab, 99);
+  assert.equal(fetched, false);
+  assert.deepEqual(activationCalls, []);
 });
