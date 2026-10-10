@@ -36,6 +36,7 @@ interface BrowserLane {
   polling: { id: string; seenAt: number } | null
   queued: BrowserRequest | null
   nativeReady: boolean
+  nativeReadyReason: string | null
   nativeAdvertised: boolean
   readinessRequestId?: string
   readinessRetryAt?: number
@@ -45,6 +46,7 @@ interface BrowserLane {
 import {
   BrowserEventSchema,
   ChatRequestSchema,
+  sanitizeNativeReadyCode,
   type BrowserRequest,
   type BrowserEvent,
 } from './protocol'
@@ -166,6 +168,7 @@ export function createService(options: Options) {
         polling: null,
         queued: null,
         nativeReady: false,
+        nativeReadyReason: null,
         nativeAdvertised: false,
         nativeQueue: [],
       }
@@ -220,6 +223,7 @@ export function createService(options: Options) {
     if (lane.polling && !pollingConnected(lane)) {
       lane.polling = null
       lane.nativeReady = false
+      lane.nativeReadyReason = null
       clearReadinessProbe(lane)
       for (const request of [...lane.nativeQueue]) {
         const record = nativeGenerations.get(request.requestId)
@@ -407,6 +411,7 @@ export function createService(options: Options) {
       transport: wsConnected(shared) ? 'websocket' : pollingConnected(shared) ? 'http' : null,
       busy: browserBusy(),
       nativeReady: shared.nativeReady,
+      nativeReadyReason: shared.nativeReady ? null : shared.nativeReadyReason,
       activeGenerations: nativeGenerations.size,
       canStartIndependentGeneration: shared.nativeReady && !nativeBlocked() && connected(shared),
       updating: browserUpdating(),
@@ -755,6 +760,7 @@ export function createService(options: Options) {
     if (event.type === 'native_ready') {
       if (event.requestId !== lane.readinessRequestId || !connected(lane)) return false
       lane.nativeReady = event.ready
+      lane.nativeReadyReason = event.ready ? null : sanitizeNativeReadyCode(event.code)
       lane.nativeAdvertised = true
       clearTimeout(lane.readinessRetryTimer)
       if (!event.ready) {
@@ -2189,6 +2195,7 @@ export function createService(options: Options) {
             socket.data.client = client
             lane.browser = client
             lane.nativeReady = false
+            lane.nativeReadyReason = null
             clearReadinessProbe(lane)
             const nativeProtocol = (socket.data as SocketData & { nativeProtocol?: boolean })
               .nativeProtocol
@@ -2211,6 +2218,7 @@ export function createService(options: Options) {
             if (socket.data.client === lane.browser) {
               lane.browser = null
               lane.nativeReady = false
+              lane.nativeReadyReason = null
               clearReadinessProbe(lane)
               lane.nativeQueue = []
               for (const record of nativeGenerations.values())

@@ -109,7 +109,7 @@ function fixture() {
   const store = {
     scope,
     queryClient,
-    chain() {},
+    chain: new Map(),
     getOwnValue() {},
     node: {},
     value: {},
@@ -737,7 +737,10 @@ test('ambiguity rejects duplicate senders, builders and root store identities', 
         }
       }
     if (kind === 'store')
-      f.owner.memoizedState.next = { memoizedState: { current: { ...f.store } }, next: null }
+      f.owner.memoizedState.next = {
+        memoizedState: { current: { ...f.store, node: {} } },
+        next: null,
+      }
     await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow('ambiguous')
     expect(f.calls).toEqual([])
   }
@@ -1173,4 +1176,239 @@ test('observed native runtime remains discoverable after resource timings and sc
   )(f.page.document.querySelectorAll)
   const contract = await discoverVerifiedNativeContract(f.page, f.deps)
   expect(contract.scope).toBe(f.store)
+})
+
+// The live SDK's ep(e) factory wraps one shared node/chain/scope/queryClient in a
+// fresh handle per consumer, so aliases are distinct objects with identical raw context.
+function handle(shared: any, overrides: any = {}) {
+  const h: any = {
+    chain: shared.chain,
+    getOwnValue() {},
+    node: shared.node,
+    queryClient: shared.queryClient,
+    scope: shared.scope,
+    value: {},
+    get() {},
+    query() {},
+    set() {},
+    watch() {},
+    when() {},
+    ...overrides,
+  }
+  return h
+}
+function liveShared(f: any) {
+  return {
+    chain: new Map(),
+    node: {},
+    queryClient: f.store.queryClient,
+    scope: f.store.scope,
+  }
+}
+function chainHooks(...stores: any[]) {
+  return stores.reduceRight(
+    (next: any, store) => ({ memoizedState: { current: store }, next }),
+    null,
+  )
+}
+function liveFixture() {
+  const f = fixture()
+  const shared = liveShared(f)
+  const C = handle(shared),
+    O1 = handle(shared),
+    O2 = handle(shared)
+  const derived = (extra = {}) =>
+    handle({ ...shared, scope: {}, node: {}, chain: new Map() }, extra)
+  f.composer.memoizedState = chainHooks(C, derived(), derived())
+  f.owner.memoizedState = chainHooks(derived(), O1, derived(), O2)
+  return { ...f, shared, C, O1, O2, derived }
+}
+test('live ep(e)-style aliases bind the composer handle, never an owner alias', async () => {
+  const f = liveFixture()
+  expect(f.C).not.toBe(f.O1)
+  const c = await discoverVerifiedNativeContract(f.page, f.deps)
+  expect(c.scope).toBe(f.C)
+  expect(c.scope).not.toBe(f.O1)
+  expect(c.scope).not.toBe(f.O2)
+  f.O1.value = { changed: true }
+  f.C.value = { changed: true }
+  expect(() => c.build('hello', [])).not.toThrow()
+})
+test('equal primitive node or chain values cannot establish a native store binding', async () => {
+  for (const key of ['node', 'chain'] as const) {
+    for (const value of [undefined, null, 0, 'shared']) {
+      const f = liveFixture()
+      f.C[key] = f.O1[key] = f.O2[key] = value
+      await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+        'native_store_context_invalid',
+      )
+      expect(f.calls).toEqual([])
+    }
+  }
+})
+test('owner aliases with a different node or chain remain ambiguous; none is unavailable', async () => {
+  for (const [defect, code] of [
+    ['node', 'native_store_ambiguous'],
+    ['chain', 'native_store_ambiguous'],
+    ['none', 'native_store_unavailable'],
+  ] as const) {
+    const f = liveFixture()
+    if (defect === 'node') f.O2.node = {}
+    if (defect === 'chain') f.O2.chain = new Map()
+    if (defect === 'none') f.owner.memoizedState = chainHooks(f.derived(), f.derived())
+    await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(code)
+    expect(f.calls).toEqual([])
+  }
+})
+test('in-place node or chain changes on the bound handle fail closed; value does not', async () => {
+  for (const key of ['node', 'chain'] as const) {
+    const f = liveFixture()
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    f.C[key] = key === 'node' ? {} : new Map()
+    expect(() => c.build('hello', [])).toThrow('native_store_stale')
+    await expect(c.readConversationSnapshot!(id, new AbortController().signal)).rejects.toThrow(
+      'native_store_stale',
+    )
+    expect(f.calls).toEqual([])
+  }
+})
+test('in-place context changes during async refetch or upload are rejected after the await', async () => {
+  for (const key of ['node', 'chain'] as const) {
+    const mutate = (g: any, name: string) => {
+      const push = g.calls.push.bind(g.calls)
+      g.calls.push = (...items: any[]) => {
+        if (items[0]?.[0] === name) g.C[key] = key === 'node' ? {} : new Map()
+        return push(...items)
+      }
+    }
+    const f = liveFixture()
+    mutate(f, 'refetch')
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    await expect(c.prepareExistingConversation!(id, project)).rejects.toThrow('native_store_stale')
+    const g = liveFixture()
+    mutate(g, 'upload')
+    const d = await discoverVerifiedNativeContract(g.page, g.deps)
+    await expect(
+      d.upload(d.scope, d.makeFile!({ name: 'a.txt', mime: 'text/plain', base64: 'YQ==' }), {
+        isTemporaryChat: false,
+        storeInLibrary: false,
+        model: { slug: 'instant', thinkingEffort: null, versionId: 'latest' },
+        composerContext: { isProjectThread: false, messageId: id },
+      }),
+    ).rejects.toThrow('native_store_stale')
+  }
+})
+const thinkingModels = () => ({
+  versionOptions: [
+    {
+      id: 'latest',
+      slugs: ['gpt-6-thinking', 'gpt-6-instant', 'gpt-6-pro'],
+      options: [
+        { slug: 'gpt-6-thinking', thinkingEffort: 'standard', isAvailable: true },
+        { slug: 'gpt-6-thinking', thinkingEffort: 'extended', isAvailable: true },
+        { slug: 'gpt-6-thinking', thinkingEffort: 'max', isAvailable: true },
+        { slug: 'gpt-6-instant', isAvailable: true },
+        { slug: 'gpt-6-pro', thinkingEffort: 'extended', isAvailable: true },
+      ],
+    },
+  ],
+})
+test('unresolved null selected effort is ready but never guessed for requests', async () => {
+  const { selectNativeModel } = await import('../src/native-chat')
+  const f = fixture()
+  f.composer.memoizedProps.models = thinkingModels()
+  f.composer.memoizedProps.selectedModel = {
+    slug: 'gpt-6-thinking',
+    versionId: 'latest',
+    thinkingEffort: null,
+  }
+  const c = await discoverVerifiedNativeContract(f.page, f.deps)
+  expect(c.selected).toEqual({ slug: 'gpt-6-thinking', versionId: 'latest', thinkingEffort: null })
+  expect(selectNativeModel(c.models, c.selected, 'gpt-6-instant')).toMatchObject({
+    model: 'gpt-6-instant',
+    thinkingEffort: null,
+  })
+  expect(selectNativeModel(c.models, c.selected, 'gpt-6-pro')).toMatchObject({
+    thinkingEffort: 'extended',
+  })
+  expect(selectNativeModel(c.models, c.selected, 'gpt-6-thinking', 'max')).toMatchObject({
+    thinkingEffort: 'max',
+  })
+  expect(() => selectNativeModel(c.models, c.selected)).toThrow()
+  expect(() => selectNativeModel(c.models, c.selected, 'gpt-6-thinking')).toThrow()
+  expect(() => selectNativeModel(c.models, c.selected, 'gpt-6-thinking', 'bogus')).toThrow()
+  // Submit-time validation stays exact.
+  const built = c.build('hello', [])
+  expect(() =>
+    c.submit(c.scope, { model: 'gpt-6-thinking', prompt: 'hello', userCompletionMessages: built }),
+  ).toThrow('native_model_unavailable')
+  expect(f.calls.filter((x) => x[0] === 'send')).toEqual([])
+})
+test('explicit Instant submits once while the selected Thinking effort remains unresolved', async () => {
+  const f = fixture()
+  f.composer.memoizedProps.models = thinkingModels()
+  const selected = { slug: 'gpt-6-thinking', versionId: 'latest', thinkingEffort: null }
+  f.composer.memoizedProps.selectedModel = selected
+  const c = await discoverVerifiedNativeContract(f.page, f.deps)
+  const built = c.build('hello', [])
+  await c.submit(c.scope, {
+    model: 'gpt-6-instant',
+    thinkingEffort: null,
+    prompt: 'hello',
+    userCompletionMessages: built,
+  })
+  const sends = f.calls.filter((x) => x[0] === 'send')
+  expect(sends).toHaveLength(1)
+  expect(sends[0][1]).toBe(f.store)
+  expect(sends[0][2].model).toBe('gpt-6-instant')
+  expect(f.composer.memoizedProps.selectedModel).toBe(selected)
+  expect(selected.thinkingEffort).toBeNull()
+})
+test('readiness still rejects structurally invalid or unusable selected catalogs', async () => {
+  const cases: [string, (f: any) => void, string][] = [
+    [
+      'unknown version',
+      (f) => (f.composer.memoizedProps.selectedModel.versionId = 'old'),
+      'native_model_unavailable',
+    ],
+    [
+      'unknown slug',
+      (f) => (f.composer.memoizedProps.selectedModel.slug = 'nope'),
+      'native_model_unavailable',
+    ],
+    [
+      'unavailable options',
+      (f) =>
+        f.composer.memoizedProps.models.versionOptions[0].options.forEach(
+          (o: any) => (o.isAvailable = false),
+        ),
+      'native_model_unavailable',
+    ],
+    [
+      'bogus non-null effort',
+      (f) => (f.composer.memoizedProps.selectedModel.thinkingEffort = 'bogus'),
+      'native_model_unavailable',
+    ],
+    [
+      'non-string effort',
+      (f) => (f.composer.memoizedProps.selectedModel.thinkingEffort = 7),
+      'native_models_invalid',
+    ],
+    [
+      'no versions',
+      (f) => (f.composer.memoizedProps.models.versionOptions = []),
+      'native_models_invalid',
+    ],
+  ]
+  for (const [, mutate, code] of cases) {
+    const f = fixture()
+    f.composer.memoizedProps.models = thinkingModels()
+    f.composer.memoizedProps.selectedModel = {
+      slug: 'gpt-6-thinking',
+      versionId: 'latest',
+      thinkingEffort: null,
+    }
+    mutate(f)
+    await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(code)
+  }
 })

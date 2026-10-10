@@ -228,6 +228,8 @@ function association(page: NativeAdapterPage) {
       props = composer.memoizedProps
     const composerStore = hookStores(composer)[0]
     if (!composerStore) fail('native_composer_store_unavailable')
+    if (!object(composerStore.node) || !object(composerStore.chain))
+      fail('native_store_context_invalid')
     const owner = lineage
       .slice(index + 1)
       .find(
@@ -238,14 +240,22 @@ function association(page: NativeAdapterPage) {
           ),
       )
     if (!owner) fail('native_store_root_unavailable')
-    const store = unique(
-      hookStores(owner).filter(
-        (s) => s.scope === composerStore.scope && s.queryClient === composerStore.queryClient,
-      ),
-      'store',
+    // The SDK's store factory wraps one node/chain/scope/queryClient in a fresh
+    // handle per consumer, so owner aliases are distinct objects. They must all
+    // share the composer handle's raw context; the composer handle itself is bound.
+    const aliases = hookStores(owner).filter(
+      (s) => s.scope === composerStore.scope && s.queryClient === composerStore.queryClient,
     )
+    if (!aliases.length) fail('native_store_unavailable')
+    if (aliases.some((s) => s.node !== composerStore.node || s.chain !== composerStore.chain))
+      fail('native_store_ambiguous')
     validateModels(props.models, props.selectedModel)
-    matches.push({ form, store, models: props.models, selected: props.selectedModel })
+    matches.push({
+      form,
+      store: composerStore,
+      models: props.models,
+      selected: props.selectedModel,
+    })
   }
   return unique(matches, 'composer')
 }
@@ -282,7 +292,25 @@ function validateModels(models: unknown, selected: unknown) {
       )
         fail('native_models_invalid')
   }
-  validateModel(models, selected.slug, selected.thinkingEffort, selected.versionId)
+  // Readiness validates the observed selection structurally. A null effort may be
+  // unresolved UI state; requests resolve or refuse it in selectNativeModel.
+  if (selected.thinkingEffort === null) validateSelectedCatalog(models, selected)
+  else validateModel(models, selected.slug, selected.thinkingEffort, selected.versionId)
+}
+function validateSelectedCatalog(models: Obj, selected: Obj) {
+  const version = models.versionOptions.find(
+    (v: Obj) => v.id === selected.versionId && v.slugs.includes(selected.slug),
+  )
+  if (
+    !version ||
+    !version.options.some(
+      (o: Obj) =>
+        o.isAvailable &&
+        (o.slug === selected.slug ||
+          (o.lane && version.modelSlugByLane?.[o.lane] === selected.slug)),
+    )
+  )
+    fail('native_model_unavailable')
 }
 function validateModel(models: Obj, slug: unknown, effort: unknown, versionId?: unknown) {
   if (
@@ -572,20 +600,29 @@ export async function discoverVerifiedNativeContract(
   )
   const associated = association(page)
   const rawScope = associated.store.scope,
-    queryClient = associated.store.queryClient
+    queryClient = associated.store.queryClient,
+    rawNode = associated.store.node,
+    rawChain = associated.store.chain
   const models = structuredClone(associated.models),
     selected = structuredClone(associated.selected)
   const projectRows = projects(page)
   const builtMessages = new Map<string, Obj[]>()
   let preparedCount = 0
+  const pinned = () =>
+    associated.store.scope === rawScope &&
+    associated.store.queryClient === queryClient &&
+    associated.store.node === rawNode &&
+    associated.store.chain === rawChain
   const assertCurrent = (scope: unknown = associated.store) => {
+    if (scope !== associated.store || !pinned()) fail('native_store_stale')
     const now = association(page)
     if (
-      scope !== associated.store ||
       now.form !== associated.form ||
       now.store !== associated.store ||
       now.store.scope !== rawScope ||
-      now.store.queryClient !== queryClient
+      now.store.queryClient !== queryClient ||
+      now.store.node !== rawNode ||
+      now.store.chain !== rawChain
     )
       fail('native_store_stale')
     return now
@@ -745,7 +782,9 @@ export async function discoverVerifiedNativeContract(
         }
       }
       assertCurrent(scope)
-      const result = uploadReference(await native.upload(scope, file, options))
+      const uploaded = await native.upload(scope, file, options)
+      assertCurrent(scope)
+      const result = uploadReference(uploaded)
       if (
         result.name !== file.name ||
         result.mimeType !== file.type ||

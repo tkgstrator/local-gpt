@@ -530,3 +530,37 @@ test('WebSocket readiness retries a lost receipt and clears its probe on HTTP fa
  assert.equal((await f.job(sid)).status,409)
  assert.equal((await (await fetch(f.base+'/v1/response-jobs/'+job.id)).json()).status,'in_progress')
 })
+
+test('failed readiness reason is correlated, sanitized, exposed in health and cleared',async t=>{
+ const f=await fixture(t);const health=async()=>(await (await fetch(f.base+'/health')).json());
+ const probe=(await f.bridge('poll',{nativeProtocol:1})).request;
+ assert.equal((await health()).nativeReadyReason??null,null);
+ assert.equal((await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:false,code:'native_store_ambiguous'},'foreign')).accepted,false);
+ assert.equal((await health()).nativeReadyReason??null,null);
+ assert.equal((await f.bridge('event',{type:'native_ready',requestId:'stale-id',protocol:1,ready:false,code:'native_store_ambiguous'})).accepted,false);
+ assert.equal((await f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:false,code:'native_store_ambiguous'})).accepted,true);
+ let h=await health();assert.equal(h.nativeReady,false);assert.equal(h.nativeReadyReason,'native_store_ambiguous');
+ await new Promise(r=>setTimeout(r,1100));const retry=(await f.bridge('poll',{nativeProtocol:1})).request;assert.equal(retry.type,'native_readiness');
+ // A receipt with no code or an unknown code is reported generically.
+ await f.bridge('event',{type:'native_ready',requestId:retry.requestId,protocol:1,ready:false});
+ assert.equal((await health()).nativeReadyReason,'native_readiness_unavailable');
+ await new Promise(r=>setTimeout(r,1100));const third=(await f.bridge('poll',{nativeProtocol:1})).request;
+ assert.equal((await f.bridge('event',{type:'native_ready',requestId:third.requestId,protocol:1,ready:false,code:'native_private_message'})).accepted,true);
+ assert.equal((await health()).nativeReadyReason,'native_readiness_unavailable');
+ await new Promise(r=>setTimeout(r,1100));const fourth=(await f.bridge('poll',{nativeProtocol:1})).request;
+ await f.bridge('event',{type:'native_ready',requestId:fourth.requestId,protocol:1,ready:true});
+ h=await health();assert.equal(h.nativeReady,true);assert.equal(h.nativeReadyReason??null,null);
+})
+test('readiness reason clears when the websocket disconnects',async t=>{
+ const f=await fixture(t,{noInitialPoll:true});
+ const ws=new WebSocket('ws://127.0.0.1:'+f.ports.wsPort+'/?token=test&browserId=owner&nativeProtocol=1');
+ await once(ws,'open').catch(()=>{});
+ const health=async()=>(await (await fetch(f.base+'/health')).json());
+ const probe=await new Promise(res=>{ws.on('message',raw=>{const m=JSON.parse(String(raw));if(m.type==='native_readiness')res(m)})});
+ ws.send(JSON.stringify({type:'native_ready',requestId:probe.requestId,protocol:1,ready:false,code:'native_models_invalid'}));
+ for(let i=0;i<50&&(await health()).nativeReadyReason!=='native_models_invalid';i++)await new Promise(r=>setTimeout(r,20));
+ assert.equal((await health()).nativeReadyReason,'native_models_invalid');
+ ws.close();
+ for(let i=0;i<50&&(await health()).nativeReadyReason;i++)await new Promise(r=>setTimeout(r,20));
+ assert.equal((await health()).nativeReadyReason??null,null);
+})

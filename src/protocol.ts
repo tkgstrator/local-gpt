@@ -79,6 +79,36 @@ export const BrowserRequestSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('navigation_ready'), requestId: z.string().min(1) }),
   z.object({ type: z.literal('dots'), requestId: z.string().min(1), operation: DotActionSchema }),
 ])
+// Readiness failures expose fixed safe codes only; raw Error messages never cross the wire.
+const NATIVE_READY_CODES = new Set([
+  ...['runtime', 'completion', 'uploader', 'builder', 'refetch', 'composer', 'store'].flatMap(
+    (name) => [`native_${name}_unavailable`, `native_${name}_ambiguous`],
+  ),
+  'native_composer_store_unavailable',
+  'native_store_root_unavailable',
+  'native_store_context_invalid',
+  'native_current_form_unavailable',
+  'native_current_form_ambiguous',
+  'native_react_fiber_unavailable',
+  'native_react_fiber_ambiguous',
+  'native_react_root_unavailable',
+  'native_react_tree_invalid',
+  'native_react_tree_limit',
+  'native_react_hooks_invalid',
+  'native_models_invalid',
+  'native_model_unavailable',
+  'native_project_attributes_invalid',
+  'native_exports_ambiguous',
+  'native_exports_unavailable',
+  'native_probe_timeout',
+  'native_readiness_unavailable',
+])
+export const NativeReadyCodeSchema = z.string().regex(/^native_[a-z0-9_]{1,57}$/)
+export function sanitizeNativeReadyCode(value: unknown): string {
+  return typeof value === 'string' && NATIVE_READY_CODES.has(value)
+    ? value
+    : 'native_readiness_unavailable'
+}
 export const BrowserEventSchema = z
   .discriminatedUnion('type', [
     z.object({
@@ -86,6 +116,7 @@ export const BrowserEventSchema = z
       requestId: z.string().min(1),
       protocol: z.literal(1),
       ready: z.boolean(),
+      code: NativeReadyCodeSchema.optional(),
     }),
     z.object({
       type: z.literal('native_intent'),

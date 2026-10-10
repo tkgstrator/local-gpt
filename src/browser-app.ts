@@ -30,7 +30,12 @@ import {
   CapabilitiesSchema,
   emptyCapabilities,
 } from './capabilities'
-import { BrowserRequestSchema, type BrowserEvent, type BrowserRequest } from './protocol'
+import {
+  BrowserRequestSchema,
+  sanitizeNativeReadyCode,
+  type BrowserEvent,
+  type BrowserRequest,
+} from './protocol'
 import {
   DomError,
   isVisible,
@@ -132,7 +137,7 @@ class App {
   private nativeContexts = new Map<string, NativeContext>()
   // Tombstones prevent duplicate transport delivery from ever invoking dispatch again.
   private nativeRequests = new Set<string>()
-  private nativeProbes = new Map<string, (ready: boolean) => void>()
+  private nativeProbes = new Map<string, (ready: boolean, code?: string) => void>()
   private responseStream: {
     requestId: string
     messageId: string | null
@@ -628,7 +633,7 @@ class App {
       if (!parsed.success) return
       const result = parsed.data
       if (result.kind === 'ready') {
-        this.nativeProbes.get(result.requestId)?.(result.ready === true)
+        this.nativeProbes.get(result.requestId)?.(result.ready === true, result.code)
         return
       }
       const state = this.nativeContexts.get(result.requestId)
@@ -758,13 +763,13 @@ class App {
     return false
   }
   private async probeNative(requestId: string) {
-    const ready = await new Promise<boolean>((resolve) => {
-      const done = (value: boolean) => {
+    const outcome = await new Promise<{ ready: boolean; code?: string }>((resolve) => {
+      const done = (ready: boolean, code?: string) => {
         clearTimeout(timer)
         this.nativeProbes.delete(requestId)
-        resolve(value)
+        resolve(ready ? { ready } : { ready, code: sanitizeNativeReadyCode(code) })
       }
-      const timer = setTimeout(() => done(false), 10000)
+      const timer = setTimeout(() => done(false, 'native_probe_timeout'), 10000)
       this.nativeProbes.set(requestId, done)
       window.dispatchEvent(
         new CustomEvent(NATIVE_REQUEST_EVENT, {
@@ -772,7 +777,7 @@ class App {
         }),
       )
     })
-    this.send({ type: 'native_ready', requestId, protocol: 1, ready })
+    this.send({ type: 'native_ready', requestId, protocol: 1, ...outcome })
   }
   private async runNative(request: Extract<BrowserRequest, { type: 'request' }>) {
     if (this.nativeRequests.has(request.requestId)) return
@@ -2086,7 +2091,7 @@ class App {
   stop() {
     this.destroyed = true
     window.removeEventListener(NATIVE_RESULT_EVENT, this.nativeResult)
-    for (const done of this.nativeProbes.values()) done(false)
+    for (const done of this.nativeProbes.values()) done(false, 'native_readiness_unavailable')
     for (const state of this.nativeContexts.values())
       state.prepared?.({
         requestId: state.request.requestId,

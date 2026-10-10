@@ -6,8 +6,8 @@ const cidB = '6ac07bb1-b2b4-43e8-8304-5424a5cf2ef4';
 const userA = 'f5eadb59-b96e-4ef5-9342-2f49d62b3c6f';
 const userB = 'f5eadb59-b96e-4ef5-9342-2f49d62b3c60';
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-async function wait(read) {
-  for (let i = 0; i < 250; i++) {
+async function wait(read, ms = 5000) {
+  for (let i = 0; i < ms / 20; i++) {
     const value = read();
     if (value) return value;
     await pause(20);
@@ -32,14 +32,14 @@ async function fixture(t, websocket = false) {
   let clicks = 0;
   page.document.querySelector('button').onclick = () => clicks++;
   const queue = [], events = [], commands = [], dispatches = [], disarms = [], arms = [], timeline = [];
-  let polls = 0, imageAccepted = true, identityAccepted = true, intentAccepted = true, terminalAccepted = true, acceptedFor = null, prepareError = null, update = null;
+  let polls = 0, imageAccepted = true, identityAccepted = true, intentAccepted = true, terminalAccepted = true, acceptedFor = null, prepareError = null, update = null, probeReceipt = null;
   const emit = (name, data) => page.dispatchEvent(new page.CustomEvent(name, { detail: JSON.stringify(data) }));
   page.addEventListener('localgpt:stream-disarm', event => disarms.push(event.detail));
   page.addEventListener('localgpt:stream-arm', event => { arms.push(JSON.parse(event.detail)); timeline.push('arm'); });
   page.addEventListener('localgpt:native-request', event => {
     const command = JSON.parse(event.detail);
     commands.push(command);
-    if (command.action === 'probe') emit('localgpt:native-result', { requestId: command.requestId, kind: 'ready', ready: true });
+    if (command.action === 'probe') { if (probeReceipt !== 'silent') emit('localgpt:native-result', { requestId: command.requestId, kind: 'ready', ...(probeReceipt ?? { ready: true }) }); }
     if (command.action === 'prepare') emit('localgpt:native-result', prepareError
       ? { requestId: command.requestId, kind: 'error', code: prepareError, preDispatch: true }
       : { requestId: command.requestId, kind: 'prepared', nativeUserMessageId: command.nativeUserMessageId });
@@ -74,6 +74,7 @@ async function fixture(t, websocket = false) {
     setTerminalAccepted: value => terminalAccepted = value,
     setAcceptedFor: value => acceptedFor = value,
     setPrepareError: value => prepareError = value,
+    setProbeReceipt: value => probeReceipt = value,
     setUpdate: value => update = value,
   };
 }
@@ -383,3 +384,34 @@ test('terminal error waits for buffered image ACK but not for unresolved referen
  assert.equal(f.events.some(e=>e.type==='error'&&e.terminalEvidence),false);assert.equal(f.disarms.includes('A'),false)
  f.setImageAccepted(true);await wait(()=>f.events.some(e=>e.type==='error'&&e.terminalEvidence));await wait(()=>f.disarms.includes('A'))
 })
+
+test('failed readiness forwards only allowlisted bounded codes', async t => {
+  const f = await fixture(t);
+  const probe = async (id, receipt) => { f.setProbeReceipt(receipt); f.deliver({ type: 'native_readiness', requestId: id }); return wait(() => f.events.find(e => e.type === 'native_ready' && e.requestId === id)); };
+  const known = await probe('known', { ready: false, code: 'native_store_ambiguous' });
+  assert.deepEqual([known.ready, known.code], [false, 'native_store_ambiguous']);
+  for (const [id, code] of [['raw', 'Cannot read secret token abc at https://x'], ['empty', ''], ['long', 'native_' + 'x'.repeat(500)], ['unknown', 'native_not_a_real_code'], ['proto', '__proto__']]) {
+    const e = await probe(id, { ready: false, code });
+    assert.equal(e.ready, false); assert.equal(e.code, 'native_readiness_unavailable');
+  }
+  const missing = await probe('missing', { ready: false });
+  assert.equal(missing.code, 'native_readiness_unavailable');
+  const ok = await probe('ok', { ready: true, code: 'native_store_ambiguous' });
+  assert.equal(ok.ready, true); assert.equal('code' in ok, false);
+});
+test('unanswered readiness probe times out with native_probe_timeout', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  f.setProbeReceipt('silent');
+  f.deliver({ type: 'native_readiness', requestId: 'slow' });
+  const e = await wait(() => f.events.find(x => x.type === 'native_ready' && x.requestId === 'slow'), 13000);
+  assert.deepEqual([e.ready, e.code], [false, 'native_probe_timeout']);
+});
+test('probe receipts for other request ids never settle a pending probe', async t => {
+  const f = await fixture(t);
+  f.setProbeReceipt('silent');
+  f.deliver({ type: 'native_readiness', requestId: 'mine' });
+  await wait(() => f.commands.some(c => c.requestId === 'mine'));
+  f.emit('localgpt:native-result', { requestId: 'other', kind: 'ready', ready: false, code: 'native_store_ambiguous' });
+  await pause(150);
+  assert.equal(f.events.some(e => e.type === 'native_ready'), false);
+});

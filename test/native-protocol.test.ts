@@ -87,3 +87,24 @@ test('extension forwards native poll negotiation and still rejects other fields'
   ).toBe(false)
   expect(ExtensionRequestSchema.safeParse({ ...request, data: {} }).success).toBe(true)
 })
+
+test('native_ready accepts an optional bounded readiness code only', () => {
+  const base = { type: 'native_ready', requestId: 'probe', protocol: 1, ready: false }
+  expect(BrowserEventSchema.safeParse({ ...base, code: 'native_store_ambiguous' }).success).toBe(
+    true,
+  )
+  expect(BrowserEventSchema.safeParse(base).success).toBe(true)
+  expect(BrowserEventSchema.safeParse({ ...base, code: 'x'.repeat(65) }).success).toBe(false)
+  expect(BrowserEventSchema.safeParse({ ...base, code: '' }).success).toBe(false)
+  expect(BrowserEventSchema.safeParse({ ...base, code: 'Bad message with spaces' }).success).toBe(
+    false,
+  )
+  expect(BrowserEventSchema.safeParse({ ...base, code: 5 }).success).toBe(false)
+})
+test('readiness code sanitizer maps unknown input to the generic code', async () => {
+  const { sanitizeNativeReadyCode } = await import('../src/protocol')
+  expect(sanitizeNativeReadyCode('native_store_ambiguous')).toBe('native_store_ambiguous')
+  expect(sanitizeNativeReadyCode('native_probe_timeout')).toBe('native_probe_timeout')
+  for (const v of ['raw message', '', undefined, null, 7, '__proto__', 'constructor', 'native_x'])
+    expect(sanitizeNativeReadyCode(v)).toBe('native_readiness_unavailable')
+})
