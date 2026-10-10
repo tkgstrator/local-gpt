@@ -102,6 +102,31 @@ test('large native hook lists resolve their store and still reject cycles', asyn
     'native_react_hooks_invalid',
   )
 })
+// Minimal rendered-DOM stand-in: connected, visible, one positive client rect.
+function element(extra: any = {}) {
+  const e: any = {
+    tagName: 'DIV',
+    isConnected: true,
+    hidden: false,
+    parentElement: null,
+    attrs: {},
+    style: { display: 'block', visibility: 'visible' },
+    rects: [{ width: 100, height: 20 }],
+    getAttribute(k: string) {
+      return this.attrs[k] ?? null
+    },
+    getClientRects() {
+      return this.rects
+    },
+    querySelectorAll: () => [],
+    closest() {
+      for (let n: any = this; n; n = n.parentElement) if (n.tagName === 'FORM') return n
+      return null
+    },
+    ...extra,
+  }
+  return e
+}
 function fixture() {
   const calls: any[] = []
   const scope = {},
@@ -146,7 +171,9 @@ function fixture() {
     memoizedProps: { onSubmit() {}, models, selectedModel },
     memoizedState: { memoizedState: { current: store }, next: null },
   }
-  const form: any = { draft: 'MANUAL DRAFT', attachments: ['manual'], isConnected: true }
+  const form: any = element({ tagName: 'FORM', draft: 'MANUAL DRAFT', attachments: ['manual'] })
+  const editor: any = element({ parentElement: form })
+  form.querySelectorAll = () => [editor]
   const fiber: any = { return: composer, stateNode: form }
   form.__reactFiber$test = fiber
   root.child = owner
@@ -274,6 +301,7 @@ function fixture() {
     location: { origin: 'https://chatgpt.com' },
     performance: { getEntriesByType: () => [{ name: 'https://chatgpt.com/cdn/assets/random.js' }] },
     document: {
+      defaultView: { getComputedStyle: (e: any) => e.style },
       querySelectorAll: (selector: string) =>
         selector === 'form'
           ? [form]
@@ -1105,6 +1133,7 @@ test('detached/unassociated current tree and multiple composers are rejected bef
       const form = { ...f.form },
         fiber = { ...f.fiber, stateNode: form }
       form.__reactFiber$test = fiber
+      form.querySelectorAll = () => [element({ parentElement: form })]
       f.fiber.sibling = fiber
       const original = f.page.document.querySelectorAll
       f.page.document.querySelectorAll = (selector: string) =>
@@ -1411,4 +1440,237 @@ test('readiness still rejects structurally invalid or unusable selected catalogs
     mutate(f)
     await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(code)
   }
+})
+
+// Extra mounted React forms whose fibers must never be read unless rendered.
+function mount(f: any, hide: (form: any) => void, readable = false) {
+  const form = element({ tagName: 'FORM' }),
+    editor = element({ parentElement: form })
+  form.querySelectorAll = () => [editor]
+  form.reads = 0
+  const fiber = { return: f.composer, stateNode: form, sibling: f.fiber.sibling }
+  f.fiber.sibling = fiber
+  Object.defineProperty(form, '__reactFiber$extra', {
+    enumerable: true,
+    get() {
+      form.reads++
+      if (!readable) throw new Error('hidden fiber read')
+      return fiber
+    },
+  })
+  hide(form)
+  const original = f.page.document.querySelectorAll
+  f.page.document.querySelectorAll = (selector: string) =>
+    selector === 'form' ? [...original(selector), form] : original(selector)
+  return form
+}
+const hiders: Record<string, (form: any) => void> = {
+  'display:none ancestor': (form) => {
+    form.parentElement = element({ style: { display: 'none', visibility: 'visible' } })
+    form.rects = []
+  },
+  'hidden ancestor': (form) => {
+    form.parentElement = element({
+      hidden: true,
+      style: { display: 'none', visibility: 'visible' },
+    })
+  },
+  'visibility:hidden': (form) => {
+    form.style = { display: 'block', visibility: 'hidden' }
+  },
+  'visibility:collapse': (form) => {
+    form.style = { display: 'block', visibility: 'collapse' }
+  },
+  'zero rect': (form) => {
+    form.rects = [{ width: 0, height: 0 }]
+  },
+  'no rects': (form) => {
+    form.rects = []
+  },
+  disconnected: (form) => {
+    form.isConnected = false
+  },
+}
+
+test('one rendered composer works while hidden mounted composers are never inspected', async () => {
+  const f = fixture(),
+    mounted = Object.values(hiders).map((hide) => mount(f, hide))
+  f.page.document.hasFocus = () => false
+  f.page.document.visibilityState = 'hidden'
+  const c = await discoverVerifiedNativeContract(f.page, f.deps)
+  expect(c.scope).toBe(f.store)
+  expect(mounted.map((m) => m.reads)).toEqual(mounted.map(() => 0))
+})
+
+test('a form with only a hidden editor is not a rendered composer', async () => {
+  const f = fixture(),
+    editor = f.form.querySelectorAll()[0]
+  editor.parentElement = element({ style: { display: 'none', visibility: 'visible' } })
+  editor.rects = []
+  await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+    'native_composer_unavailable',
+  )
+})
+
+test('zero rendered composers are unavailable and two rendered composers are ambiguous', async () => {
+  const f = fixture()
+  hiders['display:none ancestor']!(f.form)
+  await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+    'native_composer_unavailable',
+  )
+  const g = fixture()
+  mount(g, () => {}, true)
+  await expect(discoverVerifiedNativeContract(g.page, g.deps)).rejects.toThrow(
+    'native_composer_ambiguous',
+  )
+})
+
+test('a connected form in a detached React tree is distinct from a disconnected DOM form', async () => {
+  const f = fixture()
+  f.root.child = null
+  expect(f.form.isConnected).toBe(true)
+  await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+    'native_current_form_unavailable',
+  )
+  const g = fixture()
+  g.form.isConnected = false
+  await expect(discoverVerifiedNativeContract(g.page, g.deps)).rejects.toThrow(
+    'native_composer_unavailable',
+  )
+})
+
+test('malformed, throwing or non-finite geometry refuses instead of skipping a candidate', async () => {
+  const cycle = element()
+  cycle.parentElement = cycle
+  const bad: Record<string, (form: any) => void> = {
+    'missing connectedness': (form) => delete form.isConnected,
+    'malformed connectedness': (form) => (form.isConnected = 'true'),
+    'malformed visibility': (form) => (form.style.visibility = 'unknown'),
+    'missing getClientRects': (form) => (form.getClientRects = undefined),
+    'throwing getClientRects': (form) =>
+      (form.getClientRects = () => {
+        throw new Error('boom')
+      }),
+    'non-array rects': (form) => (form.rects = {}),
+    NaN: (form) => (form.rects = [{ width: NaN, height: 5 }]),
+    Infinity: (form) => (form.rects = [{ width: Infinity, height: 5 }]),
+    negative: (form) => (form.rects = [{ width: -1, height: 5 }]),
+    'string size': (form) => (form.rects = [{ width: '10', height: 5 }]),
+    'throwing style': (form) =>
+      Object.defineProperty(form, 'style', {
+        get() {
+          throw new Error('boom')
+        },
+      }),
+    'ancestor cycle': (form) => (form.parentElement = cycle),
+    'throwing editor lookup': (form) =>
+      (form.querySelectorAll = () => {
+        throw new Error('boom')
+      }),
+  }
+  for (const [name, defect] of Object.entries(bad)) {
+    const alone = fixture()
+    defect(alone.form)
+    await expect(discoverVerifiedNativeContract(alone.page, alone.deps), name).rejects.toThrow(
+      'native_composer_unavailable',
+    )
+    const beside = fixture()
+    mount(beside, defect)
+    await expect(discoverVerifiedNativeContract(beside.page, beside.deps), name).rejects.toThrow(
+      'native_composer_unavailable',
+    )
+  }
+})
+
+test('selected composer hiding, removal or replacement across SDK awaits is stale', async () => {
+  const drift: Record<string, (f: any) => void> = {
+    hidden: (f) => hiders['display:none ancestor']!(f.form),
+    removed: (f) => (f.form.isConnected = false),
+    replaced: (f) => {
+      mount(f, () => {}, true)
+      hiders['display:none ancestor']!(f.form)
+    },
+  }
+  const stale = /native_store_stale|native_composer_unavailable/
+  for (const [name, change] of Object.entries(drift)) {
+    const f = fixture(),
+      push = f.calls.push.bind(f.calls)
+    // The SDK refetch is matched by source text, so drift is injected on its call record.
+    f.calls.push = (...items: any[]) => {
+      if (items[0]?.[0] === 'refetch') change(f)
+      return push(...items)
+    }
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    await expect(
+      c.readConversationSnapshot!(id, new AbortController().signal),
+      name,
+    ).rejects.toThrow(stale)
+    const g = fixture(),
+      d = await discoverVerifiedNativeContract(g.page, g.deps)
+    change(g)
+    await expect(
+      d.readConversationSnapshot!(id, new AbortController().signal),
+      name,
+    ).rejects.toThrow(stale)
+    expect(g.calls.map((call: any) => call[0])).not.toContain('refetch')
+  }
+})
+
+test('multiple rendered editors in one composer are refused before SDK calls', async () => {
+  const f = fixture(),
+    editor = f.form.querySelectorAll()[0],
+    second = element({ parentElement: f.form })
+  f.form.querySelectorAll = () => [editor, second]
+  await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+    'native_composer_ambiguous',
+  )
+  expect(f.calls).toEqual([])
+})
+
+test('accessibility hints and CSS overrides preserve ambiguity for rendered composers', async () => {
+  for (const parent of [
+    element({ attrs: { 'aria-hidden': 'true' } }),
+    element({ hidden: true }),
+    element({ style: { display: 'block', visibility: 'hidden' } }),
+  ]) {
+    const f = fixture()
+    mount(
+      f,
+      (form) => {
+        form.parentElement = parent
+      },
+      true,
+    )
+    await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+      'native_composer_ambiguous',
+    )
+    expect(f.calls).toEqual([])
+  }
+})
+
+test('oversized layout and editor collections refuse before unbounded traversal', async () => {
+  const f = fixture()
+  f.form.rects = Array.from({ length: 513 }, () => ({ width: 100, height: 20 }))
+  await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+    'native_composer_unavailable',
+  )
+  const g = fixture(),
+    editor = g.form.querySelectorAll()[0]
+  g.form.querySelectorAll = () => Array(513).fill(editor)
+  await expect(discoverVerifiedNativeContract(g.page, g.deps)).rejects.toThrow(
+    'native_composer_unavailable',
+  )
+  expect(f.calls).toEqual([])
+  expect(g.calls).toEqual([])
+})
+
+test('a rendered editor belonging to a different form cannot establish composer eligibility', async () => {
+  const f = fixture(),
+    foreignForm = element({ tagName: 'FORM' }),
+    editor = element({ parentElement: foreignForm })
+  f.form.querySelectorAll = () => [editor]
+  await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
+    'native_composer_unavailable',
+  )
+  expect(f.calls).toEqual([])
 })

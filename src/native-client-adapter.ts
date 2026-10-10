@@ -211,10 +211,93 @@ function currentFiber(form: any) {
   }
   return unique(matches, 'current_form')
 }
+const EDITOR =
+  'textarea#prompt-textarea, #prompt-textarea[contenteditable="true"], [role="textbox"][contenteditable="true"], textarea'
+// The live composer sits well below 100 wrappers; overflow is uncertainty, not "hidden".
+const MAX_DOM_DEPTH = 512
+// Effective CSS and positive layout establish rendering, independent of tab focus.
+// Accessibility hints and CSS-overridden hidden attributes cannot discard a candidate.
+function nodeRendered(page: NativeAdapterPage, node: any) {
+  if (!object(node) || typeof node.isConnected !== 'boolean') fail('native_composer_unavailable')
+  if (!node.isConnected) return false
+  const view = page.document.defaultView
+  if (!object(view) || typeof view.getComputedStyle !== 'function')
+    fail('native_composer_unavailable')
+  const seen = new Set<Obj>()
+  let visibility = true
+  for (let n: any = node; n !== null && n !== undefined; n = n.parentElement) {
+    if (!object(n) || seen.has(n) || seen.size >= MAX_DOM_DEPTH) fail('native_composer_unavailable')
+    seen.add(n)
+    const style = view.getComputedStyle(n as Element)
+    if (!object(style) || typeof style.display !== 'string' || !style.display)
+      fail('native_composer_unavailable')
+    if (style.display === 'none') return false
+    if (n === node) {
+      if (!['visible', 'hidden', 'collapse'].includes(style.visibility))
+        fail('native_composer_unavailable')
+      visibility = style.visibility !== 'hidden' && style.visibility !== 'collapse'
+    }
+  }
+  if (!visibility) return false
+  const rects = node.getClientRects()
+  if (
+    !object(rects) ||
+    !Number.isSafeInteger(rects.length) ||
+    rects.length < 0 ||
+    rects.length > MAX_DOM_DEPTH
+  )
+    fail('native_composer_unavailable')
+  let positive = false
+  for (let i = 0; i < rects.length; i++) {
+    const r = rects[i]
+    if (
+      !object(r) ||
+      typeof r.width !== 'number' ||
+      typeof r.height !== 'number' ||
+      !Number.isFinite(r.width) ||
+      !Number.isFinite(r.height) ||
+      r.width < 0 ||
+      r.height < 0
+    )
+      fail('native_composer_unavailable')
+    positive ||= r.width > 0 && r.height > 0
+  }
+  return positive
+}
+function renderedComposer(page: NativeAdapterPage, form: any) {
+  let rendered = 0
+  try {
+    if (!nodeRendered(page, form)) return false
+    const editors = form.querySelectorAll(EDITOR)
+    if (
+      !Number.isSafeInteger(editors.length) ||
+      editors.length < 0 ||
+      editors.length > MAX_DOM_DEPTH
+    )
+      fail('native_composer_unavailable')
+    for (let i = 0; i < editors.length; i++) {
+      const editor = editors[i]
+      if (!nodeRendered(page, editor)) continue
+      if (editor.closest('form') !== form) fail('native_composer_unavailable')
+      rendered++
+    }
+  } catch {
+    // Missing, throwing or malformed DOM geometry is uncertain, never skippable.
+    return fail('native_composer_unavailable')
+  }
+  if (rendered > 1) fail('native_composer_ambiguous')
+  return rendered === 1
+}
 function association(page: NativeAdapterPage) {
   const matches: { form: any; store: Obj; models: Obj; selected: Obj }[] = []
-  for (const form of page.document.querySelectorAll('form')) {
+  const forms = page.document.querySelectorAll('form')
+  if (!Number.isSafeInteger(forms.length) || forms.length < 0 || forms.length > MAX_DOM_DEPTH)
+    fail('native_composer_unavailable')
+  for (let i = 0; i < forms.length; i++) {
+    const form = forms[i]!
     if (!Object.keys(form).some((k) => k.startsWith('__reactFiber$'))) continue
+    // Hidden mounted composers are inert; never read their React fibers.
+    if (!renderedComposer(page, form)) continue
     const lineage = ancestors(currentFiber(form))
     const index = lineage.findIndex(
       (f) =>
@@ -615,6 +698,7 @@ export async function discoverVerifiedNativeContract(
     associated.store.chain === rawChain
   const assertCurrent = (scope: unknown = associated.store) => {
     if (scope !== associated.store || !pinned()) fail('native_store_stale')
+    if (!renderedComposer(page, associated.form)) fail('native_store_stale')
     const now = association(page)
     if (
       now.form !== associated.form ||
