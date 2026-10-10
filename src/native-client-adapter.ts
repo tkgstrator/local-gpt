@@ -217,7 +217,7 @@ const EDITOR =
 const MAX_DOM_DEPTH = 512
 // Effective CSS and positive layout establish rendering, independent of tab focus.
 // Accessibility hints and CSS-overridden hidden attributes cannot discard a candidate.
-function nodeRendered(page: NativeAdapterPage, node: any) {
+function nodeRendered(page: NativeAdapterPage, node: any, subtree = false) {
   if (!object(node) || typeof node.isConnected !== 'boolean') fail('native_composer_unavailable')
   if (!node.isConnected) return false
   const view = page.document.defaultView
@@ -238,7 +238,8 @@ function nodeRendered(page: NativeAdapterPage, node: any) {
       visibility = style.visibility !== 'hidden' && style.visibility !== 'collapse'
     }
   }
-  if (!visibility) return false
+  // A form's own hidden visibility or absent box cannot hide an overridden/overflowing editor.
+  if (!visibility && !subtree) return false
   const rects = node.getClientRects()
   if (
     !object(rects) ||
@@ -262,12 +263,12 @@ function nodeRendered(page: NativeAdapterPage, node: any) {
       fail('native_composer_unavailable')
     positive ||= r.width > 0 && r.height > 0
   }
-  return positive
+  return subtree || positive
 }
 function renderedComposer(page: NativeAdapterPage, form: any) {
   let rendered = 0
   try {
-    if (!nodeRendered(page, form)) return false
+    if (!nodeRendered(page, form, true)) return false
     const editors = form.querySelectorAll(EDITOR)
     if (
       !Number.isSafeInteger(editors.length) ||

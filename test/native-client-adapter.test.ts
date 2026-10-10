@@ -1477,15 +1477,19 @@ const hiders: Record<string, (form: any) => void> = {
   },
   'visibility:hidden': (form) => {
     form.style = { display: 'block', visibility: 'hidden' }
+    form.querySelectorAll()[0].style.visibility = 'hidden'
   },
   'visibility:collapse': (form) => {
     form.style = { display: 'block', visibility: 'collapse' }
+    form.querySelectorAll()[0].style.visibility = 'collapse'
   },
   'zero rect': (form) => {
     form.rects = [{ width: 0, height: 0 }]
+    form.querySelectorAll()[0].rects = [{ width: 0, height: 0 }]
   },
   'no rects': (form) => {
     form.rects = []
+    form.querySelectorAll()[0].rects = []
   },
   disconnected: (form) => {
     form.isConnected = false
@@ -1673,4 +1677,40 @@ test('a rendered editor belonging to a different form cannot establish composer 
     'native_composer_unavailable',
   )
   expect(f.calls).toEqual([])
+})
+
+const renderedChildLayouts: Record<string, (form: any) => void> = {
+  'visible editor overrides hidden form': (form) => {
+    form.style.visibility = 'hidden'
+  },
+  'display contents form': (form) => {
+    form.style.display = 'contents'
+    form.rects = []
+  },
+  'zero-size form with overflowing editor': (form) => {
+    form.rects = [{ width: 0, height: 0 }]
+  },
+}
+
+test('rendered editor competitors remain ambiguous when their forms lack visible boxes', async () => {
+  for (const [name, layout] of Object.entries(renderedChildLayouts)) {
+    const f = fixture()
+    mount(f, layout, true)
+    await expect(discoverVerifiedNativeContract(f.page, f.deps), name).rejects.toThrow(
+      'native_composer_ambiguous',
+    )
+    expect(f.calls).toEqual([])
+  }
+})
+
+test('a lone rendered editor establishes a composer even without a visible form box', async () => {
+  for (const [name, layout] of Object.entries(renderedChildLayouts)) {
+    const f = fixture()
+    layout(f.form)
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    expect(c.scope, name).toBe(f.store)
+    expect(await c.readConversationSnapshot!(id, new AbortController().signal), name).toBe(
+      f.snapshot,
+    )
+  }
 })
