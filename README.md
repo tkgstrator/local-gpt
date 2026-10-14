@@ -170,9 +170,27 @@ LocalGPT workflow:
 - Preserve manual drafts and attachments. After a timeout or disconnect, check
   whether the request was sent before proceeding; do not automatically resend.
 - Once a conversation created for this task is no longer needed and its useful
-  output is saved, explicitly decide whether to delete it with
-  localgpt_session_delete, if available. Do not delete pre-existing user chats
-  or perform age-based bulk cleanup.
+  output is saved, a Codex caller with native chat-management tools must
+  clean only its own completed managed worker chats from Recents with
+  set_thread_archived(source:'chatgpt', archived:true). This is caller
+  orchestration, not server automatic archiving. Take a non-null
+  conversationId only from localgpt_sessions matching the exact session_id, or
+  from a completed job bound to that same session; never from model text,
+  titles, or guessed IDs. Recheck that no job is active, in_progress,
+  unresponsive, or unknown and no continuation is intended, and skip pinned or
+  unrelated chats. Project placement or removal is not Recents cleanup.
+  Require positive exact-ID confirmation from the native archived
+  listing/status plus absence from a fresh Recents listing; omission from a
+  limited list alone is not proof. Allow a bounded propagation wait. On 429,
+  mark the archive pending, honor Retry-After if present (otherwise back off),
+  and do not repeat rapidly; after a timeout, check state before resending.
+  Missing native tools mean Recents is unverified. Native archive preserves
+  cloud content and leaves LocalGPT metadata; do not reuse an archived session
+  unless explicitly unarchived, or create a new session.
+  localgpt_session_delete keeps permanent-deletion semantics and is used only
+  on explicit decision: an unbound session is metadata-only, and record the bound conversationId before
+  permanent deletion and verify Recents independently after deletion. Do not call archive on a deleted chat as a fallback. Do not
+  touch pre-existing user chats or perform age-based bulk cleanup.
 - Reuse one existing ChatGPT browser tab for all LocalGPT sessions. A new
   LocalGPT session is a conversation, not a new browser tab. Do not open tabs
   or Chrome windows per task, model, session, or subagent. Let the extension
@@ -216,7 +234,9 @@ curl -N http://127.0.0.1:8766/v1/responses \
 
 送信前は対象会話と手動下書きを確認します。送信後は会話ID・メッセージIDで識別したAPI応答をイベント駆動で直接転送し、100msタイマーでの回答確認は行いません。HTTP通信の応答待ちに溜まった未送信の回答は最新本文へまとめ、最終本文の後に完了を送ります。このため、同じタブ内で別のChatに切り替えても通信が継続していれば応答を取得できます。リロード・タブ終了などで通信が途切れた場合は失敗として報告し、自動で再送しません。
 
-不要になったセッションは、Codexから`localgpt_session_delete`に`session_id`を指定して削除できます。対応するChatGPT会話も削除し、対象の会話IDへの削除API通信が成功したことを確認してからローカルのセッション情報を消します。会話がまだ作られていないセッションはローカル情報だけを削除します。処理中のセッションや手動の下書き・添付があるタブでは削除しません。会話の削除は元に戻せません。自動で期限を決めて削除する機能はありません。
+ネイティブのチャット管理ツールを持つCodexは、保存済みで不要になった自分の完了済みワーカーチャットだけを、`set_thread_archived(source:'chatgpt', archived:true)`でRecentsから整理します。これはサーバーの自動アーカイブではなく、呼び出し側の運用です。非nullの`conversationId`は、`localgpt_sessions`で`session_id`が完全一致するものか、同じセッションに紐づく完了済みジョブからのみ取得し、モデルの文章・タイトル・推測したIDは使いません。active・in_progress・unresponsive・unknownのジョブや継続予定がないことを再確認し、ピン留めや無関係なチャットは対象外です。プロジェクトへの配置・除外はRecentsの整理ではありません。ネイティブのアーカイブ一覧/状態で正確なIDの確認と、最新のRecents一覧からの消失の両方を必須とし、件数制限のある一覧に出ないだけでは証拠になりません。反映待ちは有限時間にとどめ、429は保留として`Retry-After`があれば従い、なければバックオフして連続再試行しません。タイムアウト時は再送前に状態を確認します。ネイティブツールがなければRecentsは未確認です。アーカイブはクラウド上の内容を保持しLocalGPTのメタデータも残るため、明示的にアーカイブ解除するか新しいセッションを作る場合を除き、アーカイブ済みセッションは再利用しません。
+
+完全に不要なセッションは、明示的に判断したうえで、Codexから`localgpt_session_delete`に`session_id`を指定して削除できます。これは永久削除の動作のままで、アーカイブとは別です。未紐づけのセッションはメタデータのみの削除で、明示的な永久削除の前に紐づいた会話IDを記録し、削除後にRecentsを別途確認してください。削除済みのチャットへのアーカイブを代替手段として呼ばないでください。対応するChatGPT会話も削除し、対象の会話IDへの削除API通信が成功したことを確認してからローカルのセッション情報を消します。会話がまだ作られていないセッションはローカル情報だけを削除します。処理中のセッションや手動の下書き・添付があるタブでは削除しません。会話の削除は元に戻せません。自動で期限を決めて削除する機能はありません。
 
 画像生成も`localgpt_respond`へ通常の文章で依頼できます。生成画像は最大4枚・各8 MiBのPNG/JPEG/WebP/GIFに対応し、MCPは画像と`images`内の保存パスを返します。Responses APIの結果にも`images`を追加し、`GET /v1/images/{id}`で保存した画像を取得できます。ストリームでは保存後に`response.image.saved`と完了通知を返します。保存画像はセッション・会話の削除後も残ります。
 
