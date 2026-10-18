@@ -1,4 +1,4 @@
-import { test, installNativeEditing } from './test-support.mjs';
+import { test, installNativeEditing, withSequencedPolling } from './test-support.mjs';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { Window } from 'happy-dom';
@@ -41,7 +41,7 @@ test('built extension sends only to selected dot, preserves drafts and reads rep
  const page=new Window({url:`https://chatgpt.com/dots/${dot.threadId}`});t.after(async()=>{page.dispatchEvent(new page.Event('pagehide'));await page.happyDOM.abort();page.close();});
  page.document.body.innerHTML='<textarea id="unrelated">unrelated manual draft</textarea><main class="thread-pane"><article class="message-row" data-message-id="old"><div class="message-text">Old private message</div></article><div contenteditable="true" role="textbox" aria-label="Message"></div><button aria-label="Send">Send</button></main>';
  installNativeEditing(page);
- await page.happyDOM.waitUntilComplete();let queued=null;const events=[];page.chrome={runtime:{sendMessage:async r=>{if(r.path==='poll'){const request=queued;queued=null;return {ok:true,data:{request}};}events.push(r.data);return {ok:true,data:{ok:true}};}}};
+ await page.happyDOM.waitUntilComplete();let queued=null;const events=[];page.chrome={runtime:{sendMessage:withSequencedPolling(async r=>{if(r.path==='poll'){const request=queued;queued=null;return {ok:true,data:{request}};}events.push(r.data);return {ok:true,data:{ok:true}};})}};
  const globals=['chrome','window','document','location','HTMLTextAreaElement','WebSocket','CustomEvent','crypto','setTimeout','clearTimeout'];
  new Function(...globals,await readFile('dist/extension/content.js','utf8'))(...globals.map(k=>k==='window'?page:['setTimeout','clearTimeout'].includes(k)?page[k].bind(page):page[k]));
  page.dispatchEvent(new page.CustomEvent('localgpt:dots',{detail:JSON.stringify({dots:[dot],cursor:null,source:'chatgpt_api',selected:null})}));

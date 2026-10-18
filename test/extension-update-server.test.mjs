@@ -25,7 +25,7 @@ test('update drain lease requires the pairing token and a valid version', async 
 test('idle server grants a drain lease and refuses every browser operation while held', async t => {
   const f = await fixture(t);
   await f.bridge('poll', {});
-  assert.deepEqual(await f.ready(), { ready: true });
+  assert.equal((await f.ready()).ready, true);
   const h = await f.health();
   assert.equal(h.updating, true); assert.equal(h.availableBrowsers, 0);
   // Stored result metadata remains available while the browser is draining.

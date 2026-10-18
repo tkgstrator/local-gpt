@@ -1,3 +1,10 @@
+import { PollJournal, PollOpenSchema, PollReadSchema } from './sequenced-poll'
+import {
+  MaintenanceRequestSchema,
+  MaintenanceTargetSchema,
+  sameTarget,
+  type MaintenanceTarget,
+} from './browser-maintenance'
 import { createResponseJobStore, ResponseJobStorageError, type ResponseJob } from './response-jobs'
 import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
 import { createImageStore } from './generated-images'
@@ -31,6 +38,7 @@ interface SocketData {
 }
 interface BrowserLane {
   id: string
+  chromeIdentity?: MaintenanceTarget
   browser: BrowserSocket | null
   pending: Pending | null
   polling: { id: string; seenAt: number } | null
@@ -59,6 +67,7 @@ interface Options {
   bridgeToken?: string
   pollingLeaseMs?: number
   nativeReadinessTimeoutMs?: number
+  maintenanceLeaseMs?: number
   updateLeaseMs?: number
   responseJobsDir?: string
   sessionsFile?: string
@@ -110,6 +119,7 @@ export function createService(options: Options) {
   const http = createServer(app)
   let wsServer: Server<SocketData> | null = null
   const lanes = new Map<string, BrowserLane>()
+  const pollJournal = new PollJournal()
   const handledRequests = new Map<string, Set<string>>()
   type NativeContext = NonNullable<ResponseJob['context']>
   interface NativeGeneration {
@@ -154,9 +164,35 @@ export function createService(options: Options) {
   let sharedBrowserId: string | null =
     nativeGenerations.values().next().value?.context.browserId ?? null
   let updateLease: { browserId: string; expiresAt: number; known: Set<string> } | null = null
-  const browserUpdating = () => {
+  let selectedTarget: MaintenanceTarget | null = null
+  let maintenanceLease: {
+    target: MaintenanceTarget
+    lease: string
+    expiresAt: number
+    validated?: boolean
+  } | null = null
+  const maintenanceActive = () => {
+    if (maintenanceLease && maintenanceLease.expiresAt <= Date.now()) maintenanceLease = null
+    return maintenanceLease !== null
+  }
+  const updateActive = () => {
     if (updateLease && updateLease.expiresAt <= Date.now()) updateLease = null
     return updateLease !== null
+  }
+  const browserUpdating = () => updateActive() || maintenanceActive()
+  const selectTarget = (lane: BrowserLane) => {
+    if (!lane.chromeIdentity && !maintenanceActive()) selectedTarget = null
+    if (lane.chromeIdentity) {
+      if (maintenanceActive() && maintenanceLease!.target.tabId !== lane.chromeIdentity.tabId)
+        return
+      if (
+        maintenanceLease &&
+        !maintenanceLease.validated &&
+        !sameTarget(maintenanceLease.target, lane.chromeIdentity)
+      )
+        maintenanceLease = null
+      selectedTarget = lane.chromeIdentity
+    }
   }
   const laneFor = (id: string) => {
     let lane = lanes.get(id)
@@ -188,9 +224,13 @@ export function createService(options: Options) {
     const shared = sharedBrowserId ? laneFor(sharedBrowserId) : undefined
     // Keep a connected or in-flight shared lane. Native records alone never pin new requests;
     // they keep their own browserId, so old receipts still route to the original owner.
-    if (shared && (connected(shared) || shared.pending || shared.queued)) return shared
+    if (shared && (connected(shared) || shared.pending || shared.queued)) {
+      selectTarget(shared)
+      return shared
+    }
     const candidates = [...lanes.values()].filter((lane) => connected(lane))
     const replacement = candidates.find((lane) => lane.nativeReady) ?? candidates[0]
+    if (replacement) selectTarget(replacement)
     sharedBrowserId = replacement?.id ?? null
     return replacement ?? laneFor('disconnected')
   }
@@ -259,6 +299,20 @@ export function createService(options: Options) {
         lane.pending?.fail(503, 'browser_disconnected', 'ChatGPT HTTP browser connection expired.')
     }
   }
+  const ownsPollCommand = (target: MaintenanceTarget, request: BrowserRequest) => {
+    const lane = lanes.get(target.browserId)
+    if (!lane?.chromeIdentity || !sameTarget(lane.chromeIdentity, target)) return false
+    if (request.type === 'native_readiness') return lane.readinessRequestId === request.requestId
+    if (request.type === 'request' && request.native) {
+      const record = nativeGenerations.get(request.requestId)
+      return (
+        record?.context.browserId === target.browserId &&
+        record.context.lifecycle === 'pre_dispatch' &&
+        !record.durableIntent
+      )
+    }
+    return lane.pending?.requestId === request.requestId
+  }
   const expirePolling = () => {
     for (const lane of lanes.values()) {
       expireLane(lane)
@@ -269,6 +323,7 @@ export function createService(options: Options) {
       )
         lanes.delete(lane.id)
     }
+    pollJournal.retireInvalid(ownsPollCommand)
   }
   const leaseTimer = setInterval(expirePolling, Math.min(1000, Math.max(10, pollingLeaseMs / 2)))
   leaseTimer.unref()
@@ -628,6 +683,198 @@ export function createService(options: Options) {
       })
     else lane.queued = payload
   })
+  // Maintenance never creates a polling lane or renews its browser/native readiness lease.
+  app.post('/bridge/maintenance', (req, res) => {
+    if (!options.bridgeToken || req.get('X-Bridge-Token') !== options.bridgeToken) {
+      res.status(401).json({ error: { code: 'unauthorized' } })
+      return
+    }
+    expirePolling()
+    const parsed = MaintenanceRequestSchema.safeParse(req.body)
+    if (!parsed.success) {
+      res.status(400).json({ error: { code: 'invalid_maintenance' } })
+      return
+    }
+    const request = parsed.data
+    maintenanceActive()
+    const protectedWork =
+      restoredUnknown ||
+      nativeGenerations.size > 0 ||
+      [...lanes.values()].some(
+        (l) => l.pending !== null || l.queued !== null || l.nativeQueue.length > 0,
+      )
+    if (request.action === 'probe') {
+      const selectedLane = selectedTarget ? lanes.get(selectedTarget.browserId) : undefined
+      res.json({
+        target: selectedTarget,
+        connected: Boolean(selectedLane && connected(selectedLane)),
+        deferred: protectedWork ? 'work_in_progress' : null,
+      })
+      return
+    }
+    if (!sameTarget(selectedTarget, request.target)) {
+      res.json({ ready: false, reason: 'target_changed' })
+      return
+    }
+    if (request.action === 'invalidate') {
+      const lane = lanes.get(request.target.browserId)
+      if (lane) delete lane.chromeIdentity
+      selectedTarget = null
+      if (!maintenanceLease?.validated) maintenanceLease = null
+      res.json({ ready: true })
+      return
+    }
+    if (request.action === 'acquire') {
+      if (
+        protectedWork ||
+        maintenanceActive() ||
+        (updateActive() && updateLease!.browserId !== request.target.browserId)
+      ) {
+        res.json({
+          ready: false,
+          reason: protectedWork ? 'work_in_progress' : 'maintenance_in_progress',
+        })
+        return
+      }
+      updateLease = null
+      maintenanceLease = {
+        target: request.target,
+        lease: randomUUID(),
+        expiresAt: Date.now() + Math.min(options.maintenanceLeaseMs ?? 8000, 8000),
+      }
+      res.json({
+        ready: true,
+        lease: maintenanceLease.lease,
+        expiresAt: maintenanceLease.expiresAt,
+      })
+      return
+    }
+    if (
+      !maintenanceLease ||
+      maintenanceLease.lease !== request.lease ||
+      !sameTarget(maintenanceLease.target, request.target)
+    ) {
+      res.json({ ready: false, reason: 'lease_expired' })
+      return
+    }
+    if (request.action === 'cancel') {
+      if (!maintenanceLease.validated) maintenanceLease = null
+      res.json({ ready: true })
+      return
+    }
+    // Once validation has authorized a content commit, keep exclusion for its full bounded lifetime.
+    // A delayed response can still reload; cancellation/navigation cannot revoke that response.
+    if (!protectedWork) maintenanceLease.validated = true
+    res.json({ ready: !protectedWork, expiresAt: maintenanceLease.expiresAt })
+  })
+  const chromeTarget = (req: express.Request) =>
+    MaintenanceTargetSchema.safeParse({
+      browserId: req.get('X-Browser-Id'),
+      tabId: Number(req.get('X-Chrome-Tab-Id')),
+      documentId: req.get('X-Chrome-Document-Id'),
+    })
+  const adoptChromeDocument = (lane: BrowserLane, target: MaintenanceTarget) => {
+    if (!lane.chromeIdentity || !sameTarget(lane.chromeIdentity, target)) {
+      lane.nativeReady = false
+      lane.nativeReadyReason = null
+      clearReadinessProbe(lane)
+    }
+    lane.chromeIdentity = target
+  }
+  const touchChromeLane = (lane: BrowserLane, target: MaintenanceTarget) => {
+    adoptChromeDocument(lane, target)
+    const shared = sharedBrowserId ? lanes.get(sharedBrowserId) : undefined
+    // As in availableLane, native records retain their owner without pinning new tab selection.
+    const replaceable = !shared || (!connected(shared) && !shared.pending && !shared.queued)
+    if (
+      (!maintenanceActive() || selectedTarget?.tabId === target.tabId) &&
+      (replaceable || sharedBrowserId === lane.id || selectedTarget?.tabId === target.tabId)
+    ) {
+      sharedBrowserId = lane.id
+      selectTarget(lane)
+    }
+    lane.polling = { id: lane.id, seenAt: Date.now() }
+  }
+  const nextPoll = (lane: BrowserLane, nativeProtocol?: 1): BrowserRequest | null => {
+    if (updateActive() && (updateLease!.browserId === lane.id || !updateLease!.known.has(lane.id)))
+      updateLease = null
+    if (maintenanceActive()) return null
+    if (
+      nativeProtocol === 1 &&
+      !lane.nativeReady &&
+      !lane.readinessRequestId &&
+      Date.now() >= (lane.readinessRetryAt ?? 0)
+    ) {
+      lane.nativeAdvertised = true
+      return beginReadinessProbe(lane)
+    }
+    const request = lane.queued ?? lane.nativeQueue.shift() ?? null
+    lane.queued = null
+    return request
+  }
+  // Capability negotiation is authenticated but never dequeues, creates a lane, or claims liveness.
+  app.post(['/bridge/poll-open', '/bridge/poll-v2'], (req, res) => {
+    res.setHeader('Cache-Control', 'no-store')
+    if (!options.bridgeToken || req.get('X-Bridge-Token') !== options.bridgeToken) {
+      res.status(401).json({ error: { code: 'unauthorized' } })
+      return
+    }
+    const identity = chromeTarget(req)
+    if (!identity.success || !identity.data.browserId.startsWith(identity.data.tabId + ':')) {
+      res.status(400).json({ error: { code: 'invalid_poll_identity' } })
+      return
+    }
+    const target = identity.data
+    if (req.path === '/bridge/poll-open') {
+      const body = PollOpenSchema.safeParse(req.body)
+      if (!body.success) {
+        res.status(400).json({ error: { code: 'invalid_poll_open' } })
+        return
+      }
+      res.json(pollJournal.open(target, body.data.streamId, body.data.activation))
+      return
+    }
+    const body = PollReadSchema.safeParse(req.body)
+    if (!body.success) {
+      res.status(400).json({ error: { code: 'invalid_poll_read' } })
+      return
+    }
+    // Epoch, document, stream and sequence fencing precedes ALL liveness/selection mutation.
+    const error = pollJournal.check(target, body.data)
+    if (error) {
+      res.json({
+        protocol: 1,
+        epoch: pollJournal.epoch,
+        streamId: body.data.streamId,
+        sequence: body.data.sequence,
+        error,
+      })
+      return
+    }
+    expirePolling()
+    if (!lanes.has(target.browserId) && lanes.size >= 32) {
+      res.status(429).json({ error: { code: 'browser_limit' } })
+      return
+    }
+    const lane = laneFor(target.browserId)
+    if (wsConnected(lane)) {
+      res.status(409).json({ error: { code: 'browser_already_connected' } })
+      return
+    }
+    const response = pollJournal.read(
+      target,
+      body.data,
+      () => {
+        // This closure runs only for an admitted next sequence, after all fencing/capacity checks.
+        adoptChromeDocument(lane, target)
+        return nextPoll(lane, body.data.nativeProtocol)
+      },
+      (request) => ownsPollCommand(target, request),
+      maintenanceActive(),
+    )
+    if (!('error' in response)) touchChromeLane(lane, target)
+    res.json(response)
+  })
   app.use('/bridge', (req, res, next) => {
     expirePolling()
     if (!options.bridgeToken || req.get('X-Bridge-Token') !== options.bridgeToken) {
@@ -643,12 +890,19 @@ export function createService(options: Options) {
       res.status(429).json({ error: { code: 'browser_limit' } })
       return
     }
+    const identity = chromeTarget(req)
+    if (req.path === '/poll' && identity.success && pollJournal.registered(identity.data.tabId)) {
+      res.status(409).json({ error: { code: 'sequenced_poll_required' } })
+      return
+    }
     const lane = laneFor(id)
     res.locals.lane = lane
     if (wsConnected(lane) || (pollingConnected(lane) && lane.polling?.id !== id)) {
       res.status(409).json({ error: { code: 'browser_already_connected' } })
       return
     }
+    if (req.path === '/poll' && identity.success && id.startsWith(identity.data.tabId + ':'))
+      touchChromeLane(lane, identity.data)
     lane.polling = { id, seenAt: Date.now() }
     res.setHeader('Cache-Control', 'no-store')
     next()
@@ -668,7 +922,7 @@ export function createService(options: Options) {
       return
     }
     const lane = res.locals.lane as BrowserLane
-    if (browserUpdating() && updateLease!.browserId !== lane.id) {
+    if (maintenanceActive() || (updateActive() && updateLease!.browserId !== lane.id)) {
       res.json({ ready: false, reason: 'browser_updating' })
       return
     }
@@ -685,28 +939,15 @@ export function createService(options: Options) {
       expiresAt: Date.now() + (options.updateLeaseMs ?? 15000),
       known: new Set(lanes.keys()),
     }
-    res.json({ ready: true })
+    res.json({ ready: true, expiresAt: updateLease.expiresAt })
   })
   app.post('/bridge/poll', (req, res) => {
-    const lane = res.locals.lane as BrowserLane
-    if (
-      browserUpdating() &&
-      (updateLease!.browserId === lane.id || !updateLease!.known.has(lane.id))
-    )
-      updateLease = null
-    if (
-      req.body?.nativeProtocol === 1 &&
-      !lane.nativeReady &&
-      !lane.readinessRequestId &&
-      Date.now() >= (lane.readinessRetryAt ?? 0)
-    ) {
-      lane.nativeAdvertised = true
-      res.json({ request: beginReadinessProbe(lane) })
-      return
-    }
-    const request = lane.queued ?? lane.nativeQueue.shift() ?? null
-    lane.queued = null
-    res.json({ request })
+    res.json({
+      request: nextPoll(
+        res.locals.lane as BrowserLane,
+        req.body?.nativeProtocol === 1 ? 1 : undefined,
+      ),
+    })
   })
   app.post('/bridge/event', async (req, res) => {
     const lane = res.locals.lane as BrowserLane

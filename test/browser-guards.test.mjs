@@ -1,4 +1,4 @@
-import { test, installNativeEditing } from './test-support.mjs';
+import { test, installNativeEditing, withSequencedPolling } from './test-support.mjs';
 import assert from 'node:assert/strict';
 import { Window } from 'happy-dom';
 import { readFile } from 'node:fs/promises';
@@ -44,7 +44,7 @@ async function fixture(t, url='https://chatgpt.com/') {
  installNativeEditing(page);
  const normalTimer=page.setTimeout.bind(page);page.setTimeout=(callback,delay,...args)=>normalTimer(callback,page.responseTimersThrottled&&delay===100?60000:delay,...args);
  let queued=null;const events=[];let failBridge=false;let polls=0;let holdNavigation;const navigationStarted=new Promise(resolve=>holdNavigation=resolve);let releaseNavigation;const navigationGate=new Promise(resolve=>releaseNavigation=resolve);
- page.chrome={runtime:{sendMessage:async r=>{if(failBridge&&r.path==='event')return {ok:false,error:'Simulated disconnect'};if(r.path==='poll'){polls++;const request=queued;queued=null;return {ok:true,data:{request}};}events.push(r.data);if(r.data.type==='navigate'){holdNavigation();await navigationGate;}return {ok:true,data:{ok:true,accepted:r.data.type!=='heartbeat'}};}}};
+ page.chrome={runtime:{sendMessage:withSequencedPolling(async r=>{if(failBridge&&r.path==='event')return {ok:false,error:'Simulated disconnect'};if(r.path==='poll'){polls++;const request=queued;queued=null;return {ok:true,data:{request}};}events.push(r.data);if(r.data.type==='navigate'){holdNavigation();await navigationGate;}return {ok:true,data:{ok:true,accepted:r.data.type!=='heartbeat'}};})}};
  const globals=['chrome','window','document','location','HTMLTextAreaElement','WebSocket','CustomEvent','crypto','sessionStorage','setTimeout','clearTimeout'];new Function(...globals,await readFile('dist/extension/content.js','utf8'))(...globals.map(k=>k==='window'?page:['setTimeout','clearTimeout'].includes(k)?page[k].bind(page):page[k]));
  return {page,events,setDisconnected:value=>failBridge=value,queue:r=>queued=r,polls:()=>polls,navigationStarted,releaseNavigation,async event(id){for(let i=0;i<150;i++){const e=events.find(e=>e.requestId===id&&e.type==='error');if(e)return e;await new Promise(r=>setTimeout(r,20));}throw Error('No error event');}};
 }
