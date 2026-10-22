@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { Window } from 'happy-dom'
 import { NativeChatDispatcher, type NativeContract } from '../src/native-chat'
 import { installPageObserver } from '../src/page-observer'
+import { NativeHistoryScheduler } from '../src/native-history'
 const a = 'b3241425-4f9f-4e13-a3cb-8b0fd902f32a'
 const b = 'a3241425-4f9f-4e13-a3cb-8b0fd902f32a'
 const ca = 'c3241425-4f9f-4e13-a3cb-8b0fd902f32a'
@@ -85,6 +86,9 @@ test('connected dispatcher observer recovers separate A/B CIDs while SDK submits
         new page.CustomEvent('localgpt:native-result', { detail: JSON.stringify(receipt) }),
       ),
     () => {},
+    // This observer test isolates identity/dispatch from real read pacing,
+    // which is exercised by the scheduler and connected server regressions.
+    new NativeHistoryScheduler({ spacingMs: 0 }),
   )
   installPageObserver(page as any, dispatcher)
   page.addEventListener('localgpt:response-stream', (event: any) =>

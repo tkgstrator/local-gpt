@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import { NativeChatDispatcher, type NativeContract } from '../src/native-chat'
 import { boundedConversationSnapshot } from '../src/conversation-recovery'
+import { NativeHistoryScheduler } from '../src/native-history'
 const user = 'b3241425-4f9f-4e13-a3cb-8b0fd902f32a'
 const cid = 'a3241425-4f9f-4e13-a3cb-8b0fd902f32a'
 test('disarm prevents late preparation from restoring a retained payload', async () => {
@@ -72,6 +73,7 @@ function fixture(read: () => Promise<unknown>, existing = false) {
     async () => contract,
     () => {},
     () => {},
+    new NativeHistoryScheduler({ spacingMs: 0 }),
   )
   const request = {
     type: 'request' as const,

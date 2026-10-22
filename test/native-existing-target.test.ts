@@ -69,3 +69,37 @@ test('existing preparation passes validated parent and never adopts another CID'
   )
   await expect(wrong.prepare(request)).rejects.toThrow('existing_identity_mismatch')
 })
+
+test('a temporary SDK history rate limit does not discard an unsent continuation', async () => {
+  let reads = 0,
+    submits = 0,
+    journals = 0
+  const receipts: any[] = []
+  const dispatcher = new NativeChatDispatcher(
+    async () => ({
+      ...contract(),
+      prepareExistingConversation: async () => {
+        reads++
+        if (reads === 1) throw new Error('ChatGPT conversation history was rate limited')
+        return { conversationId: cid, parentMessageId: parent }
+      },
+      submit: async (_scope: unknown, options: any) => {
+        expect(options.conversationId).toBe(cid)
+        expect(options.userCompletionMessages.message.id).toBe(user)
+        submits++
+      },
+    }),
+    (receipt) => receipts.push(receipt),
+    () => {
+      journals++
+    },
+  )
+  await dispatcher.prepare(request)
+  expect(reads).toBe(2)
+  expect(submits).toBe(0)
+  expect(journals).toBe(0)
+  expect(receipts.filter((receipt) => receipt.kind === 'prepared')).toHaveLength(1)
+  await dispatcher.dispatch('A', user)
+  expect(submits).toBe(1)
+  expect(journals).toBe(1)
+}, 20000)

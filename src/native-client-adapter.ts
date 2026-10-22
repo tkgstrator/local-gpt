@@ -438,6 +438,103 @@ function validateProject(page: NativeAdapterPage, id: unknown, label?: unknown) 
   )
     fail('native_project_conflict')
 }
+function terminalText(message: Obj) {
+  return !(
+    !object(message.author) ||
+    message.author.role !== 'assistant' ||
+    message.channel !== 'final' ||
+    message.recipient !== 'all' ||
+    message.status !== 'finished_successfully' ||
+    message.end_turn !== true ||
+    !object(message.content) ||
+    message.content.content_type !== 'text' ||
+    !Array.isArray(message.content.parts) ||
+    !message.content.parts.length ||
+    !message.content.parts.every((part: unknown) => typeof part === 'string') ||
+    !message.content.parts.some((part: string) => part.trim()) ||
+    !object(message.metadata) ||
+    (message.metadata.is_visually_hidden_from_conversation !== undefined &&
+      message.metadata.is_visually_hidden_from_conversation !== false)
+  )
+}
+// Observed completed Pro turn: the visible final answer is followed by a
+// finished same-turn thinking-preamble leaf, which the native SDK keeps as the
+// default parent. Admit only that exact shape; the preamble stays the parent.
+function completedPreambleParent(mapping: Obj, currentId: string) {
+  if (!own(mapping, currentId)) return false
+  const node = mapping[currentId],
+    message = node?.message
+  if (
+    !object(node) ||
+    node.id !== currentId ||
+    !object(message) ||
+    message.id !== currentId ||
+    !object(message.author) ||
+    message.author.role !== 'assistant' ||
+    message.channel !== 'commentary' ||
+    message.recipient !== 'all' ||
+    message.status !== 'finished_successfully' ||
+    message.end_turn !== false ||
+    !object(message.content) ||
+    message.content.content_type !== 'text' ||
+    !Array.isArray(message.content.parts) ||
+    !message.content.parts.length ||
+    !message.content.parts.every((part: unknown) => typeof part === 'string') ||
+    !message.content.parts.some((part: string) => part.trim()) ||
+    !object(message.metadata)
+  )
+    return false
+  const meta = message.metadata
+  if (
+    (meta.is_visually_hidden_from_conversation !== undefined &&
+      meta.is_visually_hidden_from_conversation !== false) ||
+    (meta.codex_optimistic_steering_assistant !== undefined &&
+      meta.codex_optimistic_steering_assistant !== false) ||
+    meta.is_thinking_preamble_message !== true ||
+    meta.hide_inline_actions !== true ||
+    meta.disable_turn_actions !== true
+  )
+    return false
+  const parentId = node.parent
+  if (
+    typeof parentId !== 'string' ||
+    !UUID.test(parentId) ||
+    parentId === currentId ||
+    meta.parent_id !== parentId ||
+    !own(mapping, parentId) ||
+    !Array.isArray(node.children) ||
+    node.children.length
+  )
+    return false
+  const parent = mapping[parentId],
+    parentMessage = parent?.message
+  if (
+    !object(parent) ||
+    parent.id !== parentId ||
+    !object(parentMessage) ||
+    parentMessage.id !== parentId ||
+    !terminalText(parentMessage) ||
+    !Array.isArray(parent.children) ||
+    parent.children.length !== 1 ||
+    parent.children[0] !== currentId
+  )
+    return false
+  for (const key of ['working_turn_id', 'turn_exchange_id'])
+    if (
+      typeof meta[key] !== 'string' ||
+      !UUID.test(meta[key]) ||
+      parentMessage.metadata[key] !== meta[key]
+    )
+      return false
+  const ids = Object.keys(mapping)
+  if (ids.length > 5000) return false
+  for (const id of ids) {
+    const other = mapping[id]
+    if (!object(other)) return false
+    if (id !== currentId && (other.parent === currentId || other.parent === parentId)) return false
+  }
+  return true
+}
 function existingSnapshot(value: unknown, conversationId: string, projectId?: string) {
   if (
     !object(value) ||
@@ -474,23 +571,11 @@ function existingSnapshot(value: unknown, conversationId: string, projectId?: st
     node.id !== value.current_node ||
     !object(message) ||
     message.id !== value.current_node ||
-    !object(message.author) ||
-    message.author.role !== 'assistant' ||
-    message.channel !== 'final' ||
-    message.recipient !== 'all' ||
-    message.status !== 'finished_successfully' ||
-    message.end_turn !== true ||
-    !object(message.content) ||
-    message.content.content_type !== 'text' ||
-    !Array.isArray(message.content.parts) ||
-    !message.content.parts.length ||
-    !message.content.parts.every((part: unknown) => typeof part === 'string') ||
-    !message.content.parts.some((part: string) => part.trim()) ||
-    !object(message.metadata) ||
-    (message.metadata.is_visually_hidden_from_conversation !== undefined &&
-      message.metadata.is_visually_hidden_from_conversation !== false)
-  )
-    fail('native_existing_parent_invalid')
+    !terminalText(message)
+  ) {
+    if (!completedPreambleParent(value.mapping, value.current_node))
+      fail('native_existing_parent_invalid')
+  }
   return {
     conversationId,
     parentMessageId: value.current_node,
@@ -675,6 +760,7 @@ export async function discoverVerifiedNativeContract(
     prepareExistingConversation: (
       conversationId: string,
       projectId?: string,
+      signal?: AbortSignal,
     ) => Promise<{ conversationId: string; parentMessageId: string; projectId?: string }>
   }
 > {
@@ -735,8 +821,13 @@ export async function discoverVerifiedNativeContract(
       if (signal.aborted) fail('native_recovery_aborted')
       return snapshot
     },
-    async prepareExistingConversation(conversationId: string, projectId?: string) {
+    async prepareExistingConversation(
+      conversationId: string,
+      projectId?: string,
+      signal?: AbortSignal,
+    ) {
       assertCurrent()
+      if (signal?.aborted) fail('native_prepare_aborted')
       if (typeof conversationId !== 'string' || !UUID.test(conversationId))
         fail('native_existing_conversation_invalid')
       if (projectId !== undefined) validateProject(page, projectId)
@@ -744,9 +835,10 @@ export async function discoverVerifiedNativeContract(
         associated.store,
         conversationId,
         'localgpt-native-prepare',
-        { throwOnError: true },
+        { throwOnError: true, ...(signal ? { signal } : {}) },
       )
       assertCurrent()
+      if (signal?.aborted) fail('native_prepare_aborted')
       return existingSnapshot(snapshot, conversationId, projectId)
     },
     validateUpload: (result, file) => validateUpload(page, result, file),
