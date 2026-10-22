@@ -1755,3 +1755,382 @@ test('a lone rendered editor establishes a composer even without a visible form 
     )
   }
 })
+
+// Observed completed Pro turn: the visible final answer is followed by a
+// finished same-turn thinking-preamble leaf, which the native SDK submits from.
+const obsCid = '0c80500c-f930-4fca-a571-a68fc25d5a63'
+const obsUser = '1c80500c-f930-4fca-a571-a68fc25d5a64'
+const obsRecap = '2c80500c-f930-4fca-a571-a68fc25d5a65'
+const obsFinal = '3c80500c-f930-4fca-a571-a68fc25d5a66'
+const obsPreamble = '4c80500c-f930-4fca-a571-a68fc25d5a67'
+const obsTurn = '5c80500c-f930-4fca-a571-a68fc25d5a68'
+const obsOther = '6c80500c-f930-4fca-a571-a68fc25d5a69'
+const obsMessage = (messageId: string, extra: any = {}) => ({
+  id: messageId,
+  author: { role: 'assistant' },
+  channel: 'final',
+  recipient: 'all',
+  content: { content_type: 'text', parts: ['visible answer'] },
+  status: 'finished_successfully',
+  end_turn: true,
+  metadata: { working_turn_id: obsTurn, turn_exchange_id: obsTurn },
+  ...extra,
+})
+function preambleSnapshot(f: any, asyncStatus: number | null = null) {
+  const snapshot: any = {
+    conversation_id: obsCid,
+    gizmo_id: project,
+    current_node: obsPreamble,
+    async_status: asyncStatus,
+    is_read_only: null,
+    is_archived: false,
+    mapping: {
+      [obsUser]: {
+        id: obsUser,
+        parent: null,
+        children: [obsRecap],
+        message: { id: obsUser, author: { role: 'user' }, metadata: {} },
+      },
+      [obsRecap]: {
+        id: obsRecap,
+        parent: obsUser,
+        children: [obsFinal],
+        message: obsMessage(obsRecap, {
+          channel: 'analysis',
+          content: { content_type: 'reasoning_recap', content: 'x' },
+          end_turn: false,
+        }),
+      },
+      [obsFinal]: {
+        id: obsFinal,
+        parent: obsRecap,
+        children: [obsPreamble],
+        message: obsMessage(obsFinal),
+      },
+      [obsPreamble]: {
+        id: obsPreamble,
+        parent: obsFinal,
+        children: [],
+        message: obsMessage(obsPreamble, {
+          channel: 'commentary',
+          end_turn: false,
+          metadata: {
+            parent_id: obsFinal,
+            working_turn_id: obsTurn,
+            turn_exchange_id: obsTurn,
+            is_thinking_preamble_message: true,
+            hide_inline_actions: true,
+            disable_turn_actions: true,
+            model_slug: 'gpt-6-pro',
+          },
+        }),
+      },
+    },
+  }
+  f.snapshot = snapshot
+  return snapshot
+}
+const preambleRefusals: Record<string, [(s: any) => void, string?]> = {
+  // current preamble flags and message shape
+  noPreambleFlag: [
+    (s) => delete s.mapping[obsPreamble].message.metadata.is_thinking_preamble_message,
+  ],
+  falsePreambleFlag: [
+    (s) => (s.mapping[obsPreamble].message.metadata.is_thinking_preamble_message = false),
+  ],
+  stringPreambleFlag: [
+    (s) => (s.mapping[obsPreamble].message.metadata.is_thinking_preamble_message = 'true'),
+  ],
+  noHideInline: [(s) => delete s.mapping[obsPreamble].message.metadata.hide_inline_actions],
+  falseHideInline: [(s) => (s.mapping[obsPreamble].message.metadata.hide_inline_actions = false)],
+  noDisableTurn: [(s) => delete s.mapping[obsPreamble].message.metadata.disable_turn_actions],
+  falseDisableTurn: [(s) => (s.mapping[obsPreamble].message.metadata.disable_turn_actions = false)],
+  endTurnTrue: [(s) => (s.mapping[obsPreamble].message.end_turn = true)],
+  endTurnNull: [(s) => (s.mapping[obsPreamble].message.end_turn = null)],
+  endTurnMissing: [(s) => delete s.mapping[obsPreamble].message.end_turn],
+  finalChannel: [(s) => (s.mapping[obsPreamble].message.channel = 'final')],
+  analysisChannel: [(s) => (s.mapping[obsPreamble].message.channel = 'analysis')],
+  missingChannel: [(s) => delete s.mapping[obsPreamble].message.channel],
+  inProgress: [(s) => (s.mapping[obsPreamble].message.status = 'in_progress')],
+  missingStatus: [(s) => delete s.mapping[obsPreamble].message.status],
+  userRole: [(s) => (s.mapping[obsPreamble].message.author.role = 'user')],
+  foreignRecipient: [(s) => (s.mapping[obsPreamble].message.recipient = 'python')],
+  hidden: [
+    (s) => (s.mapping[obsPreamble].message.metadata.is_visually_hidden_from_conversation = true),
+  ],
+  nonText: [(s) => (s.mapping[obsPreamble].message.content.content_type = 'thoughts')],
+  emptyParts: [(s) => (s.mapping[obsPreamble].message.content.parts = [])],
+  blankText: [(s) => (s.mapping[obsPreamble].message.content.parts = [' '])],
+  nonStringPart: [(s) => (s.mapping[obsPreamble].message.content.parts = [{}])],
+  steeringMarker: [
+    (s) => (s.mapping[obsPreamble].message.metadata.codex_optimistic_steering_assistant = true),
+  ],
+  missingMetadata: [(s) => delete s.mapping[obsPreamble].message.metadata],
+  nodeIdMismatch: [(s) => (s.mapping[obsPreamble].id = obsOther)],
+  messageIdMismatch: [(s) => (s.mapping[obsPreamble].message.id = obsOther)],
+  missingMessage: [(s) => delete s.mapping[obsPreamble].message],
+  currentHasChild: [
+    (s) => {
+      s.mapping[obsPreamble].children = [obsOther]
+      s.mapping[obsOther] = {
+        id: obsOther,
+        parent: obsPreamble,
+        children: [],
+        message: obsMessage(obsOther),
+      }
+    },
+  ],
+  currentChildrenNotArray: [(s) => (s.mapping[obsPreamble].children = undefined)],
+  reverseChildOmitted: [
+    (s) => {
+      // Node points to current, yet no children array lists it.
+      s.mapping[obsOther] = {
+        id: obsOther,
+        parent: obsPreamble,
+        children: [],
+        message: obsMessage(obsOther),
+      }
+    },
+  ],
+  // reciprocal graph and parent identity
+  noParentPointer: [(s) => delete s.mapping[obsPreamble].parent],
+  nullParentPointer: [(s) => (s.mapping[obsPreamble].parent = null)],
+  parentPointerMismatch: [(s) => (s.mapping[obsPreamble].parent = obsRecap)],
+  metadataParentMissing: [(s) => delete s.mapping[obsPreamble].message.metadata.parent_id],
+  metadataParentMismatch: [(s) => (s.mapping[obsPreamble].message.metadata.parent_id = obsRecap)],
+  metadataParentMalformed: [(s) => (s.mapping[obsPreamble].message.metadata.parent_id = 'FINAL')],
+  parentNotOwn: [(s) => (s.mapping[obsPreamble].parent = 'toString')],
+  parentMissingNode: [
+    (s) => {
+      delete s.mapping[obsFinal]
+    },
+  ],
+  parentNodeIdMismatch: [(s) => (s.mapping[obsFinal].id = obsOther)],
+  parentMessageIdMismatch: [(s) => (s.mapping[obsFinal].message.id = obsOther)],
+  parentChildrenOmitted: [(s) => (s.mapping[obsFinal].children = [])],
+  parentChildrenMissing: [(s) => delete s.mapping[obsFinal].children],
+  parentChildrenWrong: [(s) => (s.mapping[obsFinal].children = [obsOther])],
+  parentChildrenDuplicate: [(s) => (s.mapping[obsFinal].children = [obsPreamble, obsPreamble])],
+  parentExtraListedChild: [
+    (s) => {
+      s.mapping[obsFinal].children = [obsPreamble, obsOther]
+      s.mapping[obsOther] = {
+        id: obsOther,
+        parent: obsFinal,
+        children: [],
+        message: obsMessage(obsOther),
+      }
+    },
+  ],
+  siblingOmittedFromChildren: [
+    (s) => {
+      // Only the mapping scan can see this sibling; the children array is clean.
+      s.mapping[obsOther] = {
+        id: obsOther,
+        parent: obsFinal,
+        children: [],
+        message: obsMessage(obsOther),
+      }
+    },
+  ],
+  parentCycle: [(s) => (s.mapping[obsFinal].parent = obsPreamble)],
+  selfParent: [
+    (s) => {
+      s.mapping[obsPreamble].parent = obsPreamble
+      s.mapping[obsPreamble].message.metadata.parent_id = obsPreamble
+    },
+  ],
+  // final parent strictness
+  finalInProgress: [(s) => (s.mapping[obsFinal].message.status = 'in_progress')],
+  finalNoEndTurn: [(s) => (s.mapping[obsFinal].message.end_turn = false)],
+  finalNotFinalChannel: [(s) => (s.mapping[obsFinal].message.channel = 'commentary')],
+  finalAnalysis: [(s) => (s.mapping[obsFinal].message.channel = 'analysis')],
+  finalHidden: [
+    (s) => (s.mapping[obsFinal].message.metadata.is_visually_hidden_from_conversation = true),
+  ],
+  finalBlank: [(s) => (s.mapping[obsFinal].message.content.parts = ['  '])],
+  finalEmpty: [(s) => (s.mapping[obsFinal].message.content.parts = [])],
+  finalNonText: [(s) => (s.mapping[obsFinal].message.content.content_type = 'multimodal_text')],
+  finalUser: [(s) => (s.mapping[obsFinal].message.author.role = 'user')],
+  finalForeignRecipient: [(s) => (s.mapping[obsFinal].message.recipient = 'python')],
+  finalMissingMetadata: [(s) => delete s.mapping[obsFinal].message.metadata],
+  // turn IDs
+  currentWorkingMissing: [(s) => delete s.mapping[obsPreamble].message.metadata.working_turn_id],
+  currentExchangeMissing: [(s) => delete s.mapping[obsPreamble].message.metadata.turn_exchange_id],
+  finalWorkingMissing: [(s) => delete s.mapping[obsFinal].message.metadata.working_turn_id],
+  finalExchangeMissing: [(s) => delete s.mapping[obsFinal].message.metadata.turn_exchange_id],
+  workingMismatch: [(s) => (s.mapping[obsPreamble].message.metadata.working_turn_id = obsOther)],
+  exchangeMismatch: [(s) => (s.mapping[obsPreamble].message.metadata.turn_exchange_id = obsOther)],
+  finalWorkingMismatch: [(s) => (s.mapping[obsFinal].message.metadata.working_turn_id = obsOther)],
+  finalExchangeMismatch: [
+    (s) => (s.mapping[obsFinal].message.metadata.turn_exchange_id = obsOther),
+  ],
+  workingEmpty: [
+    (s) => {
+      s.mapping[obsPreamble].message.metadata.working_turn_id = ''
+      s.mapping[obsFinal].message.metadata.working_turn_id = ''
+    },
+  ],
+  exchangeEmpty: [
+    (s) => {
+      s.mapping[obsPreamble].message.metadata.turn_exchange_id = ''
+      s.mapping[obsFinal].message.metadata.turn_exchange_id = ''
+    },
+  ],
+  workingNotUuid: [
+    (s) => {
+      s.mapping[obsPreamble].message.metadata.working_turn_id = 'SAME_UUID'
+      s.mapping[obsFinal].message.metadata.working_turn_id = 'SAME_UUID'
+    },
+  ],
+  exchangeNotUuid: [
+    (s) => {
+      s.mapping[obsPreamble].message.metadata.turn_exchange_id = 'SAME_UUID'
+      s.mapping[obsFinal].message.metadata.turn_exchange_id = 'SAME_UUID'
+    },
+  ],
+  workingNotString: [
+    (s) => {
+      s.mapping[obsPreamble].message.metadata.working_turn_id = 7
+      s.mapping[obsFinal].message.metadata.working_turn_id = 7
+    },
+  ],
+  // scan bound
+  mappingOver5000: [
+    (s) => {
+      for (let i = 0; i < 5001; i++) {
+        const filler = `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`
+        s.mapping[filler] = { id: filler, parent: null, children: [], message: null }
+      }
+    },
+  ],
+  // snapshot-level identity and admission
+  wrongCid: [(s) => (s.conversation_id = obsOther), 'native_existing_snapshot_invalid'],
+  wrongProject: [
+    (s) => (s.gizmo_id = 'g-p-ffffffffffffffffffffffffffffffff'),
+    'native_existing_project_mismatch',
+  ],
+  asyncInProgress: [(s) => (s.async_status = 'in_progress'), 'native_existing_not_admissible'],
+  asyncTwo: [(s) => (s.async_status = 2), 'native_existing_not_admissible'],
+  asyncMissing: [(s) => delete s.async_status, 'native_existing_not_admissible'],
+  readOnly: [(s) => (s.read_only = true), 'native_existing_not_admissible'],
+  nativeReadOnly: [(s) => (s.is_read_only = true), 'native_existing_not_admissible'],
+  archived: [(s) => (s.is_archived = true), 'native_existing_not_admissible'],
+  currentNotInMapping: [(s) => (s.current_node = obsOther), 'native_existing_parent_invalid'],
+  mappingArray: [(s) => (s.mapping = []), 'native_existing_snapshot_invalid'],
+}
+test('completed Pro final followed by its same-turn thinking preamble keeps the preamble as parent', async () => {
+  for (const status of [null, 4]) {
+    const f = fixture(),
+      s = preambleSnapshot(f, status),
+      before = structuredClone(s)
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    const result = await c.prepareExistingConversation!(obsCid, project)
+    expect(result).toEqual({
+      conversationId: obsCid,
+      parentMessageId: obsPreamble,
+      projectId: project,
+    })
+    // Admission is read-only: the SDK snapshot is neither mutated nor marked read.
+    expect(f.snapshot).toBe(s)
+    expect(s).toEqual(before)
+    expect(f.calls.map((call) => call[0])).toEqual(['refetch'])
+  }
+})
+test('thinking-preamble admission refuses every unsafe or ambiguous shape', async () => {
+  for (const [name, [mutate, code]] of Object.entries(preambleRefusals)) {
+    const f = fixture(),
+      s = preambleSnapshot(f)
+    mutate(s)
+    const c = await discoverVerifiedNativeContract(f.page, f.deps)
+    const expected = code ?? 'native_existing_parent_invalid'
+    let error: unknown
+    try {
+      await c.prepareExistingConversation!(obsCid, project)
+    } catch (e) {
+      error = e
+    }
+    expect([name, (error as Error | undefined)?.message]).toEqual([name, expected])
+    expect(f.calls.map((call) => call[0])).toEqual(['refetch'])
+  }
+})
+test('preamble admission is refused when only the final-answer shape is relaxed elsewhere', async () => {
+  // A non-preamble commentary leaf with a valid final parent must never be admitted.
+  const f = fixture(),
+    s = preambleSnapshot(f)
+  const m = s.mapping[obsPreamble].message
+  delete m.metadata.is_thinking_preamble_message
+  delete m.metadata.hide_inline_actions
+  delete m.metadata.disable_turn_actions
+  const c = await discoverVerifiedNativeContract(f.page, f.deps)
+  await expect(c.prepareExistingConversation!(obsCid, project)).rejects.toThrow(
+    'native_existing_parent_invalid',
+  )
+})
+test('dispatcher submits exactly once from the real adapter with the preamble parent and owned user/CID', async () => {
+  const { NativeChatDispatcher } = await import('../src/native-chat')
+  const f = fixture()
+  preambleSnapshot(f)
+  const receipts: any[] = []
+  const journal: string[] = []
+  const contract = await discoverVerifiedNativeContract(f.page, f.deps)
+  const dispatcher = new NativeChatDispatcher(
+    async () => contract,
+    (receipt) => receipts.push(receipt),
+    (requestId, userId) => journal.push(`${requestId}:${userId}`),
+  )
+  await dispatcher.prepare({
+    type: 'request',
+    requestId: 'A',
+    native: true,
+    nativeUserMessageId: id,
+    text: 'continue',
+    newChat: false,
+    conversationId: obsCid,
+    projectId: project,
+  } as any)
+  expect(f.calls.filter((call) => call[0] === 'send')).toHaveLength(0)
+  await dispatcher.dispatch('A', id)
+  const sends = f.calls.filter((call) => call[0] === 'send')
+  expect(sends).toHaveLength(1)
+  const options = sends[0][2]
+  expect(options.conversationId).toBe(obsCid)
+  expect(options.parentMessageId).toBe(obsPreamble)
+  expect(options.projectId).toBe(project)
+  expect(options.userCompletionMessages.message.id).toBe(id)
+  expect(options.prompt).toBe('continue')
+  expect(journal).toEqual([`A:${id}`])
+  expect(receipts.some((r) => r.kind === 'error')).toBe(false)
+  expect(f.calls.map((call) => call[0])).toEqual(['refetch', 'build', 'send'])
+})
+test('dispatcher never submits for a refused preamble shape', async () => {
+  const { NativeChatDispatcher } = await import('../src/native-chat')
+  const f = fixture()
+  const s = preambleSnapshot(f)
+  s.mapping[obsFinal].children = [obsPreamble, obsOther]
+  s.mapping[obsOther] = {
+    id: obsOther,
+    parent: obsFinal,
+    children: [],
+    message: obsMessage(obsOther),
+  }
+  const contract = await discoverVerifiedNativeContract(f.page, f.deps)
+  const dispatcher = new NativeChatDispatcher(
+    async () => contract,
+    () => {},
+    () => {},
+  )
+  await expect(
+    dispatcher.prepare({
+      type: 'request',
+      requestId: 'A',
+      native: true,
+      nativeUserMessageId: id,
+      text: 'continue',
+      newChat: false,
+      conversationId: obsCid,
+      projectId: project,
+    } as any),
+  ).rejects.toThrow('native_existing_parent_invalid')
+  expect(f.calls.some((call) => call[0] === 'send')).toBe(false)
+})
