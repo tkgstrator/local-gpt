@@ -675,6 +675,7 @@ export async function discoverVerifiedNativeContract(
     prepareExistingConversation: (
       conversationId: string,
       projectId?: string,
+      signal?: AbortSignal,
     ) => Promise<{ conversationId: string; parentMessageId: string; projectId?: string }>
   }
 > {
@@ -735,8 +736,13 @@ export async function discoverVerifiedNativeContract(
       if (signal.aborted) fail('native_recovery_aborted')
       return snapshot
     },
-    async prepareExistingConversation(conversationId: string, projectId?: string) {
+    async prepareExistingConversation(
+      conversationId: string,
+      projectId?: string,
+      signal?: AbortSignal,
+    ) {
       assertCurrent()
+      if (signal?.aborted) fail('native_prepare_aborted')
       if (typeof conversationId !== 'string' || !UUID.test(conversationId))
         fail('native_existing_conversation_invalid')
       if (projectId !== undefined) validateProject(page, projectId)
@@ -744,9 +750,10 @@ export async function discoverVerifiedNativeContract(
         associated.store,
         conversationId,
         'localgpt-native-prepare',
-        { throwOnError: true },
+        { throwOnError: true, ...(signal ? { signal } : {}) },
       )
       assertCurrent()
+      if (signal?.aborted) fail('native_prepare_aborted')
       return existingSnapshot(snapshot, conversationId, projectId)
     },
     validateUpload: (result, file) => validateUpload(page, result, file),

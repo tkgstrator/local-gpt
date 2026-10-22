@@ -4,6 +4,47 @@ import { validatePreparedMessage } from '../src/native-chat'
 
 const id = 'b3241425-4f9f-4e13-a3cb-8b0fd902f32a'
 const project = 'g-p-0123456789abcdef0123456789abcdef'
+test('preparation passes its abort signal to the SDK and refuses already aborted work', async () => {
+  const f = fixture()
+  const contract = await discoverVerifiedNativeContract(f.page, f.deps)
+  const controller = new AbortController()
+  await contract.prepareExistingConversation!(id, project, controller.signal)
+  expect(f.calls.at(-1)).toEqual([
+    'refetch',
+    f.store,
+    id,
+    'localgpt-native-prepare',
+    { throwOnError: true, signal: controller.signal },
+  ])
+  controller.abort()
+  await expect(
+    contract.prepareExistingConversation!(id, project, controller.signal),
+  ).rejects.toThrow('native_prepare_aborted')
+  expect(f.calls).toHaveLength(1)
+})
+test('preparation discards a late SDK snapshot after cancellation', async () => {
+  const f = fixture()
+  let finish!: () => void
+  let reads = 0
+  f.namespace.refetch = async function () {
+    const markers =
+      'chatgpt_conversation_refetch_started chatgpt_conversation_refetch_completed onSnapshotApply throwOnError preserveAsyncStatus mapping'
+    if (String(arguments[2]) === markers) throw Error(markers)
+    reads++
+    await new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    return f.snapshot
+  }
+  const contract = await discoverVerifiedNativeContract(f.page, f.deps)
+  const controller = new AbortController()
+  const preparing = contract.prepareExistingConversation!(id, project, controller.signal)
+  controller.abort()
+  finish()
+  await expect(preparing).rejects.toThrow('native_prepare_aborted')
+  expect(reads).toBe(1)
+  expect(f.calls.some((call) => call[0] === 'send')).toBe(false)
+})
 test('authenticated recovery refetch uses captured store, exact CID and observed options', async () => {
   const f = fixture()
   const contract = await discoverVerifiedNativeContract(f.page, f.deps)

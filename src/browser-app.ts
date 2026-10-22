@@ -1023,7 +1023,9 @@ class App {
         type: 'error',
         requestId: request.requestId,
         code: error instanceof Error ? error.message : 'native_browser_unknown',
-        message: 'Native request could not be confirmed.',
+        message: state.dispatched
+          ? 'Native request could not be confirmed.'
+          : 'Native request failed before dispatch; the generation was not sent.',
         ...(state.userId ? { nativeUserMessageId: state.userId } : {}),
         preDispatch: !state.dispatched,
       }

@@ -4,6 +4,13 @@ import { BrowserRequestSchema, type BrowserRequest } from './protocol'
 import type { BrowserFile } from './attachment-protocol'
 import { discoverVerifiedNativeContract } from './native-client-adapter'
 import { observeNativeAssets } from './native-assets'
+import { DEFAULT_GENERATION_TIMEOUT_MS } from './timeouts'
+import {
+  HISTORY_RATE_LIMITED,
+  NativeHistoryRateLimitError,
+  NativeHistoryScheduler,
+} from './native-history'
+const MAX_PREPARE_HISTORY_ATTEMPTS = 3
 
 export const NATIVE_REQUEST_EVENT = 'localgpt:native-request'
 export const NATIVE_RESULT_EVENT = 'localgpt:native-result'
@@ -224,6 +231,7 @@ export type NativeContract = {
   prepareExistingConversation?: (
     conversationId: string,
     projectId?: string,
+    signal?: AbortSignal,
   ) => Promise<{ conversationId: string; parentMessageId: string; projectId?: string }>
 }
 class NativeDispatchRefusal extends Error {
@@ -250,8 +258,11 @@ export class NativeChatDispatcher {
   >()
   private flights = new Map<string, { controller: AbortController; promise: Promise<unknown> }>()
 
+  private preparations = new Map<string, AbortController>()
+
   disarm(requestId: string) {
     if (this.preparing.has(requestId)) this.disarmedPreparations.add(requestId)
+    this.preparations.get(requestId)?.abort()
     this.owners.delete(requestId)
     this.prepared.delete(requestId)
     this.flights.get(requestId)?.controller.abort()
@@ -280,10 +291,19 @@ export class NativeChatDispatcher {
     if (!flight) {
       if (this.flights.size >= 32) throw new Error('native_recovery_capacity')
       const controller = new AbortController()
-      const promise = Promise.resolve().then(() => {
-        check()
-        return owner!.contract.readConversationSnapshot!(conversationId, controller.signal)
-      })
+      // One scheduled attempt per outer recovery iteration; no retry or terminalization here.
+      const promise = this.history
+        .run(
+          (signal) => {
+            check()
+            return owner!.contract.readConversationSnapshot!(conversationId, signal)
+          },
+          { signal: controller.signal, validate: check },
+        )
+        .catch((error) => {
+          if (controller.signal.aborted) throw new Error('native_recovery_disarmed')
+          throw error
+        })
       flight = { controller, promise }
       this.flights.set(requestId, flight)
       const captured = flight
@@ -327,6 +347,7 @@ export class NativeChatDispatcher {
     private discover: () => Promise<NativeContract>,
     private receipt: (value: NativeReceipt) => void,
     private journal: (requestId: string, userId: string) => void,
+    private history: NativeHistoryScheduler = new NativeHistoryScheduler(),
   ) {}
   async probe(requestId: string) {
     try {
@@ -352,6 +373,9 @@ export class NativeChatDispatcher {
     if (this.preparing.size + this.prepared.size + this.owners.size >= 32)
       throw new Error('native_request_capacity')
     this.preparing.add(request.requestId)
+    const controller = new AbortController()
+    this.preparations.set(request.requestId, controller)
+    const deadline = this.history.clock.now() + (request.timeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS)
     const checkPreparing = () => {
       if (this.disarmedPreparations.has(request.requestId))
         throw new Error('native_prepare_disarmed')
@@ -374,9 +398,13 @@ export class NativeChatDispatcher {
       if (request.conversationId) {
         if (!contract.prepareExistingConversation)
           throw new Error('native_existing_preparation_unavailable')
-        const existing = await contract.prepareExistingConversation(
+        const existing = await this.readExisting(
+          contract,
           request.conversationId,
           projectId,
+          controller.signal,
+          deadline,
+          checkPreparing,
         )
         checkPreparing()
         if (
@@ -438,6 +466,34 @@ export class NativeChatDispatcher {
     } finally {
       this.preparing.delete(request.requestId)
       this.disarmedPreparations.delete(request.requestId)
+      this.preparations.delete(request.requestId)
+    }
+  }
+  // Retries only the SDK history read: same ledger entry, same user message id.
+  private async readExisting(
+    contract: NativeContract,
+    conversationId: string,
+    projectId: string | undefined,
+    signal: AbortSignal,
+    deadline: number,
+    check: () => void,
+  ) {
+    for (let attempt = 1; ; attempt++) {
+      check()
+      try {
+        return await this.history.run(
+          (taskSignal) => {
+            check()
+            return contract.prepareExistingConversation!(conversationId, projectId, taskSignal)
+          },
+          { signal, deadline, validate: check },
+        )
+      } catch (error) {
+        check()
+        if (!(error instanceof NativeHistoryRateLimitError)) throw error
+        if (!error.retryable || attempt >= MAX_PREPARE_HISTORY_ATTEMPTS)
+          throw new Error(HISTORY_RATE_LIMITED)
+      }
     }
   }
   async dispatch(requestId: string, userId: string) {
