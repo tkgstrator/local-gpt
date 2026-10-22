@@ -5,6 +5,15 @@ on:
 permissions:
   contents: read
 jobs:
+  ci-change-scope:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-change-scope.yaml
+    with:
+      doc-paths: '["AGENTS.md","CHANGELOG.md","CLAUDE.md","LICENSE","docs/development/ci-change-scope.md","docs/native-concurrency.md","docs/superpowers/plans/2026-10-07-pro-recovery-cleanup.md"]'
+      doc-prefixes: '[]'
+      runner: '"ubuntu-latest"'
+
   commitlint:
     name: Commit Lint
     runs-on: ubuntu-latest
@@ -28,8 +37,10 @@ jobs:
             bun node_modules/@commitlint/cli/cli.js --last --verbose
           fi
   check:
+    if: ${{ !cancelled() && (true) }}
+    needs: ["ci-change-scope"]
     name: Format, TypeScript and Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true') && '"ubuntu-latest"' || '"ubuntu-latest"') }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -59,11 +70,13 @@ jobs:
           bun scripts/check-extension-version.mjs "$base"
       - run: bun run check
       - run: bun run test
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
       - name: Validate Dev Container and runtime Compose
         run: |
           docker compose -f .devcontainer/compose.yaml config --quiet
           docker compose config --quiet
       - name: Verify standalone Compose from empty volumes
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') }}
         run: |
           docker build -t localgpt-compose-ci .
           cat > /tmp/compose-ci.yaml <<'EOF'
@@ -76,5 +89,14 @@ jobs:
           docker compose -p localgpt-ci -f compose.yaml -f /tmp/compose-ci.yaml up -d --wait --wait-timeout 120 localgpt
           docker compose -p localgpt-ci -f compose.yaml -f /tmp/compose-ci.yaml exec -T localgpt bun scripts/verify-compose.mjs
       - name: Clean up test containers
-        if: always()
+        if: ${{ (needs['ci-change-scope'].result != 'success' || needs['ci-change-scope'].outputs.docs_only != 'true') && (always()) }}
         run: docker compose -p localgpt-ci -f compose.yaml -f /tmp/compose-ci.yaml down -v || true
+
+      - name: Docs-only exemption
+        if: ${{ needs['ci-change-scope'].result == 'success' && needs['ci-change-scope'].outputs.docs_only == 'true' }}
+        shell: bash
+        working-directory: .
+        env:
+          CI_CHANGE_REASON: ${{ needs['ci-change-scope'].outputs.reason }}
+        run: |
+          printf '%s\n' "$CI_CHANGE_REASON" >> "$GITHUB_STEP_SUMMARY"
