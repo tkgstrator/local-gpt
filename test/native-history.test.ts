@@ -230,6 +230,74 @@ test('fallback cooldown including jitter remains capped at one minute', async ()
   await next
 })
 
+test('zero-padded and long numeric Retry-After values never fall back to a short delay', () => {
+  const now = 1_000_000
+  const read = (value: string) =>
+    classifyHistoryRateLimit({ status: 429, headers: { 'retry-after': value } }, now)
+  expect(read('0000000120')).toEqual({ retryAfterMs: 120_000 })
+  expect(read('1000000000')).toEqual({ retryAfterMs: 1_000_000_000_000 })
+  expect(read('9'.repeat(400))).toEqual({ retryAfterMs: Number.MAX_SAFE_INTEGER - now })
+})
+
+test('long Retry-After waits use bounded timer chunks and queued cancellation clears the timer', async () => {
+  const f = fakeClock()
+  const delays: number[] = []
+  const schedule = f.clock.setTimeout
+  f.clock.setTimeout = (fn, ms) => {
+    delays.push(ms)
+    return schedule(fn, ms)
+  }
+  const s = new NativeHistoryScheduler({ clock: f.clock })
+  await expect(
+    s.run(async () => {
+      throw { status: 429, headers: { 'retry-after': '1000000000' } }
+    }),
+  ).rejects.toBeInstanceOf(NativeHistoryRateLimitError)
+  const controller = new AbortController()
+  let starts = 0
+  const waiting = s.run(
+    async () => {
+      starts++
+    },
+    { signal: controller.signal },
+  )
+  await f.advance(2_147_483_647)
+  expect(starts).toBe(0)
+  expect(delays).toEqual([2_147_483_647, 2_147_483_647])
+  controller.abort()
+  await expect(waiting).rejects.toBeDefined()
+  expect(s.pending).toBe(0)
+  expect(f.timers()).toBe(0)
+})
+
+test('an aborted active SDK read still shares a late 429 cooldown with queued work', async () => {
+  const f = fakeClock()
+  const s = new NativeHistoryScheduler({ clock: f.clock })
+  const a = deferred(),
+    b = deferred()
+  const controller = new AbortController()
+  const first = s.run(() => a.promise, { signal: controller.signal }).catch((error) => error)
+  const second = s.run(() => b.promise)
+  let thirdStarted = false
+  const third = s.run(async () => {
+    thirdStarted = true
+  })
+  await f.advance(15_000)
+  controller.abort()
+  a.reject({ status: 429, headers: { 'retry-after': '60' } })
+  await flush()
+  expect(thirdStarted).toBe(false)
+  await f.advance(59_999)
+  expect(thirdStarted).toBe(false)
+  await f.advance(1)
+  await third
+  expect(thirdStarted).toBe(true)
+  expect(await first).toBeInstanceOf(Error)
+  b.resolve(undefined)
+  await second
+  expect(s.active).toBe(0)
+})
+
 test('long Retry-After is not shortened and is refused when beyond the deadline', async () => {
   const f = fakeClock()
   const s = new NativeHistoryScheduler({ clock: f.clock, spacingMs: 0 })

@@ -58,7 +58,12 @@ export function classifyHistoryRateLimit(
   if (!limited) return undefined
   const raw = (header(error, 'retry-after') ?? header(response, 'retry-after'))?.trim()
   if (!raw) return {}
-  if (/^\d{1,9}$/.test(raw)) return { retryAfterMs: Number(raw) * 1000 }
+  if (/^\d+$/.test(raw)) {
+    // Number handles leading zeros. Saturate oversized durations at a safe
+    // timestamp instead of turning a server-directed wait into a short retry.
+    const remaining = Number.MAX_SAFE_INTEGER - Math.max(0, now)
+    return { retryAfterMs: Math.min(Number(raw) * 1000, remaining) }
+  }
   const date = Date.parse(raw)
   if (Number.isFinite(date) && date > now) return { retryAfterMs: date - now }
   return {}
@@ -225,14 +230,16 @@ export class NativeHistoryScheduler {
       },
       (error) => {
         this.inFlight--
+        // The caller may be canceled, but an actual SDK 429 still applies to
+        // every other read sharing the endpoint. Never discard that cooldown.
+        const limited = classifyHistoryRateLimit(error, this.clock.now())
+        if (limited) this.cooldown(limited.retryAfterMs)
         if (signal?.aborted) {
           finish(() => item.reject(abortReason(signal)))
           this.pump()
           return
         }
-        const limited = classifyHistoryRateLimit(error, this.clock.now())
         if (limited) {
-          this.cooldown(limited.retryAfterMs)
           finish(() => item.reject(new NativeHistoryRateLimitError(true, this.cooldownUntil)))
         } else finish(() => item.reject(error))
         this.pump()
@@ -246,7 +253,10 @@ export class NativeHistoryScheduler {
     const backoff = Math.min(this.maxDelayMs, exponential * (1 + 0.25 * this.clock.random()))
     // A server-directed delay is never shortened, only extended by the shared backoff floor.
     const delay = retryAfterMs === undefined ? backoff : retryAfterMs
-    this.cooldownUntil = Math.max(this.cooldownUntil, this.clock.now() + delay)
+    this.cooldownUntil = Math.max(
+      this.cooldownUntil,
+      Math.min(Number.MAX_SAFE_INTEGER, this.clock.now() + delay),
+    )
   }
 }
 
