@@ -447,12 +447,13 @@ test('native status and sequential read-only model/capability checks remain usab
  const health=await(await fetch(f.base+'/health')).json();
  assert.equal(health.nativeReady,true);assert.equal(health.activeGenerations,1);assert.equal(health.canStartIndependentGeneration,true);
  const pending=fetch(f.base+'/v1/models');await new Promise(r=>setTimeout(r,10));
- const request=(await f.bridge('poll')).request;assert.equal(request.type,'models');
- await f.bridge('event',{type:'models',requestId:request.requestId,models:['pro'],selected:'pro',selectionLabel:'Pro',source:'visible_ui'});
- assert.equal((await pending).status,200);
+ const request=(await f.bridge('poll')).request;assert.equal(request.type,'capabilities');
+ const {emptyCapabilities}=await import('../src/capabilities.ts');
+ await f.bridge('event',{type:'capabilities',requestId:request.requestId,...emptyCapabilities(),models:[{id:'test-pro',name:'Test Pro',reasoning:'pro',configurable:false,efforts:[]}]});
+ const modelResponse=await pending;assert.equal(modelResponse.status,200);
+ const modelList=await modelResponse.json();assert.equal(modelList.source,'chatgpt_api');assert.equal(modelList.data[0].id,'test-pro');assert.equal(modelList.selected,null);
  const capabilities=fetch(f.base+'/v1/capabilities');await new Promise(r=>setTimeout(r,10));
  const capRequest=(await f.bridge('poll')).request;assert.equal(capRequest.type,'capabilities');
- const {emptyCapabilities}=await import('../src/capabilities.ts');
  await f.bridge('event',{type:'capabilities',requestId:capRequest.requestId,...emptyCapabilities()});
  assert.equal((await capabilities).status,200);
  assert.equal((await(await fetch(f.base+'/v1/response-jobs/'+A.job.id)).json()).status,'in_progress');
