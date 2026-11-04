@@ -830,11 +830,12 @@ export function createService(options: Options) {
         .catch(() => lane.pending?.suspend?.())
   }
   app.get('/v1/models', (_req, res) => {
-    const lane = availableLane()
     expirePolling()
+    const lane = availableLane()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
-    if (lane.nativeReady ? nativeBlocked() : browserBusy()) {
+    // Snapshot reads never dispatch generation; native jobs only block the DOM fallback.
+    if (nativeBlocked()) {
       error(409, 'browser_busy', busyMessage)
       return
     }
@@ -915,6 +916,10 @@ export function createService(options: Options) {
           return
         }
         if (event.models === null) {
+          if (nativeGenerations.size > 0) {
+            fail(409, 'browser_busy', busyMessage)
+            return
+          }
           readDom()
           return
         }
@@ -944,11 +949,12 @@ export function createService(options: Options) {
     dispatch({ type: 'capabilities', requestId })
   })
   app.get('/v1/capabilities', (_req, res) => {
-    const lane = availableLane()
     expirePolling()
+    const lane = availableLane()
     const error = (status: number, code: string, message: string) =>
       res.status(status).json({ error: { code, message } })
-    if (lane.nativeReady ? nativeBlocked() : browserBusy()) {
+    // Snapshot reads never dispatch generation; native jobs only block the DOM fallback.
+    if (nativeBlocked()) {
       error(409, 'browser_busy', busyMessage)
       return
     }

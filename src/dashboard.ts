@@ -34,6 +34,12 @@ async function refreshCapabilities() {
       cache: 'no-store',
       signal: AbortSignal.timeout(12000),
     })
+    if (response.status === 409) {
+      if (wasConnected)
+        element('capability-detail').textContent =
+          'ChatGPTが別の処理中です。表示は直前の情報のままです。しばらくして再度お試しください。'
+      return
+    }
     if (!response.ok) throw new Error('Capabilities unavailable')
     const data = CapabilitiesSchema.parse((await response.json()) as unknown)
     if (!wasConnected) {
@@ -104,8 +110,8 @@ async function refresh() {
     if (!response.ok) throw new Error('Health request failed')
     const health = HealthSchema.parse((await response.json()) as unknown)
     if (!health.browserConnected) clearCapabilities()
-    if (health.browserConnected && !health.busy) void refreshCapabilities()
     wasConnected = health.browserConnected
+    if (health.browserConnected && !health.updating) void refreshCapabilities()
     element('server-status').textContent = '稼働中'
     element('browser-status').textContent = health.browserConnected ? '接続済み' : '接続待ち'
     element('browser-detail').textContent =

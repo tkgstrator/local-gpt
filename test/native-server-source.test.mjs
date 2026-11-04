@@ -565,3 +565,59 @@ test('readiness reason clears when the websocket disconnects',async t=>{
  for(let i=0;i<50&&(await health()).nativeReadyReason;i++)await new Promise(r=>setTimeout(r,20));
  assert.equal((await health()).nativeReadyReason??null,null);
 })
+
+async function nonReadyOwner(t) {
+ const r=await restoredOwner(t);
+ const probe=(await r.f.bridge('poll',{nativeProtocol:1},'original-owner')).request;assert.equal(probe.type,'native_readiness');
+ assert.equal((await r.f.bridge('event',{type:'native_ready',requestId:probe.requestId,protocol:1,ready:false,code:'native_builder_unavailable'},'original-owner')).accepted,true);
+ const health=await(await fetch(r.f.base+'/health')).json();assert.equal(health.nativeReady,false);
+ return r;
+}
+const retained=async({f,saved,sidA,status},context)=>{
+ const job=await status(saved.id);assert.equal(job.status,'in_progress');
+ assert.equal(job.context.requestId,context.requestId);assert.equal(job.context.sessionId,sidA);assert.equal(job.context.serverConversationId,cidA);
+ assert.equal((await f.job(sidA)).status,409);
+};
+
+test('non-ready shared tab with restored native unknown still serves capability and model snapshots',async t=>{
+ const r=await nonReadyOwner(t);const {f}=r;const {emptyCapabilities}=await import('../src/capabilities.ts');
+ const capabilities=fetch(f.base+'/v1/capabilities');await new Promise(res=>setTimeout(res,10));
+ const capRequest=(await f.bridge('poll',{},'original-owner')).request;assert.equal(capRequest.type,'capabilities');
+ await f.bridge('event',{type:'capabilities',requestId:capRequest.requestId,...emptyCapabilities(),plan:'pro'},'original-owner');
+ const capResponse=await capabilities;assert.equal(capResponse.status,200);assert.equal((await capResponse.json()).plan,'pro');
+ const models=fetch(f.base+'/v1/models');await new Promise(res=>setTimeout(res,10));
+ const modelRequest=(await f.bridge('poll',{},'original-owner')).request;assert.equal(modelRequest.type,'capabilities');
+ await f.bridge('event',{type:'capabilities',requestId:modelRequest.requestId,...emptyCapabilities(),models:[]},'original-owner');
+ const modelResponse=await models;assert.equal(modelResponse.status,200);const list=await modelResponse.json();assert.equal(list.source,'chatgpt_api');assert.deepEqual(list.data,[]);
+ await retained(r,r.context);
+});
+
+test('null model snapshot never falls back to the DOM while a native job is unknown',async t=>{
+ const r=await nonReadyOwner(t);const {f}=r;const {emptyCapabilities}=await import('../src/capabilities.ts');
+ const models=fetch(f.base+'/v1/models');await new Promise(res=>setTimeout(res,10));
+ const request=(await f.bridge('poll',{},'original-owner')).request;assert.equal(request.type,'capabilities');
+ await f.bridge('event',{type:'capabilities',requestId:request.requestId,...emptyCapabilities()},'original-owner');
+ const response=await models;assert.equal(response.status,409);assert.equal((await response.json()).error.code,'browser_busy');
+ assert.equal((await f.bridge('poll',{},'original-owner')).request,null);
+ await retained(r,r.context);
+ const capabilities=fetch(f.base+'/v1/capabilities');await new Promise(res=>setTimeout(res,10));
+ assert.equal((await f.bridge('poll',{},'original-owner')).request.type,'capabilities');
+ const late=await Promise.race([capabilities,new Promise(res=>setTimeout(()=>res(null),200))]);assert.equal(late?.status,504);
+});
+
+test('legacy restored unknown still blocks capability and model snapshots on a non-ready tab',async t=>{
+ const dir=mkdtempSync(join(tmpdir(),'legacy-snapshot-'));const store=createResponseJobStore({dir});
+ const saved=store.create();store.context(saved.id,{requestId:'legacy',browserId:'owner'});store.close();
+ const f=await fixture(t,{responseJobsDir:dir});
+ assert.equal((await fetch(f.base+'/v1/capabilities')).status,409);
+ assert.equal((await fetch(f.base+'/v1/models')).status,409);
+ assert.equal((await f.bridge('poll')).request,null);
+});
+
+test('pending browser operation still blocks snapshot reads for a restored native unknown',async t=>{
+ const r=await nonReadyOwner(t);const {f}=r;
+ const first=fetch(f.base+'/v1/capabilities');await new Promise(res=>setTimeout(res,10));
+ assert.equal((await fetch(f.base+'/v1/capabilities')).status,409);
+ assert.equal((await fetch(f.base+'/v1/models')).status,409);
+ assert.equal((await first).status,504);
+});

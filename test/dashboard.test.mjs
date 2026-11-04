@@ -52,3 +52,54 @@ test('dashboard separates four connection states and does not equate gateway wit
  assert.equal(document.getElementById('localmcp-status').textContent,'接続済み');assert.match(document.getElementById('localmcp-detail').textContent,/2ツール/);assert.match(document.getElementById('localmcp-chatgpt').textContent,/未確認/);
  assert.equal(document.getElementById('browser-status').textContent,'接続待ち');
 });
+
+async function routedDashboard(t, route) {
+  const window = new Window({ url: 'http://localhost:8766/' });
+  window.document.write(await readFile('dist/dashboard.html', 'utf8'));
+  const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  const fakeFetch = async path => path === '/v1/localmcp' ? json({configured:false,connected:false,tools:[],chatgptConnection:'not_verified'}) : route(path, json);
+  const names = ['window', 'document', 'location', 'navigator', 'fetch', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'];
+  const values = [window, window.document, window.location, { clipboard: { writeText: async () => {} } }, fakeFetch, window.setInterval.bind(window), window.clearInterval.bind(window), window.setTimeout.bind(window), window.clearTimeout.bind(window)];
+  new Function(...names, await readFile('dist/dashboard.js', 'utf8'))(...values);
+  t.after(async () => { window.dispatchEvent(new window.Event('pagehide')); await window.happyDOM.abort(); window.close(); });
+  const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 10)); };
+  const refresh = async () => { window.document.getElementById('refresh-status').click(); await settle(); };
+  await settle();
+  return { document: window.document, refresh };
+}
+const busyHealth = (extra = {}) => ({ status: 'ok', browserConnected: true, transport: 'http', busy: true, wsPort: 8875, ...extra });
+const proCapabilities = { models: [{ id: 'test-thinking', name: 'Test Thinking', reasoning: 'reasoning', configurable: false, efforts: [] }], plan: 'pro', planTier: '200', observedAt: '2026-01-01T00:00:00.000Z', source: 'chatgpt_api', selectionSupported: false };
+
+test('busy dashboard loads the capability snapshot automatically', async t => {
+  const { document } = await routedDashboard(t, (path, json) => path === '/v1/capabilities' ? json(proCapabilities) : json(busyHealth()));
+  assert.equal(document.getElementById('account-plan').textContent, 'Pro 200');
+  assert.match(document.getElementById('capability-models').textContent, /Test Thinking \(test-thinking\)/);
+});
+
+test('busy dashboard keeps rendered capabilities on 409 and explains the retry', async t => {
+  let busy = false;
+  const { document, refresh } = await routedDashboard(t, (path, json) => path === '/v1/capabilities'
+    ? (busy ? json({ error: { code: 'browser_busy', message: 'busy' } }, 409) : json(proCapabilities))
+    : json(busyHealth()));
+  assert.equal(document.getElementById('account-plan').textContent, 'Pro 200');
+  busy = true;
+  await refresh();
+  assert.equal(document.getElementById('account-plan').textContent, 'Pro 200');
+  assert.match(document.getElementById('capability-models').textContent, /Test Thinking/);
+  assert.match(document.getElementById('capability-detail').textContent, /処理中/);
+  assert.doesNotMatch(document.getElementById('capability-detail').textContent, /取得できませんでした/);
+});
+
+test('dashboard skips capability reads while updating and clears them on disconnect', async t => {
+  let health = busyHealth(), reads = 0;
+  const { document, refresh } = await routedDashboard(t, (path, json) => path === '/v1/capabilities' ? (reads++, json(proCapabilities)) : json(health));
+  assert.equal(reads, 1);
+  health = busyHealth({ updating: true });
+  await refresh();
+  assert.equal(reads, 1);
+  health = busyHealth({ browserConnected: false, transport: null, busy: false });
+  await refresh();
+  assert.equal(reads, 1);
+  assert.equal(document.getElementById('account-plan').textContent, '未取得');
+  assert.equal(document.getElementById('capability-models').textContent, '');
+});
