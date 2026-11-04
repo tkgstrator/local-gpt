@@ -137,7 +137,7 @@ LocalGPT workflow:
 - Before executing a task, check localgpt_status. Retrieve
   localgpt_capabilities and localgpt_models sequentially, then assess the models.
   Use capabilities.choices for executable model IDs and effort combinations;
-  localgpt_models provides display labels, not authoritative model IDs.
+  localgpt_models (GET /v1/models) lists the available Chat models from the API capabilities snapshot (source chatgpt_api, scope available_chat_models, owned_by chatgpt). observedAt is the cached capabilities snapshot time, not when the models were fetched. It never selects a model: choose model and effort from localgpt_capabilities choices. Only when capabilities were not observed (null) does it fall back to visible_ui labels, which are display labels, not authoritative model IDs.
 - Plan model allocation before sending requests. Prefer faster available
   models for simple searches, summaries, and small edits. Prefer stronger
   reasoning models for difficult analysis, complex UI proposals, and demanding

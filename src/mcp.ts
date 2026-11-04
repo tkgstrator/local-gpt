@@ -28,15 +28,29 @@ const HealthSchema = z.object({
   sharedBrowserId: z.string().nullable().optional(),
   wsPort: z.number(),
 })
-const ModelsSchema = z.object({
-  object: z.literal('list'),
-  data: z.array(z.object({ id: z.string(), display_name: z.string() })),
-  selected: z.string().nullable(),
-  selectionLabel: z.string().nullable(),
-  source: z.literal('visible_ui'),
-  scope: z.literal('currently_visible_controls'),
-  canSelect: z.literal(false),
-})
+const ModelsSchema = z.discriminatedUnion('source', [
+  z.object({
+    object: z.literal('list'),
+    data: z.array(
+      z.object({ id: z.string(), display_name: z.string(), owned_by: z.literal('chatgpt') }),
+    ),
+    observedAt: z.string().nullable(),
+    selected: z.null(),
+    selectionLabel: z.null(),
+    source: z.literal('chatgpt_api'),
+    scope: z.literal('available_chat_models'),
+    canSelect: z.literal(false),
+  }),
+  z.object({
+    object: z.literal('list'),
+    data: z.array(z.object({ id: z.string(), display_name: z.string() })),
+    selected: z.string().nullable(),
+    selectionLabel: z.string().nullable(),
+    source: z.literal('visible_ui'),
+    scope: z.literal('currently_visible_controls'),
+    canSelect: z.literal(false),
+  }),
+])
 const ResponseSchema = z.object({
   object: z.literal('response'),
   status: z.literal('completed'),
@@ -297,7 +311,7 @@ export function createMcpServer(baseUrl: string) {
     'localgpt_models',
     {
       description:
-        'Read model display labels from the connected ChatGPT page. Temporarily opens the model menu to read rendered choices, closes it if originally closed, and never selects another model. selected is a model label; selectionLabel may be an effort/mode label such as Pro. Labels are not official model IDs.',
+        "List available ChatGPT Chat models from the connected browser's API capabilities (source chatgpt_api; data[].id are the observed IDs, selected/selectionLabel are null). observedAt is the capabilities snapshot time, not when models were fetched. If capabilities were not observed, falls back to rendered page labels (source visible_ui; briefly opens the model menu, and those IDs are labels, not official model IDs). Never selects a model; choose model/effort only from localgpt_capabilities choices.",
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false },
     },

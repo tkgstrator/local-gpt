@@ -842,7 +842,7 @@ export function createService(options: Options) {
       error(503, 'browser_disconnected', 'Open ChatGPT with LocalGPT enabled.')
       return
     }
-    const requestId = randomUUID()
+    let requestId = randomUUID()
     let finished = false
     const cleanup = () => {
       finished = true
@@ -855,10 +855,52 @@ export function createService(options: Options) {
       cleanup()
       error(status, code, message)
     }
+    // One timer covers the capabilities read and any DOM fallback read.
     const timer = setTimeout(
       () => fail(504, 'browser_timeout', 'Timed out reading model names.'),
       Math.min(options.timeoutMs, 10000),
     )
+    const dispatch = (payload: BrowserRequest) => {
+      if (wsConnected(lane))
+        lane.browser!.send(JSON.stringify(payload), (err) => {
+          if (err) fail(503, 'browser_disconnected', 'Unable to send to browser.')
+        })
+      else lane.queued = payload
+    }
+    const readDom = () => {
+      // Replace the correlation ID synchronously so the lane stays held and stale replies are ignored.
+      requestId = randomUUID()
+      lane.pending = { requestId, fail, event: onDomEvent }
+      dispatch({ type: 'models', requestId })
+    }
+    const onDomEvent: Pending['event'] = (event) => {
+      if (finished || event.type === 'heartbeat') return
+      if (event.type === 'error') {
+        fail(502, event.code, event.message)
+        return
+      }
+      if (event.type !== 'models') {
+        fail(502, 'invalid_browser_message', 'Expected a model observation.')
+        return
+      }
+      cleanup()
+      res.setHeader('Cache-Control', 'no-store')
+      res.json({
+        object: 'list',
+        data: event.models.map((label) => ({
+          id: label,
+          object: 'model',
+          created: 0,
+          owned_by: 'browser',
+          display_name: label,
+        })),
+        selected: event.selected,
+        selectionLabel: event.selectionLabel,
+        source: event.source,
+        scope: 'currently_visible_controls',
+        canSelect: false,
+      })
+    }
     lane.pending = {
       requestId,
       fail,
@@ -868,24 +910,30 @@ export function createService(options: Options) {
           fail(502, event.code, event.message)
           return
         }
-        if (event.type !== 'models') {
-          fail(502, 'invalid_browser_message', 'Expected a model observation.')
+        if (event.type !== 'capabilities') {
+          fail(502, 'invalid_browser_message', 'Expected browser capabilities.')
+          return
+        }
+        if (event.models === null) {
+          readDom()
           return
         }
         cleanup()
+        res.setHeader('Cache-Control', 'no-store')
         res.json({
           object: 'list',
-          data: event.models.map((label) => ({
-            id: label,
+          data: event.models.map((model) => ({
+            id: model.id,
             object: 'model',
             created: 0,
-            owned_by: 'browser',
-            display_name: label,
+            owned_by: 'chatgpt',
+            display_name: model.name,
           })),
-          selected: event.selected,
-          selectionLabel: event.selectionLabel,
-          source: event.source,
-          scope: 'currently_visible_controls',
+          observedAt: event.observedAt,
+          selected: null,
+          selectionLabel: null,
+          source: 'chatgpt_api',
+          scope: 'available_chat_models',
           canSelect: false,
         })
       },
@@ -893,12 +941,7 @@ export function createService(options: Options) {
     res.on('close', () => {
       if (!finished) cleanup()
     })
-    const payload: BrowserRequest = { type: 'models', requestId }
-    if (wsConnected(lane))
-      lane.browser!.send(JSON.stringify(payload), (err) => {
-        if (err) fail(503, 'browser_disconnected', 'Unable to send to browser.')
-      })
-    else lane.queued = payload
+    dispatch({ type: 'capabilities', requestId })
   })
   app.get('/v1/capabilities', (_req, res) => {
     const lane = availableLane()

@@ -102,7 +102,7 @@ test('model, dot and bound deletion operations each block generation on other ta
   const conversationId='6ac07bb1-b2b4-43e8-8304-5424a5cf2ef3';
   await bridge('one','event',{type:'answer',requestId:bind.requestId,text:'Bound'}); await bridge('one','event',{type:'stop',requestId:bind.requestId,conversationId}); assert.equal((await initial).status,200);
   for (const [expected,start] of [
-    ['models',()=>fetch(base+'/v1/models')],
+    ['capabilities',()=>fetch(base+'/v1/models')],
     ['dots',()=>fetch(base+'/v1/dots')],
     ['delete_conversation',()=>post('/v1/sessions/delete',{session_id:session.id})],
   ]) {
