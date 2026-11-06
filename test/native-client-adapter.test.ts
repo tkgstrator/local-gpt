@@ -796,7 +796,7 @@ test('ambiguity rejects duplicate senders, builders and root store identities', 
           systemHints,
         } = arg
         return {
-          message: { content_type: 'text', role: 'user' },
+          message: { content_type: 'text', author: { role: 'user' } },
           extraDeveloperInstructionMessages: [],
           prompt,
           attachments,
@@ -822,6 +822,59 @@ test('builder only qualifies within completion namespace; async sender lookalike
   await expect(discoverVerifiedNativeContract(f.page, f.deps)).rejects.toThrow(
     'native_builder_unavailable',
   )
+})
+
+function delegatedAuthorFixture(role: 'user' | 'tool') {
+  const f = fixture()
+  const author = () => ({ metadata: {}, name: null, role })
+  f.namespace.d = function ({
+    prompt,
+    attachments,
+    extraDeveloperInstructions,
+    oneTurnDeveloperInstructions,
+    systemHints,
+  }: any) {
+    return {
+      extraDeveloperInstructionMessages: [
+        ...extraDeveloperInstructions,
+        ...oneTurnDeveloperInstructions,
+      ],
+      message: {
+        id,
+        author: author(),
+        channel: null,
+        content: { content_type: 'text', parts: [prompt.trim()] },
+        create_time: 1,
+        end_turn: null,
+        metadata: { attachments, system_hints: systemHints },
+        recipient: 'all',
+        status: 'finished_successfully',
+        update_time: null,
+        weight: 1,
+      },
+    }
+  }
+  f.runtime.c.builderModule = { exports: { b: f.namespace.d } }
+  return f
+}
+
+test('builder discovery accepts author construction delegated to a helper', async () => {
+  const f = delegatedAuthorFixture('user')
+  expect(Function.prototype.toString.call(f.namespace.d)).not.toContain('user')
+  const contract = await discoverVerifiedNativeContract(f.page, f.deps)
+  expect(contract.build('hello', []).message.author).toEqual({
+    metadata: {},
+    name: null,
+    role: 'user',
+  })
+  expect(f.calls).toEqual([])
+})
+
+test('delegated author construction still rejects a non-user role before sending', async () => {
+  const f = delegatedAuthorFixture('tool')
+  const contract = await discoverVerifiedNativeContract(f.page, f.deps)
+  expect(() => contract.build('hello', [])).toThrow('native_prepared_invalid')
+  expect(f.calls).toEqual([])
 })
 
 test('uses current React tree rather than stale alternate and rechecks before operations', async () => {

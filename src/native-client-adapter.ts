@@ -103,7 +103,7 @@ async function exportsFromPage(page: NativeAdapterPage, load: (url: string) => P
         [
           'extraDeveloperInstructionMessages',
           'content_type',
-          'user',
+          'author',
           'prompt',
           'attachments',
           'extraDeveloperInstructions',
