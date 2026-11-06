@@ -86,8 +86,13 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
       )
         return sendResponse({ ok: false, error: 'Maintenance transaction expired' })
       reloadLeases.delete(key)
-      sendResponse({ ok: true, data: { reloading: true, expiresAt: committed.expiresAt } })
-      setTimeout(() => chrome.runtime.reload(), 200)
+      const deadline = Math.min(transaction.expiresAt, committed.expiresAt)
+      sendResponse({ ok: true, data: { reloading: true, expiresAt: deadline } })
+      setTimeout(() => {
+        // A validated commit holds server exclusion until this fixed deadline.
+        // A throttled worker must not reload after new work can be admitted.
+        if (Date.now() < deadline) chrome.runtime.reload()
+      }, 200)
       return
     }
     if (request.data.path === 'update-ready' && (await diskVersion()) !== request.data.data.version)

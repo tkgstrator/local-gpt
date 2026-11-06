@@ -2,9 +2,9 @@ import { test } from './test-support.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 // Drive the built service worker with a fake chrome runtime, packaged build-info.json and local server.
-async function fixture({ buildInfo = { version: '2.4.14' }, manifest = '2.4.13', server = {} } = {}) {
+async function fixture({ buildInfo = { version: '2.4.14' }, manifest = '2.4.13', server = {}, holdTimers = false } = {}) {
   let listener;
-  const state = { reloads: 0, buildInfo, buildInfoFetches: [], serverCalls: [], job: null, ready: { ready: true, expiresAt: Date.now() + 15000 } };
+  const state = { reloads: 0, buildInfo, buildInfoFetches: [], serverCalls: [], job: null, ready: { ready: true, expiresAt: Date.now() + 15000 }, holdTimers, timers: [], now: null };
   const chrome = {
     runtime: {
       id: 'our-id',
@@ -30,7 +30,10 @@ async function fixture({ buildInfo = { version: '2.4.14' }, manifest = '2.4.13',
     return Response.json({ ok: true, accepted: true });
   };
   const source = await readFile('dist/extension/background.js', 'utf8');
-  new Function('chrome', 'fetch', 'importScripts', 'LOCALGPT_PAIRING_TOKEN', source)(chrome, fetch, () => {}, 'fixture-token');
+  const NativeDate = Date;
+  class Clock extends NativeDate { static now() { return state.now ?? NativeDate.now(); } }
+  const schedule = (callback, delay, ...args) => state.holdTimers && delay === 200 ? state.timers.push(() => callback(...args)) : setTimeout(callback, delay, ...args);
+  new Function('chrome', 'fetch', 'importScripts', 'LOCALGPT_PAIRING_TOKEN', 'Date', 'setTimeout', source)(chrome, fetch, () => {}, 'fixture-token', Clock, schedule);
   const sender = { id: 'our-id', url: 'https://chatgpt.com/', tab: { id: 7 }, frameId: 0, documentId: 'doc-a' };
   const send = (path, data = {}, from = sender) => new Promise(resolve => listener({ type: 'bridge_request', path, browserId: 'tab1', data }, from, resolve));
   return { state, send, sender };
@@ -127,4 +130,39 @@ for (const [name, respond] of [
   await f.send('update-ready', { version: '2.4.14' });
   assert.equal((await f.send('reload', { version: '2.4.14' })).ok, false);
   await settle(); assert.equal(f.state.reloads, 0);
+});
+
+
+// A background service worker can wake long after a timer's requested delay.
+for (const offset of [0, 1, 60000]) test(`deferred worker reload cannot execute at/after expiry (+${offset}ms)`, async () => {
+  const f = await fixture({ holdTimers: true });
+  await f.send('update-ready', { version: '2.4.14' });
+  const reply = await f.send('reload', { version: '2.4.14' });
+  assert.equal(reply.ok, true); assert.equal(f.state.timers.length, 1);
+  f.state.now = reply.data.expiresAt + offset;
+  await f.state.timers.shift()();
+  assert.equal(f.state.reloads, 0, 'an expired callback must not invalidate new work');
+});
+test('deferred worker reload executes once before its immutable transaction deadline', async () => {
+  const f = await fixture({ holdTimers: true });
+  await f.send('update-ready', { version: '2.4.14' });
+  const reply = await f.send('reload', { version: '2.4.14' });
+  assert.equal(reply.ok, true);
+  const before = f.state.serverCalls.filter(c => c.path === '/bridge/maintenance').length;
+  f.state.now = reply.data.expiresAt - 1;
+  await f.state.timers.shift()();
+  assert.equal(f.state.reloads, 1);
+  assert.equal(f.state.serverCalls.filter(c => c.path === '/bridge/maintenance').length, before,
+    'validated exclusion is irrevocable until expiry; another network wait could invert worker/page reload order');
+});
+test('deferred worker reload cannot extend the original grant when validation advertises a later expiry', async () => {
+  const f = await fixture({ holdTimers: true });
+  const deadline = Date.now() + 4000;
+  f.state.maintenance = body => ({ ready: true, lease: '11111111-1111-4111-8111-111111111111', expiresAt: body.action === 'acquire' ? deadline : deadline + 4000 });
+  await f.send('update-ready', { version: '2.4.14' });
+  const reply = await f.send('reload', { version: '2.4.14' });
+  assert.equal(reply.ok, true); assert.equal(reply.data.expiresAt, deadline);
+  f.state.now = deadline;
+  await f.state.timers.shift()();
+  assert.equal(f.state.reloads, 0);
 });
