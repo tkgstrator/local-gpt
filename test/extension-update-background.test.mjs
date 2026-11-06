@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 // Drive the built service worker with a fake chrome runtime, packaged build-info.json and local server.
 async function fixture({ buildInfo = { version: '2.4.14' }, manifest = '2.4.13', server = {} } = {}) {
   let listener;
-  const state = { reloads: 0, buildInfo, buildInfoFetches: [], serverCalls: [], job: null, ready: { ready: true } };
+  const state = { reloads: 0, buildInfo, buildInfoFetches: [], serverCalls: [], job: null, ready: { ready: true, expiresAt: Date.now() + 15000 } };
   const chrome = {
     runtime: {
       id: 'our-id',
@@ -24,13 +24,14 @@ async function fixture({ buildInfo = { version: '2.4.14' }, manifest = '2.4.13',
     }
     const path = new URL(url).pathname;
     state.serverCalls.push({ path, body: JSON.parse(init.body), headers: init.headers });
-    if (path === '/bridge/poll') return Response.json({ request: state.job });
+    if (path === '/bridge/maintenance') { const body = JSON.parse(init.body); const o = state.maintenance?.(body); if (o !== undefined) return Response.json(o); return Response.json({ ready: true, lease: '11111111-1111-4111-8111-111111111111', expiresAt: Date.now() + 8000 }); }
+    if (path === '/bridge/poll' || path === '/bridge/poll-v2') return Response.json({ request: state.job });
     if (path === '/bridge/update-ready') return Response.json(state.ready);
     return Response.json({ ok: true, accepted: true });
   };
   const source = await readFile('dist/extension/background.js', 'utf8');
   new Function('chrome', 'fetch', 'importScripts', 'LOCALGPT_PAIRING_TOKEN', source)(chrome, fetch, () => {}, 'fixture-token');
-  const sender = { id: 'our-id', url: 'https://chatgpt.com/', tab: { id: 7 }, frameId: 0 };
+  const sender = { id: 'our-id', url: 'https://chatgpt.com/', tab: { id: 7 }, frameId: 0, documentId: 'doc-a' };
   const send = (path, data = {}, from = sender) => new Promise(resolve => listener({ type: 'bridge_request', path, browserId: 'tab1', data }, from, resolve));
   return { state, send, sender };
 }
@@ -73,8 +74,9 @@ test('runtime reload requires a fresh server drain lease for the same tab and ve
   assert.deepEqual((await f.send('update-ready', { version: '2.4.14' })).data, { ready: false, reason: 'browser_busy' });
   assert.equal((await f.send('reload', { version: '2.4.14' })).ok, false);
   // Server grants it; the forwarded call is authenticated with the pairing token.
-  f.state.ready = { ready: true };
-  assert.deepEqual((await f.send('update-ready', { version: '2.4.14' })).data, { ready: true });
+  f.state.ready = { ready: true, expiresAt: Date.now() + 15000 };
+  const granted = (await f.send('update-ready', { version: '2.4.14' })).data;
+  assert.equal(granted.ready, true); assert.ok(Number.isFinite(granted.expiresAt) && granted.expiresAt > Date.now() && granted.expiresAt - Date.now() <= 60_000, 'ready response carries bounded future expiry');
   const forwarded = f.state.serverCalls.at(-1);
   assert.equal(forwarded.path, '/bridge/update-ready');
   // Same pairing header as ordinary polls; compared without printing the key.
@@ -105,4 +107,24 @@ test('old content script messages still work against the new background', async 
   const f = await fixture({ buildInfo: { version: '2.4.13' } });
   assert.deepEqual((await f.send('poll')).data, { request: null });
   assert.equal((await f.send('event', { type: 'heartbeat' })).ok, true);
+});
+
+test('sequenced idle polling preserves automatic update metadata after server response caching', async () => {
+  const f = await fixture();
+  const response = await f.send('poll-v2', { protocol: 1, epoch: '11111111-1111-4111-8111-111111111111', streamId: '22222222-2222-4222-8222-222222222222', activation: 1000, sequence: 1 });
+  assert.equal(response.ok, true); assert.equal(response.data.request, null); assert.deepEqual(response.data.update, { version: '2.4.14' });
+});
+
+// Catches a runtime reload after the server refused, malformed, nearly expired, or invalidated the document transaction.
+for (const [name, respond] of [
+  ['refused acquire', body => body.action === 'acquire' ? { ready: false, reason: 'work_in_progress' } : undefined],
+  ['malformed lease', body => body.action === 'acquire' ? { ready: true, lease: 'not-a-uuid', expiresAt: Date.now() + 8000 } : undefined],
+  ['acquire expiring in under one second', body => body.action === 'acquire' ? { ready: true, lease: '11111111-1111-4111-8111-111111111111', expiresAt: Date.now() + 500 } : undefined],
+  ['validate false', body => body.action === 'validate' ? { ready: false, reason: 'lease_expired' } : undefined],
+  ['validate expiring in under one second', body => body.action === 'validate' ? { ready: true, expiresAt: Date.now() + 500 } : undefined],
+]) test(`background reload fails closed and never calls runtime.reload after ${name}`, async () => {
+  const f = await fixture(); f.state.maintenance = respond;
+  await f.send('update-ready', { version: '2.4.14' });
+  assert.equal((await f.send('reload', { version: '2.4.14' })).ok, false);
+  await settle(); assert.equal(f.state.reloads, 0);
 });

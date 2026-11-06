@@ -101,7 +101,10 @@ const DEFINITE_SETUP_FAILURES = new Set([
   'draft_too_large',
   'draft_backup_conflict',
 ])
-export type HttpBridge = (path: string, data: unknown, browserId: string) => Promise<unknown>
+export type HttpBridge = ((path: string, data: unknown, browserId: string) => Promise<unknown>) & {
+  suspend?: () => void
+  activate?: () => void
+}
 const NativeResultSchema = z.object({
   requestId: z.string().min(1),
   kind: z.enum(['ready', 'prepared', 'identity', 'error', 'dispatch_refused']),
@@ -164,6 +167,8 @@ class App {
   private active: string | null = null
   private status: HTMLDivElement
   private destroyed = false
+  private suspended = false
+  private startedAt = window.performance.timeOrigin
   private transport: 'websocket' | 'http' = 'websocket'
   private pollingStarted = false
   private httpConnected = false
@@ -186,6 +191,7 @@ class App {
   private recovery: HTMLDivElement
   private recoveryValue = ''
   private draftTimer: ReturnType<typeof setTimeout> | null = null
+  private maintenanceDeferred = false
   private lastManualEdit = -Infinity
   private markManualEdit = () => {
     this.lastManualEdit = Date.now()
@@ -314,7 +320,7 @@ class App {
     document.body.append(this.recovery)
     const watch = () => {
       if (this.destroyed) return
-      this.recoverDraft()
+      if (!this.suspended) this.recoverDraft()
       this.draftTimer = setTimeout(watch, 1000)
     }
     this.showSavedDrafts()
@@ -1576,7 +1582,7 @@ class App {
       this.responseStream?.wake?.()
       this.responseStream = null
       this.active = null
-      this.recoverDraft()
+      if (!this.suspended) this.recoverDraft()
     }
   }
   private async runMove(request: Extract<BrowserRequest, { type: 'move_conversation' }>) {
@@ -1876,6 +1882,7 @@ class App {
     }
   }
   private connected() {
+    if (this.suspended) return false
     return this.transport === 'http'
       ? this.httpConnected
       : this.socket?.readyState === WebSocket.OPEN
@@ -1920,6 +1927,7 @@ class App {
   private safeToReload(): boolean {
     if (
       this.destroyed ||
+      this.suspended ||
       this.active ||
       this.nativeContexts.size > 0 ||
       this.navigating ||
@@ -1943,15 +1951,42 @@ class App {
       return false
     }
   }
-  private async reloadWhenSafe() {
-    this.setStatus('拡張機能を更新しました。安全な状態でChatGPTを再読み込みします。')
-    while (!this.destroyed) {
-      if (this.safeToReload()) {
-        this.stop()
-        location.reload()
-        return
+  maintenanceSafety(browserId?: string, deferred?: string | null) {
+    if (deferred !== undefined) this.maintenanceDeferred = Boolean(deferred)
+    if (deferred) this.setStatus('接続済み · 実行中の処理があるため再読み込みを保留しています。')
+    return {
+      browserId: this.browserId,
+      startedAt: this.startedAt,
+      safe: browserId === this.browserId && this.safeToReload(),
+    }
+  }
+  async maintenanceReload(browserId: string | undefined, lease: string, expiresAt: number) {
+    if (
+      browserId !== this.browserId ||
+      !Number.isFinite(expiresAt) ||
+      expiresAt - Date.now() < 1000 ||
+      !this.safeToReload()
+    )
+      return { reloading: false }
+    try {
+      const result = (await this.httpRequest('maintenance-check', { lease })) as {
+        ready?: boolean
+        expiresAt?: number
       }
-      await sleep(300)
+      // This live content document owns the final synchronous safety check and reload.
+      if (
+        result?.ready !== true ||
+        typeof result.expiresAt !== 'number' ||
+        !Number.isFinite(result.expiresAt) ||
+        Math.min(expiresAt, result.expiresAt) - Date.now() < 1000 ||
+        !this.safeToReload()
+      )
+        return { reloading: false }
+      this.stop()
+      location.reload()
+      return { reloading: true }
+    } catch {
+      return { reloading: false }
     }
   }
   private async tryExtensionUpdate(value: unknown): Promise<boolean> {
@@ -1977,12 +2012,19 @@ class App {
         !result ||
         typeof result !== 'object' ||
         !('reloading' in result) ||
-        result.reloading !== true
+        result.reloading !== true ||
+        !('expiresAt' in result) ||
+        typeof result.expiresAt !== 'number' ||
+        !Number.isFinite(result.expiresAt) ||
+        result.expiresAt - Date.now() < 1000
       )
         throw new Error('Extension reload was not confirmed')
-      // Let the acknowledged worker reload finish before replacing the page observer.
+      // The worker reload is scheduled200ms after its reply; let it finish before
+      // this page loads its content script. The wait is bounded by this exact lease.
       await sleep(450)
-      await this.reloadWhenSafe()
+      if (result.expiresAt - Date.now() < 1000 || !this.safeToReload()) return false
+      this.stop()
+      location.reload()
       return true
     } catch {
       this.setStatus('拡張機能の再読み込みが必要です。入力欄は保持しています。')
@@ -1996,6 +2038,10 @@ class App {
     this.socket?.close()
     while (!this.destroyed) {
       try {
+        if (this.suspended) {
+          await sleep(100)
+          continue
+        }
         if (this.navigating) {
           await sleep(100)
           continue
@@ -2009,9 +2055,16 @@ class App {
           continue
         }
         const value = await this.httpRequest('poll', { nativeProtocol: 1 })
+        while (this.suspended && !this.destroyed) await sleep(100)
+        if (this.destroyed) return
         if (this.navigating) continue
         this.httpConnected = true
-        if (!this.active) this.setStatus('接続済み · HTTP 8766')
+        if (!this.active)
+          this.setStatus(
+            this.maintenanceDeferred
+              ? '接続済み · 実行中の処理があるため再読み込みを保留しています。'
+              : '接続済み · HTTP 8766',
+          )
         if (typeof value !== 'object' || value === null || !('request' in value))
           throw new Error('Invalid poll response')
         if (value.request !== null) this.receive(value.request)
@@ -2027,8 +2080,7 @@ class App {
           err instanceof Error &&
           /Extension context invalidated/i.test(err.message)
         ) {
-          await this.reloadWhenSafe()
-          return
+          this.setStatus('再読み込みを保留しています。接続の回復を待っています。')
         }
         await sleep(3000)
       }
@@ -2043,11 +2095,16 @@ class App {
     void this.run(result.data)
   }
   connect() {
-    if (this.destroyed) return
-    if (this.httpBridge) {
+    if (this.destroyed || this.suspended) return
+    if (this.httpBridge || this.pollingStarted) {
       void this.poll()
       return
     }
+    if (
+      this.socket &&
+      (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)
+    )
+      return
     this.setStatus('接続中 · 8875')
     try {
       this.socket = new WebSocket(
@@ -2059,13 +2116,16 @@ class App {
     }
     const socket = this.socket
     const fallback = setTimeout(() => {
+      if (this.socket !== socket || this.destroyed || this.suspended) return
       if (socket.readyState !== WebSocket.OPEN) void this.poll()
     }, 2000)
     this.socket.onopen = () => {
       clearTimeout(fallback)
+      if (this.socket !== socket || this.destroyed || this.suspended) return
       this.setStatus('接続済み · 8875')
     }
     this.socket.onmessage = (event) => {
+      if (this.socket !== socket || this.destroyed || this.suspended) return
       let value: unknown
       try {
         value = JSON.parse(String(event.data))
@@ -2077,18 +2137,36 @@ class App {
     }
     this.socket.onerror = () => {
       clearTimeout(fallback)
+      if (this.socket !== socket || this.destroyed || this.suspended) return
       this.wakeNative()
       this.responseStream?.wake?.()
       void this.poll()
     }
     this.socket.onclose = () => {
       clearTimeout(fallback)
+      if (this.socket !== socket || this.destroyed || this.suspended) return
       this.wakeNative()
       this.responseStream?.wake?.()
-      if (this.destroyed || this.transport === 'http') return
+      if (this.destroyed || this.suspended || this.transport === 'http') return
       this.setStatus('未接続 · 8875 / 再接続待ち')
       this.reconnect = setTimeout(() => this.connect(), 3000)
     }
+  }
+  suspend() {
+    if (this.destroyed || this.suspended) return
+    this.suspended = true
+    this.httpBridge?.suspend?.()
+    this.httpConnected = false
+    if (this.reconnect) clearTimeout(this.reconnect)
+    this.socket?.close()
+  }
+  resume() {
+    if (this.destroyed || !this.suspended) return
+    this.suspended = false
+    this.httpBridge?.activate?.()
+    this.connect()
+    this.wakeNative()
+    this.responseStream?.wake?.()
   }
   stop() {
     this.destroyed = true
@@ -2115,5 +2193,9 @@ export function startBrowserApp(httpBridge?: HttpBridge) {
   if (document.getElementById('chatgpt-local-api-status')) return
   const app = new App(httpBridge)
   app.connect()
-  window.addEventListener('pagehide', () => app.stop(), { once: true })
+  window.addEventListener('pagehide', (event) => (event.persisted ? app.suspend() : app.stop()))
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) app.resume()
+  })
+  return app
 }

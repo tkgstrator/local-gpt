@@ -1,4 +1,4 @@
-import { test, installNativeEditing } from './test-support.mjs';
+import { test, installNativeEditing, withSequencedPolling } from './test-support.mjs';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { Window } from 'happy-dom';
@@ -41,7 +41,7 @@ async function fixture(t, url = `https://chatgpt.com/c/${target}`) {
   const page = new Window({ url }); t.after(async () => { page.dispatchEvent(new page.Event('pagehide')); await page.happyDOM.abort(); page.close(); });
   page.document.body.innerHTML = '<div role="textbox" contenteditable="true"></div><button aria-label="Send">Send</button>'; await page.happyDOM.waitUntilComplete(); installNativeEditing(page);
   let queued = null, failBridge = false, rejectEvent = false; const events = [], order = [], attempts = [];
-  page.chrome = { runtime: { sendMessage: async r => { if (r.path === 'event') attempts.push(r.data); if (failBridge && r.path === 'event') return { ok: false, error: 'Simulated disconnect' }; if (r.path === 'poll') { const request = queued; queued = null; return { ok: true, data: { request } }; } events.push(r.data); return { ok: true, data: { ok: true, accepted: rejectEvent !== r.data.requestId && r.data.type !== 'heartbeat' } }; } } };
+  page.chrome = { runtime: { sendMessage: withSequencedPolling(async r => { if (r.path === 'event') attempts.push(r.data); if (failBridge && r.path === 'event') return { ok: false, error: 'Simulated disconnect' }; if (r.path === 'poll') { const request = queued; queued = null; return { ok: true, data: { request } }; } events.push(r.data); return { ok: true, data: { ok: true, accepted: rejectEvent !== r.data.requestId && r.data.type !== 'heartbeat' } }; }) } };
   page.addEventListener('localgpt:stream-arm', () => order.push('arm')); page.document.querySelector('button').addEventListener('click', () => order.push('click'));
   const globals = ['chrome', 'window', 'document', 'location', 'HTMLTextAreaElement', 'WebSocket', 'CustomEvent', 'crypto', 'sessionStorage', 'setTimeout', 'clearTimeout'];
   new Function(...globals, await readFile('dist/extension/content.js', 'utf8'))(...globals.map(k => k === 'window' ? page : ['setTimeout', 'clearTimeout'].includes(k) ? page[k].bind(page) : page[k]));

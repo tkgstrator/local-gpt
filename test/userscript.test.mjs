@@ -51,9 +51,13 @@ for (const userOnlyConversation of [false, true, 'empty-route', 'extension']) te
       tabs: { update: async id => ({ id, windowId: 1 }) },
       windows: { update: async () => ({ id: 1 }) },
     };
-    const localFetch = (url, options) => fetch(`${base}${new URL(url).pathname}`, {...options,...(new URL(url).pathname==='/bridge/poll'?{body:'{}'}:{})});
+    const localFetch = (url, options) => {
+      const path = new URL(url).pathname;
+      if (path === '/bridge/poll-v2') { const { nativeProtocol, ...body } = JSON.parse(options.body); return fetch(`${base}${path}`, { ...options, body: JSON.stringify(body) }); }
+      return fetch(`${base}${path}`, {...options,...(path==='/bridge/poll'?{body:'{}'}:{})});
+    };
     new Function('chrome', 'fetch', 'importScripts', 'LOCALGPT_PAIRING_TOKEN', await readFile('dist/extension/background.js', 'utf8'))(workerChrome, localFetch, () => {}, token);
-    page.window.chrome = { runtime: { sendMessage: message => new Promise(resolve => listener(message, { id: 'test-extension', url: 'https://chatgpt.com/', tab: { id: 1 }, frameId: 0 }, resolve)) } };
+    page.window.chrome = { runtime: { sendMessage: message => new Promise(resolve => listener(message, { id: 'test-extension', url: 'https://chatgpt.com/', tab: { id: 1 }, frameId: 0, documentId: 'integration-document' }, resolve)) } };
   }
   const globals = ['unsafeWindow', 'CustomEvent', 'chrome', 'window', 'document', 'location', 'HTMLTextAreaElement', 'WebSocket', 'GM_xmlhttpRequest', 'crypto', 'setTimeout', 'clearTimeout'];
   const values = globals.map(key => key === 'window' || key === 'unsafeWindow' ? page.window : typeof page.window[key] === 'function' && ['setTimeout', 'clearTimeout'].includes(key) ? page.window[key].bind(page.window) : page.window[key]);

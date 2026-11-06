@@ -3,6 +3,7 @@ export interface Sender {
   id?: string
   url?: string
   tab?: { id?: number }
+  documentId?: string
   frameId?: number
 }
 export function authorizedSender(sender: Sender, extensionId: string): boolean {
@@ -33,7 +34,7 @@ export async function handleBridgeMessage(
       error:
         'LocalGPT pairing is missing. Install from the local dashboard or configure the extension updater.',
     }
-  if (request.data.path === 'reload')
+  if (request.data.path === 'reload' || request.data.path === 'maintenance-check')
     return { ok: false, error: 'Reload must be authorized by the extension' }
   try {
     const response = await fetchRequest(`http://127.0.0.1:8766/bridge/${request.data.path}`, {
@@ -42,6 +43,9 @@ export async function handleBridgeMessage(
         'Content-Type': 'application/json',
         'X-Bridge-Token': config.token,
         'X-Browser-Id': `${sender.tab!.id}:${request.data.browserId}`,
+        ...(sender.documentId
+          ? { 'X-Chrome-Tab-Id': String(sender.tab!.id), 'X-Chrome-Document-Id': sender.documentId }
+          : {}),
       },
       body: JSON.stringify(request.data.data),
       signal: AbortSignal.timeout(4000),
