@@ -14,7 +14,7 @@ async function wait(read, ms = 5000) {
   }
   throw Error('Expected browser event did not arrive');
 }
-async function fixture(t, websocket = false) {
+async function fixture(t, websocket = false, { delayedClose = false, holdConnecting = false } = {}) {
   const page = new Window({ url: 'https://chatgpt.com/' });
   const saved = new Map();
   for (const key of ['window', 'document', 'location', 'HTMLTextAreaElement', 'WebSocket', 'CustomEvent', 'sessionStorage', '__BRIDGE_TOKEN__']) {
@@ -46,18 +46,18 @@ async function fixture(t, websocket = false) {
     if (command.action === 'dispatch') { dispatches.push(command); timeline.push('dispatch'); }
   });
   const accepted = data => acceptedFor ? acceptedFor(data) : data.type === 'image' ? imageAccepted : data.type === 'native_identity' ? (typeof identityAccepted === 'function' ? identityAccepted(data) : identityAccepted) : data.type === 'native_intent' ? intentAccepted : data.type === 'stop' ? terminalAccepted : true;
-  let socket;
+  let socket; let socketCount = 0; const sockets = [];
   if (websocket) {
     globalThis.WebSocket = class {
-      static OPEN = 1;
-      readyState = 1;
-      constructor() { socket = this; setTimeout(() => this.onopen?.(), 0); }
+      static OPEN = 1; static CONNECTING = 0;
+      readyState = holdConnecting ? 0 : 1;
+      constructor() { socketCount++; socket = this; sockets.push(this); if (!holdConnecting) setTimeout(() => this.onopen?.(), 0); }
       send(raw) { const data = JSON.parse(raw); events.push(data); }
-      close() { this.readyState = 3; this.onclose?.(); }
+      close() { this.readyState = 3; if (!delayedClose) this.onclose?.(); }
     };
   }
   const { startBrowserApp } = await import('../src/browser-app.ts');
-  startBrowserApp(websocket ? undefined : async (path, data) => {
+  const app = startBrowserApp(websocket ? undefined : async (path, data) => {
     if (path === 'poll') { polls++; return { request: queue.shift() ?? null, ...(update ? { update } : {}) }; }
     if (path !== 'event') throw Error(`Unexpected mutation bridge call: ${path}`);
     events.push(data);
@@ -65,7 +65,7 @@ async function fixture(t, websocket = false) {
     return { accepted: accepted(data) };
   });
   const deliver = data => websocket ? socket.onmessage({ data: JSON.stringify(data) }) : queue.push(data);
-  return { page, queue, deliver, events, commands, dispatches, disarms, arms, timeline, emit,
+  return { app, page, queue, deliver, sockets, failSocket: () => socket.onerror?.(), socketCount: () => socketCount, events, commands, dispatches, disarms, arms, timeline, emit,
     ack: (event, value) => deliver({ type: 'event_ack', requestId: event.requestId, eventId: event.eventId, accepted: value }),
     polls: () => polls, clicks: () => clicks,
     setImageAccepted: value => imageAccepted = value,
@@ -414,4 +414,56 @@ test('probe receipts for other request ids never settle a pending probe', async 
   f.emit('localgpt:native-result', { requestId: 'other', kind: 'ready', ready: false, code: 'native_store_ambiguous' });
   await pause(150);
   assert.equal(f.events.some(e => e.type === 'native_ready'), false);
+});
+
+test('BFCache keeps exact-owner native terminal receipts and rejects a foreign owner after resume', async t => {
+  const f = await fixture(t); f.page.document.querySelector('[role="textbox"]').textContent = '';
+  f.deliver(request('A')); await wait(() => f.dispatches.length === 1);
+  const browserId = f.page.sessionStorage.getItem('localgpt:browser-id');
+  assert.equal(f.app.maintenanceSafety(browserId).safe, false, 'native context protects reload');
+  const hide = new f.page.Event('pagehide'); Object.defineProperty(hide, 'persisted', { value: true }); f.page.dispatchEvent(hide);
+  stream(f, 'A', 'stop', { terminalEvidence: true, nativeUserMessageId: userB });
+  complete(f, 'A', 'Late exact-owner final');
+  assert.equal(f.disarms.length, 0);
+  for (let i = 0; i < 3; i++) { const show = new f.page.Event('pageshow'); Object.defineProperty(show, 'persisted', { value: true }); f.page.dispatchEvent(show); }
+  await wait(() => f.disarms.includes('A'));
+  assert.equal(f.dispatches.length, 1); assert.equal(f.events.filter(e => e.type === 'stop').length, 1);
+  assert.deepEqual(f.events.filter(e => e.type === 'answer').map(e => e.text), ['Late exact-owner final']);
+  assert.equal(f.events.find(e => e.type === 'stop').nativeUserMessageId, userA);
+});
+
+test('BFCache resume retains one HTTP fallback owner instead of opening another WebSocket', async t => {
+  const f = await fixture(t, true); f.failSocket(); await pause(20);
+  const hide = new f.page.Event('pagehide'); Object.defineProperty(hide, 'persisted', { value: true }); f.page.dispatchEvent(hide);
+  const show = new f.page.Event('pageshow'); Object.defineProperty(show, 'persisted', { value: true }); f.page.dispatchEvent(show);
+  await pause(20); assert.equal(f.socketCount(), 1);
+});
+
+test('a superseded WebSocket close cannot mark the resumed connection disconnected', async t => {
+  const f = await fixture(t, true, { delayedClose: true }); await pause(20);
+  f.app.suspend(); f.app.resume(); await pause(20); assert.equal(f.socketCount(), 2);
+  const status = f.page.document.getElementById('chatgpt-local-api-status').textContent;
+  f.sockets[0].onclose();
+  assert.equal(f.page.document.getElementById('chatgpt-local-api-status').textContent, status);
+  await pause(3100); assert.equal(f.socketCount(), 2, 'no stale reconnect may replace the resumed owner');
+});
+test('superseded WebSocket messages and errors cannot start work or replace the resumed owner', async t => {
+  const f = await fixture(t, true, { delayedClose: true }); await pause(20);
+  f.app.suspend(); f.app.resume(); await pause(20);
+  f.sockets[0].onmessage({ data: JSON.stringify({ type: 'native_readiness', requestId: 'stale-probe' }) });
+  f.sockets[0].onerror(); await pause(20);
+  assert.equal(f.commands.some(c => c.requestId === 'stale-probe'), false);
+  assert.equal(f.sockets[1].readyState, 1, 'old error must not close the active socket for HTTP fallback');
+});
+for (const holdConnecting of [false, true]) test(`connect retains the existing ${holdConnecting ? 'connecting' : 'open'} WebSocket owner`, async t => {
+  const f = await fixture(t, true, { holdConnecting }); f.app.connect(); await pause(20);
+  assert.equal(f.socketCount(), 1);
+});
+test('a late superseded open cannot mark a still-connecting replacement ready', async t => {
+  const f = await fixture(t, true, { delayedClose: true, holdConnecting: true });
+  f.app.suspend(); f.app.resume();
+  const status = f.page.document.getElementById('chatgpt-local-api-status').textContent;
+  f.sockets[0].onopen();
+  assert.equal(f.page.document.getElementById('chatgpt-local-api-status').textContent, status);
+  assert.equal(f.sockets[1].readyState, 0);
 });

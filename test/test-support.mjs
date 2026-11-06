@@ -26,3 +26,18 @@ export function installNativeEditing(window) {
     return true;
   };
 }
+
+// Negotiate/echo the extension protocol at the mocked runtime boundary. UI tests keep
+// their existing business-operation fixture; protocol reconciliation has separate real tests.
+export function withSequencedPolling(handler) {
+  const epoch = '11111111-1111-4111-8111-111111111111'; const reads = new Map();
+  return async request => {
+    if (request.path === 'poll-open') return { ok: true, data: { protocol: 1, epoch, streamId: request.data.streamId, activation: request.data.activation } };
+    if (request.path !== 'poll-v2') return handler(request);
+    const key = request.data.streamId + ':' + request.data.sequence;
+    const result = reads.has(key) ? reads.get(key) : await handler({ ...request, path: 'poll', data: request.data.nativeProtocol === 1 ? { nativeProtocol: 1 } : {} });
+    if (result?.ok) reads.set(key, result);
+    if (!result?.ok || !result.data || typeof result.data !== 'object') return result;
+    return { ...result, data: { ...result.data, protocol: 1, epoch, streamId: request.data.streamId, activation: request.data.activation, sequence: request.data.sequence } };
+  };
+}

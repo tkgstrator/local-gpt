@@ -1,8 +1,18 @@
+import { PollOpenSchema, PollReadSchema } from './sequenced-poll'
 import { z } from 'zod'
 z.config({ jitless: true })
 import { BrowserEventSchema } from './protocol'
 const shared = { type: z.literal('bridge_request'), browserId: z.string().min(1).max(100) }
 export const ExtensionRequestSchema = z.discriminatedUnion('path', [
+  z.object({ ...shared, path: z.literal('poll-open'), data: PollOpenSchema }).strict(),
+  z.object({ ...shared, path: z.literal('poll-v2'), data: PollReadSchema }).strict(),
+  z
+    .object({
+      ...shared,
+      path: z.literal('maintenance-check'),
+      data: z.object({ lease: z.string().uuid() }).strict(),
+    })
+    .strict(),
   z
     .object({
       ...shared,
